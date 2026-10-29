@@ -143,6 +143,11 @@ struct St {
     want_panel_resize: bool,
     want_panel_move: bool,
     hover: String,
+    /// What the panel footer last rendered, so it can be refreshed when the cursor
+    /// moves on its own (the panel is otherwise only repainted on widget changes).
+    drawn_visible: bool,
+    drawn_pos: (i32, i32),
+    footer_tick: Instant,
     drag_slider: Option<&'static str>,
     drag_panel: Option<(i32, i32)>,
 
@@ -194,6 +199,9 @@ impl St {
             want_panel_resize: false,
             want_panel_move: false,
             hover: String::new(),
+            drawn_visible: false,
+            drawn_pos: (i32::MIN, i32::MIN),
+            footer_tick: now,
             drag_slider: None,
             drag_panel: None,
             permission: 3,
@@ -1832,6 +1840,23 @@ fn main() {
                 } else {
                     Some(format!("could not write {path}"))
                 };
+            }
+
+            // Keep the panel's status line honest. The cursor glides on its own
+            // thread of control, so cap the refresh at ~4 Hz instead of repainting
+            // the whole panel every frame.
+            {
+                let mut s = st.lock().unwrap();
+                if s.panel_shown && s.panel_full {
+                    let pos = (s.cur.0.round() as i32, s.cur.1.round() as i32);
+                    let stale = s.visible != s.drawn_visible || pos != s.drawn_pos;
+                    if stale && now.duration_since(s.footer_tick) >= Duration::from_millis(250) {
+                        s.footer_tick = now;
+                        s.drawn_visible = s.visible;
+                        s.drawn_pos = pos;
+                        s.panel_dirty = true;
+                    }
+                }
             }
 
             let (draw_cursor_now, cvv) = {
