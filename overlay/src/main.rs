@@ -50,6 +50,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, ReleaseCapture, SetCapture, VK_LBUTTON,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
+    CallNextHookEx, SetWindowsHookExW, HHOOK, MSLLHOOKSTRUCT, WH_MOUSE_LL,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows,
     GetClassNameW, GetCursorPos, GetWindow, GetWindowRect, GetWindowThreadProcessId,
     IsWindowVisible,
@@ -1624,6 +1627,37 @@ unsafe fn probe_windows(x: i32, y: i32, limit: usize) -> Vec<serde_json::Value> 
 /// The BOOL from the last z-order call, stashed so `status` can report it.
 static LAST_LAYER: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
+/// The button state as the low-level hook sees it.
+///
+/// `GetAsyncKeyState` returned 0 while the button was genuinely held (measured),
+/// so it cannot gate the grab. A WH_MOUSE_LL hook is called by the system for
+/// real and injected input alike, which is what makes the drag detectable.
+static HOOK_DOWN: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+static HOOK_X: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+static HOOK_Y: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+static HOOK_EVENTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static HOOK_UPPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code >= 0 {
+        let info = &*(lparam.0 as *const MSLLHOOKSTRUCT);
+        HOOK_X.store(info.pt.x, std::sync::atomic::Ordering::Relaxed);
+        HOOK_Y.store(info.pt.y, std::sync::atomic::Ordering::Relaxed);
+        match wparam.0 as u32 {
+            WM_LBUTTONDOWN => {
+                HOOK_DOWN.store(1, std::sync::atomic::Ordering::Relaxed);
+                HOOK_EVENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            WM_LBUTTONUP => {
+                HOOK_DOWN.store(0, std::sync::atomic::Ordering::Relaxed);
+                HOOK_UPPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
+    CallNextHookEx(None, code, wparam, lparam)
+}
+
 fn last_layer_result() -> i32 {
     LAST_LAYER.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -2226,6 +2260,9 @@ fn handle_line(line: &str) {
     out["dragging"] = serde_json::json!(st.dragging);
     out["drag_feedback"] = serde_json::json!(st.drag_feedback);
     out["drag_seen_down"] = serde_json::json!(st.drag_seen_down);
+    out["hook_down"] = serde_json::json!(HOOK_DOWN.load(std::sync::atomic::Ordering::Relaxed) != 0);
+    out["hook_events"] = serde_json::json!(HOOK_EVENTS.load(std::sync::atomic::Ordering::Relaxed));
+    out["hook_ups"] = serde_json::json!(HOOK_UPPS.load(std::sync::atomic::Ordering::Relaxed));
     out["drag_raw"] = serde_json::json!(st.drag_raw);
     out["drag_near"] = serde_json::json!(st.drag_near);
     out["panel_x"] = serde_json::json!(st.panel_pos.0);
@@ -2342,6 +2379,10 @@ fn main() {
             "excluded_from_capture": true,
             "version": env!("CARGO_PKG_VERSION"),
         }));
+
+        // Installed on the thread that pumps messages below; the system calls it
+        // for every mouse event, including injected ones.
+        let _hook: Option<HHOOK> = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), hinst, 0).ok();
 
         let cursor_cv = Canvas::new(W, H, SS);
         let panel_cv = Canvas::new(PW, PH_MAX, SS_PANEL);
@@ -2580,11 +2621,19 @@ fn main() {
             // The cursor window is click-through, so it never receives the mouse
             // message; the pointer is polled instead. The press also reaches
             // whatever is underneath, which is the price of staying click-through.
-            let raw = GetAsyncKeyState(VK_LBUTTON.0 as i32);
-            let now_down = (raw as u16 & 0x8000) != 0;
+            let raw = GetAsyncKeyState(VK_LBUTTON.0 as i32) as i32;
+            let now_down = HOOK_DOWN.load(std::sync::atomic::Ordering::Relaxed) != 0
+                || (raw as u16 & 0x8000) != 0;
             {
-                let mut p = POINT::default();
-                let _ = GetCursorPos(&mut p);
+                let hx = HOOK_X.load(std::sync::atomic::Ordering::Relaxed);
+                let hy = HOOK_Y.load(std::sync::atomic::Ordering::Relaxed);
+                let p = if hx >= 0 {
+                    POINT { x: hx, y: hy }
+                } else {
+                    let mut q = POINT::default();
+                    let _ = GetCursorPos(&mut q);
+                    q
+                };
                 let mut s = st.lock().unwrap();
                 let near = {
                     let dx = p.x as f64 - s.cur.0;

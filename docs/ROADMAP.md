@@ -24,7 +24,12 @@
   `held  raw=0 seen=False near=True dragging=False`
   → **几何命中是对的（`near=True`）**，但 `GetAsyncKeyState(VK_LBUTTON)` 在按键确实
   被按住期间返回 **0**，所以永远进不了拖拽。
-- 结论：`GetAsyncKeyState` 看不到这次合成按键。下一步二选一：
+- **低级鼠标钩子也试了（2026-10-29 第三轮）**：装了 `SetWindowsHookExW(WH_MOUSE_LL)`，
+  实测 `hook_events=0`、`hook_down=False` —— **钩子一次都没被调用**。最可能是
+  `SetWindowsHookExW` 安装就失败了，而我用 `.ok()` 把错误吞掉了（和之前丢
+  `SetWindowPos` 返回值是同一个毛病）。
+  **下一步第一件事：把 `SetWindowsHookExW` 的错误码记下来**，再判断是安装失败还是没派发。
+- 备选结论：`GetAsyncKeyState` 看不到这次合成按键。下一步二选一：
   1. 改用 **`SetWindowsHookEx(WH_MOUSE_LL)`** 低级鼠标钩子——它能收到注入输入，是最稳的做法；
   2. 或者先让真人在光标上按住一次，确认 `drag_raw` 会不会变成非 0（能变说明只是合成输入
      不被 `GetAsyncKeyState` 认，真人可用）。
