@@ -32,7 +32,8 @@ use sprite::SpriteCache;
 use widget::{channels_of, hex, Hit, Kind, PanelView, SlotView, SWATCHES};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
-    COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
+    COLORREF, BOOL, FALSE, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, TRUE,
+    WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen, CreateSolidBrush, DeleteDC,
@@ -47,11 +48,14 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows,
+    GetClassNameW, GetCursorPos, GetWindow, GetWindowRect, GetWindowTextW,
+    GetWindowThreadProcessId, IsWindowVisible,
     GetSystemMetrics, HMENU,
     PeekMessageW, RegisterClassExW, SetWindowDisplayAffinity, SetWindowPos, ShowWindow,
     TranslateMessage, UpdateLayeredWindow, HWND_TOPMOST, MA_NOACTIVATE, MSG, PM_REMOVE,
-    SET_WINDOW_POS_FLAGS, SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOSIZE,
+    GW_HWNDPREV, HWND_BOTTOM, SET_WINDOW_POS_FLAGS, SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE,
     SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, SYSTEM_METRICS_INDEX, ULW_ALPHA,
     WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE,
     WM_MOUSEMOVE, WM_QUIT, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
@@ -185,6 +189,13 @@ struct St {
     asset_dir: String,
     custom: custom::CustomSpec,
     art_sel: usize,
+    /// z-order anchoring: "topmost" | "above" | "below" | "desktop"
+    layer_mode: String,
+    /// The window we are anchored to (0 = none).
+    layer_hwnd: isize,
+    layer_title: String,
+    /// Set when the anchor needs applying (or re-applying) on the window thread.
+    want_layer: bool,
     want_dump: Option<(String, bool)>, // (path, panel?)
     dump_done: bool,
     dump_error: Option<String>,
@@ -248,6 +259,10 @@ impl St {
             panel_px_h: PH,
             asset_dir: String::new(),
             art_sel: 0,
+            layer_mode: "topmost".to_string(),
+            layer_hwnd: 0,
+            layer_title: String::new(),
+            want_layer: false,
             custom: custom::CustomSpec::default(),
             want_dump: None,
             dump_done: false,
@@ -1515,6 +1530,95 @@ fn rect_y_clamp(y: i32, h: i32, screen_h: i32) -> i32 {
     y.min(max_y).max(8)
 }
 
+// ------------------------------------------------------------- z-order -----
+
+/// Walk the top-level windows in z-order (front to back) and report the visible
+/// ones containing the point. Strictly read-only: nothing here changes another
+/// window's position, size, focus or stacking.
+unsafe fn probe_windows(x: i32, y: i32, limit: usize) -> Vec<serde_json::Value> {
+    struct Acc {
+        x: i32,
+        y: i32,
+        limit: usize,
+        out: Vec<serde_json::Value>,
+    }
+    unsafe extern "system" fn cb(hwnd: HWND, lp: LPARAM) -> BOOL {
+        let acc = &mut *(lp.0 as *mut Acc);
+        if acc.out.len() >= acc.limit {
+            return FALSE;
+        }
+        if !IsWindowVisible(hwnd).as_bool() {
+            return TRUE;
+        }
+        let mut r = RECT::default();
+        if GetWindowRect(hwnd, &mut r).is_err() {
+            return TRUE;
+        }
+        if acc.x < r.left || acc.x >= r.right || acc.y < r.top || acc.y >= r.bottom {
+            return TRUE;
+        }
+        let mut tbuf = [0u16; 256];
+        let n = GetWindowTextW(hwnd, &mut tbuf).max(0) as usize;
+        let title = String::from_utf16_lossy(&tbuf[..n]);
+        let mut cbuf = [0u16; 128];
+        let cn = GetClassNameW(hwnd, &mut cbuf).max(0) as usize;
+        let class = String::from_utf16_lossy(&cbuf[..cn]);
+        let mut pid = 0u32;
+        let _ = GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        acc.out.push(serde_json::json!({
+            "hwnd": format!("0x{:X}", hwnd.0 as isize),
+            "title": title,
+            "class": class,
+            "pid": pid,
+            "rect": [r.left, r.top, r.right - r.left, r.bottom - r.top],
+        }));
+        TRUE
+    }
+    let mut acc = Acc { x, y, limit, out: Vec::new() };
+    let _ = EnumWindows(Some(cb), LPARAM(&mut acc as *mut Acc as isize));
+    acc.out
+}
+
+/// Place our own cursor window relative to `anchor`.
+///
+/// Only OUR window moves in the z-order; the anchor and every other window keep
+/// their position, size, focus and stacking. That is the whole point: the AI
+/// cursor travels between windows without disturbing anything the user is doing.
+unsafe fn apply_layer(overlay: HWND, mode: &str, anchor: isize) {
+    let a = HWND(anchor as *mut core::ffi::c_void);
+    match mode {
+        "desktop" => {
+            let _ = SetWindowPos(
+                overlay, HWND_BOTTOM, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+        "below" if anchor != 0 => {
+            // insert-after places us immediately BEHIND the anchor
+            let _ = SetWindowPos(
+                overlay, a, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+        "above" if anchor != 0 => {
+            // to sit in FRONT of the anchor, insert after whatever is currently
+            // in front of it
+            let prev = GetWindow(a, GW_HWNDPREV).unwrap_or_default();
+            let insert = if prev.0.is_null() { HWND_TOPMOST } else { prev };
+            let _ = SetWindowPos(
+                overlay, insert, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+        _ => {
+            let _ = SetWindowPos(
+                overlay, HWND_TOPMOST, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+    }
+}
+
 fn client_xy(lparam: LPARAM) -> (i32, i32) {
     let v = lparam.0 as u32;
     ((v & 0xFFFF) as i16 as i32, ((v >> 16) & 0xFFFF) as i16 as i32)
@@ -1872,6 +1976,40 @@ fn handle_line(line: &str) {
             out["assets"] = serde_json::json!(found);
             out["count"] = serde_json::json!(found.len());
         }
+        "layer" => {
+            let mode = v.get("mode").and_then(|m| m.as_str()).unwrap_or("topmost").to_string();
+            let hwnd = v
+                .get("hwnd")
+                .and_then(|h| h.as_str())
+                .and_then(|h| isize::from_str_radix(h.trim_start_matches("0x"), 16).ok())
+                .or_else(|| v.get("hwnd").and_then(|h| h.as_i64()).map(|n| n as isize))
+                .unwrap_or(0);
+            if !matches!(mode.as_str(), "topmost" | "above" | "below" | "desktop") {
+                out["ok"] = serde_json::json!(false);
+                out["error"] = serde_json::json!("mode must be topmost | above | below | desktop");
+            } else if (mode == "above" || mode == "below") && hwnd == 0 {
+                out["ok"] = serde_json::json!(false);
+                out["error"] = serde_json::json!("above/below need an hwnd");
+            } else {
+                st.layer_mode = mode;
+                st.layer_hwnd = hwnd;
+                st.layer_title = if hwnd != 0 {
+                    let h = HWND(hwnd as *mut core::ffi::c_void);
+                    let mut buf = [0u16; 256];
+                    let n = unsafe { GetWindowTextW(h, &mut buf) }.max(0) as usize;
+                    String::from_utf16_lossy(&buf[..n])
+                } else {
+                    String::new()
+                };
+                st.want_layer = true;
+            }
+        }
+        "layer_probe" => {
+            let x = v.get("x").and_then(|n| n.as_f64()).unwrap_or(st.cur.0) as i32;
+            let y = v.get("y").and_then(|n| n.as_f64()).unwrap_or(st.cur.1) as i32;
+            let list = unsafe { probe_windows(x, y, 8) };
+            out["windows"] = serde_json::json!(list);
+        }
         "sprite_rescan" => {
             sprites().lock().unwrap().clear();
             for slot in st.slots.iter_mut() {
@@ -2013,6 +2151,9 @@ fn handle_line(line: &str) {
     out["panel_hwnd"] = serde_json::json!(format!("0x{:X}", st.panel_hwnd));
     out["panel"] = serde_json::json!(st.panel_shown);
     out["panel_expanded"] = serde_json::json!(st.panel_full);
+    out["layer"] = serde_json::json!(st.layer_mode);
+    out["layer_hwnd"] = serde_json::json!(format!("0x{:X}", st.layer_hwnd));
+    out["layer_title"] = serde_json::json!(st.layer_title);
     out["panel_x"] = serde_json::json!(st.panel_pos.0);
     out["panel_y"] = serde_json::json!(st.panel_pos.1);
     let mut slot_out = serde_json::Map::new();
@@ -2192,6 +2333,10 @@ fn main() {
                 }
             }
 
+            let p_layer = {
+                let mut s = st.lock().unwrap();
+                std::mem::take(&mut s.want_layer)
+            };
             let (do_show, do_hide, affinity, dump, p_show, p_hide, p_resize, p_move, p_pos, p_full, p_h) = {
                 let mut s = st.lock().unwrap();
                 let show = s.want_show;
@@ -2262,6 +2407,13 @@ fn main() {
                 }
             }
 
+            if p_layer {
+                let (mode, anchor, ohwnd) = {
+                    let s = st.lock().unwrap();
+                    (s.layer_mode.clone(), s.layer_hwnd, s.hwnd)
+                };
+                apply_layer(hwnd_of(ohwnd), &mode, anchor);
+            }
             if p_hide {
                 let _ = ShowWindow(hwnd_of(phwnd), SW_HIDE);
             }

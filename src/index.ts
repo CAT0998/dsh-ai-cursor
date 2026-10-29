@@ -600,6 +600,72 @@ export function apply(ctx: Context, config: ConfigShape): void {
     }),
   )
 
+  // --------------------------------------------------------------- layers ---
+
+  ctx.tools.register(
+    defineTool({
+      name: 'ai_mouse_layer',
+      description:
+        'Put the AI cursor into the window stack: `topmost` (above everything, the default), `above`/`below` a specific window (needs `window`), or `desktop` (behind normal windows). Only the AI cursor\'s own window moves in the z-order — the anchored window and every other window keep their position, size, focus and stacking.',
+      parameters: {
+        mode: { type: 'string', description: 'topmost | above | below | desktop. Omit to just read.' },
+        window: {
+          type: 'string',
+          description: 'Target window handle, e.g. "0x1A0B2C". Required for above/below.',
+        },
+      },
+      output: TEXT_OUTPUT,
+      async execute(args: { mode?: string; window?: string }) {
+        if (args.mode !== undefined) {
+          const refused = await gate(2, 'ai_mouse_layer')
+          if (refused) return refused
+          const reply = await send('layer', {
+            mode: args.mode,
+            ...(args.window ? { hwnd: args.window } : {}),
+          })
+          if (!reply.ok) return `设置层级失败：${reply.error ?? 'unknown'}`
+        }
+        const st = await send('status')
+        const extra = st as unknown as { layer?: string; layer_title?: string; layer_hwnd?: string }
+        return `${describeStatus(st)}\n层级=${extra.layer ?? '?'}${
+          extra.layer_title ? ` 锚定「${extra.layer_title}」(${extra.layer_hwnd})` : ''
+        }`
+      },
+    }),
+  )
+
+  ctx.tools.register(
+    defineTool({
+      name: 'ai_mouse_windows_at',
+      description:
+        'List the windows stacked under a screen point, front to back (title, class, process, rect). Read-only. Use it to pick a window for ai_mouse_layer.',
+      parameters: {
+        x: { type: 'number', description: 'Screen X (defaults to the cursor position).' },
+        y: { type: 'number', description: 'Screen Y (defaults to the cursor position).' },
+      },
+      output: TEXT_OUTPUT,
+      async execute(args: { x?: number; y?: number }) {
+        const refused = await gate(1, 'ai_mouse_windows_at')
+        if (refused) return refused
+        const reply = (await send('layer_probe', {
+          ...(args.x !== undefined ? { x: args.x } : {}),
+          ...(args.y !== undefined ? { y: args.y } : {}),
+        })) as unknown as {
+          windows?: Array<{ hwnd: string; title: string; class: string; pid: number; rect: number[] }>
+        }
+        const list = reply.windows ?? []
+        if (list.length === 0) return '该位置没有可见窗口。'
+        return list
+          .map(
+            (w, i) =>
+              `${i + 1}. ${w.hwnd}  ${w.title || '（无标题）'}  [${w.class}]  pid=${w.pid}  ` +
+              `${w.rect[2]}×${w.rect[3]} @ (${w.rect[0]},${w.rect[1]})`,
+          )
+          .join('\n')
+      },
+    }),
+  )
+
   ctx.tools.register(
     defineTool({
       name: 'ai_mouse_stop',
