@@ -82,6 +82,47 @@ const CHIP_W: i32 = 132; // collapsed panel width
 const CHIP_H: i32 = 40; // collapsed panel height
 const SS_PANEL: i32 = 2; // supersample factor for the panel
 const GRAB: i32 = 40; // side of the clickable grab hotspot at the cursor tip
+/// The minimap runs as a second instance of this binary (`--map`), drawn into the
+/// same window class that already works instead of a new one.
+const MAP_W: i32 = 380;
+const MAP_H: i32 = 260;
+const MAP_X: i32 = 64;
+const MAP_Y: i32 = 64;
+
+static MAP_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+unsafe fn draw_map_surface(cv: &Canvas, cx: i32, cy: i32, accent: u32) {
+    let full = rect(0, 0, MAP_W, MAP_H);
+    cv.fill_round(full, 10, 0x0B1016);
+    cv.stroke_round(full, 10, 0x2A3542, 1);
+
+    let sw = GetSystemMetrics(SYSTEM_METRICS_INDEX(SM_CXSCREEN.0)).max(1) as f64;
+    let sh = GetSystemMetrics(SYSTEM_METRICS_INDEX(SM_CYSCREEN.0)).max(1) as f64;
+    let bw = (MAP_W - 16) as f64;
+    let bh = (MAP_H - 16) as f64;
+    let k = (bw / sw).min(bh / sh);
+    let ox = 8 + ((bw - sw * k) / 2.0) as i32;
+    let oy = 8 + ((bh - sh * k) / 2.0) as i32;
+    let mx = |x: i32| ox + (x as f64 * k) as i32;
+    let my = |y: i32| oy + (y as f64 * k) as i32;
+
+    cv.stroke_round(rect(ox, oy, mx(sw as i32), my(sh as i32)), 3, 0x2A3542, 1);
+    for (wx, wy, ww, wh) in top_window_rects(10) {
+        cv.fill_round(
+            rect(
+                mx(wx),
+                my(wy),
+                mx(wx + ww).max(mx(wx) + 1),
+                my(wy + wh).max(my(wy) + 1),
+            ),
+            2,
+            0x1D2733,
+        );
+    }
+    let (px, py) = (mx(cx), my(cy));
+    cv.fill_circle(px, py, 4, accent);
+    cv.ring_circle(px, py, 6, 1, 0xFFFFFF);
+}
 const PH_MAX: i32 = 1200; // the panel canvas is allocated this tall and clipped per frame
 
 // Palette. Accent-dependent colours are derived from the live accent value.
@@ -2612,6 +2653,9 @@ fn handle_line(line: &str) {
 // -------------------------------------------------------------------- main ---
 
 fn main() {
+    if std::env::args().any(|a| a == "--map") {
+        MAP_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
@@ -2673,6 +2717,20 @@ fn main() {
             s.panel_pos = (px, py);
         }
 
+        if MAP_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = ShowWindow(panel, SW_HIDE);
+            let _ = ShowWindow(grab, SW_HIDE);
+            let _ = SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                MAP_X,
+                MAP_Y,
+                MAP_W,
+                MAP_H,
+                SWP_NOACTIVATE,
+            );
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
         reply(serde_json::json!({
             "ok": true, "event": "ready",
             "hwnd": format!("0x{:X}", hwnd.0 as isize),
@@ -2702,6 +2760,7 @@ fn main() {
         };
 
         let cursor_cv = Canvas::new(W, H, SS);
+        let map_cv = Canvas::new(MAP_W, MAP_H, SS);
         let panel_cv = Canvas::new(PW, PH_MAX, SS_PANEL);
 
         loop {
@@ -2765,6 +2824,24 @@ fn main() {
                 }
             }
 
+            if MAP_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+                let (h, acc, cx, cy) = {
+                    let s = st.lock().unwrap();
+                    (s.hwnd, s.accent, s.cur.0 as i32, s.cur.1 as i32)
+                };
+                unsafe {
+                    draw_map_surface(&map_cv, cx, cy, acc);
+                    map_cv.present(
+                        h,
+                        MAP_W,
+                        MAP_H,
+                        Some(POINT { x: MAP_X, y: MAP_Y }),
+                        1.0,
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                continue;
+            }
             let p_layer = {
                 let mut s = st.lock().unwrap();
                 // Re-pin at a low rate: every paint of a layered window is free to
