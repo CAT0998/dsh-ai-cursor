@@ -1702,6 +1702,9 @@ static HOOK_X: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(
 static HOOK_Y: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 static HOOK_EVENTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static HOOK_UPPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Why the hook install ended up as it did: 0 = installed, else GetLastError().
+static HOOK_ERROR: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+static HOOK_HANDLE: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 
 unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code >= 0 {
@@ -2354,6 +2357,8 @@ fn handle_line(line: &str) {
     out["drag_feedback"] = serde_json::json!(st.drag_feedback);
     out["drag_seen_down"] = serde_json::json!(st.drag_seen_down);
     out["hook_down"] = serde_json::json!(HOOK_DOWN.load(std::sync::atomic::Ordering::Relaxed) != 0);
+    out["hook_error"] = serde_json::json!(HOOK_ERROR.load(std::sync::atomic::Ordering::Relaxed));
+    out["hook_handle"] = serde_json::json!(HOOK_HANDLE.load(std::sync::atomic::Ordering::Relaxed));
     out["hook_events"] = serde_json::json!(HOOK_EVENTS.load(std::sync::atomic::Ordering::Relaxed));
     out["hook_ups"] = serde_json::json!(HOOK_UPPS.load(std::sync::atomic::Ordering::Relaxed));
     out["drag_raw"] = serde_json::json!(st.drag_raw);
@@ -2475,7 +2480,18 @@ fn main() {
 
         // Installed on the thread that pumps messages below; the system calls it
         // for every mouse event, including injected ones.
-        let _hook: Option<HHOOK> = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), hinst, 0).ok();
+        let _hook: Option<HHOOK> = match SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), hinst, 0) {
+            Ok(h) => {
+                HOOK_HANDLE.store(h.0 as isize, std::sync::atomic::Ordering::Relaxed);
+                HOOK_ERROR.store(0, std::sync::atomic::Ordering::Relaxed);
+                Some(h)
+            }
+            Err(e) => {
+                // Record WHY instead of throwing the failure away.
+                HOOK_ERROR.store(e.code().0, std::sync::atomic::Ordering::Relaxed);
+                None
+            }
+        };
 
         let cursor_cv = Canvas::new(W, H, SS);
         let panel_cv = Canvas::new(PW, PH_MAX, SS_PANEL);
