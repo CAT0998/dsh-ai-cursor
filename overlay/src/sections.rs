@@ -335,9 +335,76 @@ fn body_artwork(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
     };
     out.push(
         Hit::new(rect(x, y + 2, content_right(), y + 20), Kind::Label, "l_art_note")
-            .text(format!("‹ › 循环切换：内置 / 关闭 / {}", assets)),
+            .text(format!("‹ › 循环切换；点缩略图选中再调参数（{}）", assets)),
     );
-    y + 24
+    y += 26;
+
+    // ---- editor for the selected slot -------------------------------------
+    let sel = v.art_sel.min(2);
+    let slot = &v.slots[sel];
+    out.push(
+        Hit::new(rect(x, y, content_right(), y + 18), Kind::Label, "l_art_edit").text(format!(
+            "调整「{}」：{}× 偏移({:.0},{:.0}) {:.0}%",
+            slot.name,
+            if slot.size > 0.0 { format!("{:.0}", slot.size) } else { "原始".to_string() },
+            slot.offset.0,
+            slot.offset.1,
+            slot.opacity * 100.0
+        )),
+    );
+    y += 20;
+
+    let rows2: [(&'static str, &str, f64, String); 4] = [
+        (
+            "art_size",
+            "大小",
+            ((if slot.size > 0.0 { slot.size } else { 64.0 } - 8.0) / 248.0).clamp(0.0, 1.0),
+            if slot.size > 0.0 { format!("{:.0}px", slot.size) } else { "原始".to_string() },
+        ),
+        (
+            "art_offx",
+            "横向",
+            ((slot.offset.0 + 200.0) / 400.0).clamp(0.0, 1.0),
+            format!("{:.0}", slot.offset.0),
+        ),
+        (
+            "art_offy",
+            "纵向",
+            ((slot.offset.1 + 200.0) / 400.0).clamp(0.0, 1.0),
+            format!("{:.0}", slot.offset.1),
+        ),
+        (
+            "art_opacity",
+            "透明",
+            slot.opacity.clamp(0.0, 1.0),
+            format!("{:.0}%", slot.opacity * 100.0),
+        ),
+    ];
+    for (id, label, frac, text) in rows2 {
+        out.push(Hit::new(rect(x, y + 4, x + 34, y + 20), Kind::Label, "l_art_c").text(label));
+        out.push(
+            Hit::new(rect(x + 38, y + 2, x + 330, y + 20), Kind::Slider, id)
+                .data((frac * 1000.0) as i32)
+                .hover(hov(v, id)),
+        );
+        out.push(
+            Hit::new(rect(x + 336, y + 4, content_right(), y + 20), Kind::LabelRight, "l_art_v")
+                .text(text),
+        );
+        y += 22;
+    }
+    out.push(
+        Hit::new(rect(x, y + 2, x + 90, y + 26), Kind::Button, "art_flip")
+            .text(if slot.flip { "翻转：开" } else { "翻转：关" })
+            .active(slot.flip)
+            .hover(hov(v, "art_flip")),
+    );
+    out.push(
+        Hit::new(rect(x + 98, y + 2, x + 180, y + 26), Kind::Button, "art_reset")
+            .text("重置")
+            .hover(hov(v, "art_reset")),
+    );
+    y + 30
 }
 
 fn body_permission(v: &PanelView, x: i32, y: i32, out: &mut Vec<Hit>) -> i32 {

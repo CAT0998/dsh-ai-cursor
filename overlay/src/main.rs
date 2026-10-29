@@ -1509,6 +1509,12 @@ fn cycle_slot_source(st: &mut St, slot_idx: usize, dir: i32) {
     st.panel_dirty = true;
 }
 
+/// Keep a panel of height `h` fully visible in a screen of height `screen_h`.
+fn rect_y_clamp(y: i32, h: i32, screen_h: i32) -> i32 {
+    let max_y = (screen_h - h - 8).max(8);
+    y.min(max_y).max(8)
+}
+
 fn client_xy(lparam: LPARAM) -> (i32, i32) {
     let v = lparam.0 as u32;
     ((v & 0xFFFF) as i16 as i32, ((v >> 16) & 0xFFFF) as i16 as i32)
@@ -2265,6 +2271,15 @@ fn main() {
             if p_resize {
                 let w = if p_full { PW } else { CHIP_W };
                 let h = if p_full { p_h } else { CHIP_H };
+                // Opening a section grows the panel downward; keep it on screen by
+                // sliding it up rather than letting it run off the bottom edge.
+                let screen_h = GetSystemMetrics(SYSTEM_METRICS_INDEX(SM_CYSCREEN.0));
+                if p_pos.1 + h > screen_h - 8 {
+                    let moved = rect_y_clamp(p_pos.1, h, screen_h);
+                    let mut s = st.lock().unwrap();
+                    s.panel_pos.1 = moved;
+                }
+                let p_pos = { st.lock().unwrap().panel_pos };
                 let _ = SetWindowPos(
                     hwnd_of(phwnd),
                     HWND_TOPMOST,
