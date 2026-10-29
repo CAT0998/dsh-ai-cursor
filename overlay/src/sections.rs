@@ -241,12 +241,25 @@ fn body_colors(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
         y += 22;
     }
 
-    // colour wheel: reserved by the colours module, drawn once the wheel exists
+    // colour wheel: hue ring + HSV square, drawn from a cached surface
+    let d = crate::wheel::D;
     out.push(
-        Hit::new(rect(x, y + 2, content_right(), y + 20), Kind::Label, "l_wheel")
-            .text("色环：待接入（模块 colors.wheel）"),
+        Hit::new(rect(x, y + 6, x + d, y + 6 + d), Kind::Wheel, "wheel")
+            .hover(hov(v, "wheel")),
     );
-    y + 24
+    out.push(
+        Hit::new(rect(x + d + 10, y + 12, content_right(), y + 30), Kind::LabelRight, "l_wheel_hex")
+            .text(hex(v.accent)),
+    );
+    out.push(
+        Hit::new(rect(x + d + 10, y + 36, content_right(), y + 54), Kind::Label, "l_wheel_hint")
+            .text("外环选色相"),
+    );
+    out.push(
+        Hit::new(rect(x + d + 10, y + 54, content_right(), y + 72), Kind::Label, "l_wheel_hint2")
+            .text("内块选明度/饱和"),
+    );
+    y + 6 + d + 8
 }
 
 const PREVIEW_IDS: [&'static str; 3] = ["prev0", "prev1", "prev2"];

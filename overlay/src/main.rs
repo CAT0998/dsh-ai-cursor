@@ -18,6 +18,7 @@
 
 mod custom;
 mod sections;
+mod wheel;
 mod sprite;
 mod widget;
 
@@ -170,6 +171,7 @@ struct St {
     footer_tick: Instant,
     drag_slider: Option<&'static str>,
     drag_panel: Option<(i32, i32)>,
+    drag_wheel: bool,
 
     // --- permission ---
     permission: u8,
@@ -231,6 +233,7 @@ impl St {
             footer_tick: now,
             drag_slider: None,
             drag_panel: None,
+            drag_wheel: false,
             permission: 3,
             prev_permission: 3,
             slots: [Slot::new(SLOT_CURSOR), Slot::new(SLOT_HINT), Slot::new(SLOT_ORNAMENT)],
@@ -680,6 +683,22 @@ fn slot_is_image(slot: &Slot) -> bool {
 }
 
 static SPRITES: OnceLock<Mutex<SpriteCache>> = OnceLock::new();
+static WHEEL: OnceLock<Mutex<wheel::Wheel>> = OnceLock::new();
+
+fn wheel() -> &'static Mutex<wheel::Wheel> {
+    WHEEL.get_or_init(|| Mutex::new(unsafe { wheel::Wheel::new(SS_PANEL) }))
+}
+
+/// Single place that changes the accent, so the colour wheel never drifts out of
+/// sync with the colour set by a swatch, a channel bar or a tool call.
+fn set_accent(st: &mut St, rgb: u32) {
+    st.accent = rgb & 0xFFFFFF;
+    if let Some(w) = WHEEL.get() {
+        w.lock().unwrap().set_from_rgb(st.accent);
+    }
+    st.dirty = true;
+    st.panel_dirty = true;
+}
 
 fn sprites() -> &'static Mutex<SpriteCache> {
     SPRITES.get_or_init(|| Mutex::new(SpriteCache::default()))
@@ -1010,7 +1029,27 @@ unsafe fn draw_panel(cv: &Canvas, v: &PanelView, hits: &[Hit], h: i32) {
                 cv.fill_circle(kx, cy, 6, 0xFFFFFF);
                 cv.ring_circle(kx, cy, 6, 1, 0x101820);
             }
-            Kind::Wheel | Kind::Preview => {}
+            Kind::Wheel => {
+                let mut wh = wheel().lock().unwrap();
+                wh.ensure();
+                wh.blit(cv.hdc_big, h.r.left * cv.ss, h.r.top * cv.ss);
+                let cx = h.r.left + wheel::D / 2;
+                let cy = h.r.top + wheel::D / 2;
+                // hue marker on the ring
+                let angle_hue = (1.0 - wh.hue).rem_euclid(1.0);
+                let ang = angle_hue * std::f64::consts::TAU;
+                let rr = (wheel::R_IN + wheel::R_OUT) / 2.0;
+                let mx = cx + (rr * ang.cos()) as i32;
+                let my = cy + (rr * ang.sin()) as i32;
+                cv.ring_circle(mx, my, 6, 2, 0xFFFFFF);
+                cv.ring_circle(mx, my, 7, 1, 0x101820);
+                // saturation/value marker inside the square
+                let sx = cx + ((wh.sat - 0.5) * wheel::SQ) as i32;
+                let sy = cy + ((0.5 - wh.val) * wheel::SQ) as i32;
+                cv.ring_circle(sx, sy, 5, 2, 0xFFFFFF);
+                cv.ring_circle(sx, sy, 6, 1, 0x101820);
+            }
+            Kind::Preview => {}
             Kind::Header | Kind::Chip => {}
         }
     }
@@ -1315,8 +1354,7 @@ fn on_toggle(st: &mut St, id: &str) {
             } else if let Some(rest) = id.strip_prefix("sw") {
                 if let Ok(i) = rest.parse::<usize>() {
                     if let Some(rgb) = SWATCHES.get(i) {
-                        st.accent = *rgb;
-                        st.dirty = true;
+                        set_accent(st, *rgb);
                     }
                 }
             }
@@ -1347,9 +1385,7 @@ fn channel_value(st: &mut St, channel: i32, x: i32, hits: &[Hit]) {
     let t = ((x - h.r.left) as f64 / (h.r.right - h.r.left).max(1) as f64).clamp(0.0, 1.0);
     let mut c = channels_of(st.accent);
     c[channel as usize] = (t * 255.0).round() as u8;
-    st.accent = ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32;
-    st.dirty = true;
-    st.panel_dirty = true;
+    set_accent(st, ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32);
 }
 
 unsafe fn slider_value(st: &mut St, id: &str, x: i32, hits: &[Hit]) {
@@ -1410,8 +1446,7 @@ fn apply_custom_set(st: &mut St, set: &serde_json::Value) {
     }
     if let Some(hexs) = set.get("color").and_then(|x| x.as_str()) {
         if let Some(rgb) = parse_hex(hexs) {
-            st.accent = rgb;
-            st.dirty = true;
+            set_accent(st, rgb);
         }
     }
     st.panel_dirty = true;
@@ -1454,6 +1489,22 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                 st.want_panel_move = true;
                 return LRESULT(0);
             }
+            if st.drag_wheel {
+                let hits = panel_layout(&view_of(&st));
+                if let Some(h) = hits.iter().find(|h| h.kind == Kind::Wheel) {
+                    let lx = x - h.r.left;
+                    let ly = y - h.r.top;
+                    let mut wh = wheel().lock().unwrap();
+                    if wh.hit(lx, ly) {
+                        let rgb = wh.rgb();
+                        drop(wh);
+                        st.accent = rgb & 0xFFFFFF;
+                        st.dirty = true;
+                        st.panel_dirty = true;
+                    }
+                }
+                return LRESULT(0);
+            }
             if let Some(id) = st.drag_slider {
                 let hits = panel_layout(&view_of(&st));
                 let is_channel = hits.iter().any(|h| h.id == id && h.kind == Kind::Channel);
@@ -1470,7 +1521,7 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                 .filter(|h| {
                     matches!(
                         h.kind,
-                        Kind::Button | Kind::Swatch | Kind::Chip | Kind::Section | Kind::Channel
+                        Kind::Button | Kind::Swatch | Kind::Chip | Kind::Section | Kind::Channel | Kind::Wheel
                     )
                 })
                 .map(|h| h.id.to_string())
@@ -1493,6 +1544,20 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                         let mut p = POINT::default();
                         let _ = GetCursorPos(&mut p);
                         st.drag_panel = Some((p.x - st.panel_pos.0, p.y - st.panel_pos.1));
+                        handled = true;
+                    }
+                    Kind::Wheel => {
+                        let lx = x - h.r.left;
+                        let ly = y - h.r.top;
+                        let mut wh = wheel().lock().unwrap();
+                        if wh.hit(lx, ly) {
+                            let rgb = wh.rgb();
+                            drop(wh);
+                            st.accent = rgb & 0xFFFFFF;
+                            st.dirty = true;
+                            st.panel_dirty = true;
+                        }
+                        st.drag_wheel = true;
                         handled = true;
                     }
                     Kind::Slider | Kind::Channel => {
@@ -1531,6 +1596,7 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                 let mut st = s.lock().unwrap();
                 st.drag_slider = None;
                 st.drag_panel = None;
+                st.drag_wheel = false;
                 st.panel_dirty = true;
             }
             let _ = ReleaseCapture();
@@ -1663,9 +1729,7 @@ fn handle_line(line: &str) {
         "color" => {
             if let Some(hexs) = v.get("hex").and_then(|t| t.as_str()) {
                 if let Some(rgb) = parse_hex(hexs) {
-                    st.accent = rgb;
-                    st.dirty = true;
-                    st.panel_dirty = true;
+                    set_accent(&mut st, rgb);
                 }
             }
         }
