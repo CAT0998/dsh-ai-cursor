@@ -1031,6 +1031,9 @@ unsafe fn draw_panel(cv: &Canvas, v: &PanelView, hits: &[Hit], h: i32) {
             }
             Kind::Wheel => {
                 let mut wh = wheel().lock().unwrap();
+                if !wh.is_synced() {
+                    wh.set_from_rgb(v.accent);
+                }
                 wh.ensure();
                 wh.blit(cv.hdc_big, h.r.left * cv.ss, h.r.top * cv.ss);
                 let cx = h.r.left + wheel::D / 2;

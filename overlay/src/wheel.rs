@@ -72,6 +72,8 @@ pub struct Wheel {
     ss: i32,
     /// Hue (0..1) the square was rendered for; `-1` forces a re-render.
     rendered_hue: f64,
+    /// False until a colour has been loaded; the panel syncs on first draw.
+    synced: bool,
     pub hue: f64,
     pub sat: f64,
     pub val: f64,
@@ -104,14 +106,20 @@ impl Wheel {
             bits: bits as *mut u8,
             ss,
             rendered_hue: -1.0,
+            synced: false,
             hue: 0.0,
             sat: 1.0,
             val: 1.0,
         }
     }
 
+    pub fn is_synced(&self) -> bool {
+        self.synced
+    }
+
     pub fn set_from_rgb(&mut self, rgb: u32) {
         let (h, s, v) = rgb_to_hsv(rgb);
+        self.synced = true;
         self.hue = h;
         self.sat = s;
         self.val = v;
@@ -130,7 +138,10 @@ impl Wheel {
         let ss = self.ss;
         let n = (D * ss) as usize;
         let c = n as f64 / 2.0;
-        let keyb = [255u8, 0, 255, 255]; // BGRA magenta
+        // Fill the corners with the panel background rather than a key colour:
+        // the wheel is blitted over an already-painted panel, and a key colour here
+        // would punch a transparent hole around it.
+        let bg = [0x1Cu8, 0x14, 0x0F, 255]; // BGRA of 0x0F141C
         let px = std::slice::from_raw_parts_mut(self.bits, n * n * 4);
 
         for y in 0..n {
@@ -158,9 +169,9 @@ impl Wheel {
                         px[o + 3] = 255;
                     }
                     None => {
-                        px[o] = keyb[0];
-                        px[o + 1] = keyb[1];
-                        px[o + 2] = keyb[2];
+                        px[o] = bg[0];
+                        px[o + 1] = bg[1];
+                        px[o + 2] = bg[2];
                         px[o + 3] = 255;
                     }
                 }
