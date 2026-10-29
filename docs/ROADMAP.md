@@ -19,10 +19,15 @@
 - 真实指针按住光标附近（46px 内）→ 进入拖拽，跟随指针移动
 - 松手 → `permission = 0`（AI 自动停止），并在 `status.drag_feedback` 留下说明
 - 面板「操作」分区新增 `拖拽 可用/禁用` 开关（`drag_toggle`）
-- **实测未触发**：用 `SetCursorPos` + `mouse_event` 合成了一次真实拖拽
-  （(900,520) → (1150,600)），松手后状态仍是 `(900,520)`、`permission=管理员`，
-  说明命中/按键检测没生效。下一步：把 `GetAsyncKeyState` 的原始返回值写进 `status`
-  看是真没按到，还是键值判断写错了。
+- **诊断结果（已定位到根因方向）**：加了 `drag_raw / drag_seen_down / drag_near` 三个
+  诊断字段后，用独立浮层进程实测合成拖拽：
+  `held  raw=0 seen=False near=True dragging=False`
+  → **几何命中是对的（`near=True`）**，但 `GetAsyncKeyState(VK_LBUTTON)` 在按键确实
+  被按住期间返回 **0**，所以永远进不了拖拽。
+- 结论：`GetAsyncKeyState` 看不到这次合成按键。下一步二选一：
+  1. 改用 **`SetWindowsHookEx(WH_MOUSE_LL)`** 低级鼠标钩子——它能收到注入输入，是最稳的做法；
+  2. 或者先让真人在光标上按住一次，确认 `drag_raw` 会不会变成非 0（能变说明只是合成输入
+     不被 `GetAsyncKeyState` 认，真人可用）。
 
 ### P1b 收尾
 - 图案槽位的**文件选择框**（Win32 打开对话框）。目前可以：素材目录按文件名引用、绝对路径、`‹ ›` 循环、工具 `ai_mouse_sprite`。

@@ -50,7 +50,10 @@ export function describeStatus(status: OverlayStatus): string {
     `badge=${status.badge === false ? 'off' : 'on'}`,
     `permission=${levelName(status.permission ?? 3)}(${normalizeLevel(status.permission, 3)})`,
     `panel=${status.panel ? (status.panel_expanded === false ? 'chip' : 'full') : 'off'}`,
+    `drag=${status.drag_enabled === false ? 'off' : 'on'}${status.dragging ? '/dragging' : ''}`,
+    `press=${status.drag_seen_down ? 'seen' : 'no'}`,
   ]
+  if (status.drag_feedback) parts.push(`note=${status.drag_feedback}`)
   if (status.excluded_from_capture) parts.push('excluded_from_capture=true')
   return parts.join(' ')
 }

@@ -211,6 +211,10 @@ struct St {
     /// Offset from the pointer to the cursor tip while dragging.
     drag_grab: (f64, f64),
     drag_was_down: bool,
+    /// Diagnostics: was a physical press ever observed, and what did the poll see?
+    drag_seen_down: bool,
+    drag_raw: i32,
+    drag_near: bool,
     /// What to tell the agent after the user took the cursor away.
     drag_feedback: Option<String>,
     want_dump: Option<(String, bool)>, // (path, panel?)
@@ -287,6 +291,9 @@ impl St {
             dragging: false,
             drag_grab: (0.0, 0.0),
             drag_was_down: false,
+            drag_seen_down: false,
+            drag_raw: 0,
+            drag_near: false,
             drag_feedback: None,
             custom: custom::CustomSpec::default(),
             want_dump: None,
@@ -2218,6 +2225,9 @@ fn handle_line(line: &str) {
     out["drag_enabled"] = serde_json::json!(st.drag_enabled);
     out["dragging"] = serde_json::json!(st.dragging);
     out["drag_feedback"] = serde_json::json!(st.drag_feedback);
+    out["drag_seen_down"] = serde_json::json!(st.drag_seen_down);
+    out["drag_raw"] = serde_json::json!(st.drag_raw);
+    out["drag_near"] = serde_json::json!(st.drag_near);
     out["panel_x"] = serde_json::json!(st.panel_pos.0);
     out["panel_y"] = serde_json::json!(st.panel_pos.1);
     let mut slot_out = serde_json::Map::new();
@@ -2570,7 +2580,8 @@ fn main() {
             // The cursor window is click-through, so it never receives the mouse
             // message; the pointer is polled instead. The press also reaches
             // whatever is underneath, which is the price of staying click-through.
-            let now_down = (GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16 & 0x8000) != 0;
+            let raw = GetAsyncKeyState(VK_LBUTTON.0 as i32);
+            let now_down = (raw as u16 & 0x8000) != 0;
             {
                 let mut p = POINT::default();
                 let _ = GetCursorPos(&mut p);
@@ -2607,6 +2618,11 @@ fn main() {
                     }
                 }
                 s.drag_was_down = now_down;
+                s.drag_raw = raw as i32;
+                s.drag_near = near;
+                if now_down {
+                    s.drag_seen_down = true;
+                }
             }
 
             // Sprite frames advance whether or not the cursor is on screen: the
