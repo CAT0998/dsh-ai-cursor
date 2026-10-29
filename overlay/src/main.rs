@@ -81,6 +81,7 @@ const PH: i32 = 396; // expanded panel height
 const CHIP_W: i32 = 132; // collapsed panel width
 const CHIP_H: i32 = 40; // collapsed panel height
 const SS_PANEL: i32 = 2; // supersample factor for the panel
+const GRAB: i32 = 40; // side of the clickable grab hotspot at the cursor tip
 const PH_MAX: i32 = 1200; // the panel canvas is allocated this tall and clipped per frame
 
 // Palette. Accent-dependent colours are derived from the live accent value.
@@ -221,6 +222,11 @@ struct St {
     drag_near: bool,
     /// What to tell the agent after the user took the cursor away.
     drag_feedback: Option<String>,
+    grab_hwnd: isize,
+    /// Hide the hotspot for a frame so the click cannot be re-captured.
+    want_hide_grab: bool,
+    /// Set while the human holds the grab hotspot.
+    grabbed: bool,
     want_dump: Option<(String, bool)>, // (path, panel?)
     dump_done: bool,
     dump_error: Option<String>,
@@ -299,6 +305,9 @@ impl St {
             drag_raw: 0,
             drag_near: false,
             drag_feedback: None,
+            grab_hwnd: 0,
+            want_hide_grab: false,
+            grabbed: false,
             custom: custom::CustomSpec::default(),
             want_dump: None,
             dump_done: false,
@@ -1150,6 +1159,20 @@ unsafe fn make_overlay() -> HWND {
     hwnd
 }
 
+unsafe fn make_grab() -> HWND {
+    // Layered (so it can be fully transparent-looking) but NOT click-through:
+    // this window is the handle the human grabs.
+    let hwnd = make_window(
+        w!("AiMouseGrab"),
+        w!("AI Mouse Grab"),
+        WS_EX_LAYERED.0 | WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0 | WS_EX_TOPMOST.0,
+        GRAB,
+        GRAB,
+    );
+    let _ = ShowWindow(hwnd, SW_HIDE);
+    hwnd
+}
+
 unsafe fn make_panel(x: i32, y: i32) -> HWND {
     let hwnd = make_window(
         w!("AiMousePanel"),
@@ -1929,6 +1952,68 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }
 
+/// The grab hotspot's window procedure.
+///
+/// This is the reliable way to see a press on the cursor: a small window that is
+/// NOT click-through receives an ordinary WM_LBUTTONDOWN, so no global polling or
+/// hook is needed. The trade-off is that while drag mode is on, a press inside
+/// this 40x40 box goes to us rather than to whatever is underneath.
+unsafe extern "system" fn grab_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let s = state();
+    match msg {
+        WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
+        WM_LBUTTONDOWN => {
+            let mut p = POINT::default();
+            let _ = GetCursorPos(&mut p);
+            {
+                let mut st = s.lock().unwrap();
+                // stop the agent FIRST, then let the drag happen
+                st.grabbed = true;
+                st.dragging = true;
+                st.drag_grab = (p.x as f64 - st.cur.0, p.y as f64 - st.cur.1);
+                st.prev_permission = st.permission.max(2);
+                st.permission = 0;
+                st.drag_feedback =
+                    Some("用户按住了 AI 光标，AI 控制已立即停止，正在拖动。".to_string());
+                st.dirty = true;
+                st.panel_dirty = true;
+            }
+            let _ = SetCapture(hwnd);
+            return LRESULT(0);
+        }
+        WM_MOUSEMOVE => {
+            let dragging = { s.lock().unwrap().dragging };
+            if dragging {
+                let mut p = POINT::default();
+                let _ = GetCursorPos(&mut p);
+                let mut st = s.lock().unwrap();
+                st.cur = (p.x as f64 - st.drag_grab.0, p.y as f64 - st.drag_grab.1);
+                st.target = st.cur;
+                st.dur_ms = 0.0;
+                st.last_activity = Instant::now();
+                st.dirty = true;
+            }
+            return LRESULT(0);
+        }
+        WM_LBUTTONUP => {
+            let mut st = s.lock().unwrap();
+            st.grabbed = false;
+            st.dragging = false;
+            st.drag_feedback = Some(format!(
+                "用户把 AI 光标放到了 ({:.0}, {:.0})。AI 控制仍是停止状态，需在面板上点「启用」恢复。",
+                st.cur.0, st.cur.1
+            ));
+            st.want_hide_grab = true;
+            st.dirty = true;
+            st.panel_dirty = true;
+            let _ = ReleaseCapture();
+            return LRESULT(0);
+        }
+        _ => {}
+    }
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
 unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }
@@ -2440,6 +2525,7 @@ fn main() {
         for (class, proc_) in [
             (w!("AiMouseOverlay"), overlay_proc as unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT),
             (w!("AiMousePanel"), panel_proc as unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT),
+            (w!("AiMouseGrab"), grab_proc as unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT),
         ] {
             let wc = WNDCLASSEXW {
                 cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
@@ -2458,10 +2544,12 @@ fn main() {
 
         let hwnd = make_overlay();
         let panel = make_panel(px, py);
+        let grab = make_grab();
         {
             let mut s = st.lock().unwrap();
             s.hwnd = hwnd.0 as isize;
             s.panel_hwnd = panel.0 as isize;
+            s.grab_hwnd = grab.0 as isize;
             s.panel_pos = (px, py);
         }
 
@@ -2646,6 +2734,29 @@ fn main() {
                 }
             }
 
+            // Park the grab hotspot on the cursor tip so the human can press it.
+            {
+                let (gh, show, x, y) = {
+                    let s = st.lock().unwrap();
+                    let show = s.drag_enabled && s.visible && !s.want_hide_grab;
+                    (s.grab_hwnd, show, s.cur.0 as i32, s.cur.1 as i32)
+                };
+                if gh != 0 {
+                    if show {
+                        let _ = SetWindowPos(
+                            hwnd_of(gh),
+                            HWND_TOPMOST,
+                            x - GRAB / 2,
+                            y - GRAB / 2,
+                            GRAB,
+                            GRAB,
+                            SWP_NOACTIVATE | SWP_NOZORDER | SET_WINDOW_POS_FLAGS(0x0040),
+                        );
+                    } else {
+                        let _ = ShowWindow(hwnd_of(gh), SW_HIDE);
+                    }
+                }
+            }
             if p_layer {
                 let (mode, anchor, ohwnd) = {
                     let s = st.lock().unwrap();
@@ -2842,6 +2953,12 @@ fn main() {
                 }
             }
 
+            {
+                let mut s = st.lock().unwrap();
+                if s.want_hide_grab {
+                    s.want_hide_grab = false;
+                }
+            }
             let (draw_cursor_now, cvv) = {
                 let mut s = st.lock().unwrap();
                 if s.visible && s.dirty {
