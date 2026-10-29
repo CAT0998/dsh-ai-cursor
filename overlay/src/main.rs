@@ -16,7 +16,9 @@
 //! Nothing here moves the real mouse pointer, and nothing here takes keyboard focus:
 //! the panel is WS_EX_NOACTIVATE, so clicking a button never steals the foreground.
 
+mod sections;
 mod sprite;
+mod widget;
 
 use std::io::{BufRead, Write};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -25,6 +27,7 @@ use std::time::{Duration, Instant};
 use std::path::Path;
 
 use sprite::SpriteCache;
+use widget::{channels_of, hex, Hit, Kind, PanelView, SlotView, SWATCHES};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
     COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
@@ -66,6 +69,7 @@ const PH: i32 = 396; // expanded panel height
 const CHIP_W: i32 = 132; // collapsed panel width
 const CHIP_H: i32 = 40; // collapsed panel height
 const SS_PANEL: i32 = 2; // supersample factor for the panel
+const PH_MAX: i32 = 900; // the panel canvas is allocated this tall and clipped per frame
 
 // Palette. Accent-dependent colours are derived from the live accent value.
 const C_PANEL: u32 = 0x0F141C;
@@ -92,6 +96,16 @@ fn shade(rgb: u32, f: f64) -> u32 {
         y.clamp(0.0, 255.0) as u32
     };
     (ch((rgb >> 16) & 0xFF) << 16) | (ch((rgb >> 8) & 0xFF) << 8) | ch(rgb & 0xFF)
+}
+
+/// Linear blend between two 0xRRGGBB colours.
+fn blend(a: u32, b: u32, t: f64) -> u32 {
+    let ch = |sh: u32| -> u32 {
+        let x = ((a >> sh) & 0xFF) as f64;
+        let y = ((b >> sh) & 0xFF) as f64;
+        (x + (y - x) * t).round().clamp(0.0, 255.0) as u32
+    };
+    (ch(16) << 16) | (ch(8) << 8) | ch(0)
 }
 
 fn rect(l: i32, t: i32, r: i32, b: i32) -> RECT {
@@ -162,6 +176,9 @@ struct St {
 
     slots: [Slot; 3],
     sprite_epoch: Instant,
+    collapsed: Vec<String>,
+    assets: Vec<String>,
+    panel_px_h: i32,
     want_dump: Option<(String, bool)>, // (path, panel?)
     dump_done: bool,
     dump_error: Option<String>,
@@ -215,6 +232,13 @@ impl St {
             prev_permission: 3,
             slots: [Slot::new(SLOT_CURSOR), Slot::new(SLOT_HINT), Slot::new(SLOT_ORNAMENT)],
             sprite_epoch: now,
+            collapsed: sections::SECTIONS
+                .iter()
+                .filter(|d| d.default_collapsed)
+                .map(|d| d.key.to_string())
+                .collect(),
+            assets: Vec::new(),
+            panel_px_h: PH,
             want_dump: None,
             dump_done: false,
             dump_error: None,
@@ -231,214 +255,36 @@ fn state() -> &'static Arc<Mutex<St>> {
 
 // ------------------------------------------------------------ widget model ---
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Kind {
-    Chip,
-    Header,
-    Label,
-    LabelRight,
-    Button,
-    Slider,
-    Swatch,
-    Sep,
-}
-
-#[derive(Clone)]
-struct Hit {
-    r: RECT,
-    kind: Kind,
-    id: &'static str,
-    text: String,
-    active: bool,
-    hover: bool,
-}
-
-impl Hit {
-    fn new(r: RECT, kind: Kind, id: &'static str) -> Self {
-        Hit { r, kind, id, text: String::new(), active: false, hover: false }
-    }
-    fn text(mut self, t: impl Into<String>) -> Self {
-        self.text = t.into();
-        self
-    }
-    fn active(mut self, a: bool) -> Self {
-        self.active = a;
-        self
-    }
-    fn hit(&self, x: i32, y: i32) -> bool {
-        x >= self.r.left && x < self.r.right && y >= self.r.top && y < self.r.bottom
-    }
-}
-
-/// Everything the panel needs to lay itself out. Kept as a value so the layout
-/// function stays pure: drawing and hit-testing call it with the same input and
-/// therefore can never disagree about where a widget is.
-#[derive(Clone)]
-struct PanelView {
-    full: bool,
-    theme: String,
-    badge: bool,
-    opacity: f64,
-    scale: f64,
-    accent: u32,
-    permission: u8,
-    visible: bool,
-    hover: String,
-    cur: (f64, f64),
-    fps: f64,
-    label: String,
-}
-
-const SWATCHES: [u32; 8] = [
-    0x4FC3F7, 0x7C5CFF, 0xFF6B8B, 0x34D399, 0xF5A524, 0xE2E8F0, 0xFF4D4F, 0x22D3EE,
-];
-const SWATCH_IDS: [&str; 8] = ["sw0", "sw1", "sw2", "sw3", "sw4", "sw5", "sw6", "sw7"];
-
-fn hex(rgb: u32) -> String {
-    format!("#{:06X}", rgb & 0xFFFFFF)
-}
-
 fn panel_layout(v: &PanelView) -> Vec<Hit> {
-    let mut o: Vec<Hit> = Vec::with_capacity(48);
-    let hov = |id: &str, v: &PanelView| v.hover == id;
+    let mut o: Vec<Hit> = Vec::with_capacity(96);
 
     if !v.full {
-        // ---- collapsed chip -------------------------------------------------
-        let mut c = Hit::new(rect(0, 0, CHIP_W, CHIP_H), Kind::Chip, "expand")
-            .text("\u{2261}  AI 鼠标");
+        let mut c = Hit::new(rect(0, 0, CHIP_W, CHIP_H), Kind::Chip, "expand").text("\u{2261}  AI 鼠标");
         c.active = v.permission > 0;
-        c.hover = hov("expand", v);
+        c.hover = v.hover == "expand";
         o.push(c);
         return o;
     }
 
-    let pad = 14;
+    let pad = sections::PAD;
     let right = PW - pad;
-    let col_w = (right - pad - 3 * 8) / 4; // four equal primary buttons
-
-    // ---- header -------------------------------------------------------------
-    // The two header buttons go in first: `pick()` prefers interactive widgets,
-    // but layout order is the second line of defence against the drag zone
-    // (which spans the whole strip) swallowing the click.
     o.push(
         Hit::new(rect(right - 60, 8, right - 34, 32), Kind::Button, "collapse")
             .text("\u{2500}")
-            .hover(hov("collapse", v)),
+            .hover(v.hover == "collapse"),
     );
     o.push(
         Hit::new(rect(right - 26, 8, right, 32), Kind::Button, "close")
             .text("\u{2715}")
-            .hover(hov("close", v)),
+            .hover(v.hover == "close"),
     );
     o.push(Hit::new(rect(0, 0, PW, 40), Kind::Header, "drag"));
     o.push(Hit::new(rect(pad, 0, 200, 40), Kind::Label, "title").text("AI 鼠标"));
     o.push(Hit::new(rect(pad, 40, right, 41), Kind::Sep, "sep1"));
 
-    // ---- primary actions ----------------------------------------------------
-    let y = 50;
-    let acts: [(&str, &str, bool); 4] = [
-        ("show", "显示", v.visible),
-        ("hide", "隐藏", !v.visible),
-        ("stop", "停止", v.permission == 0),
-        ("start", "启用", v.permission > 0),
-    ];
-    for (i, (id, text, on)) in acts.iter().enumerate() {
-        let x = pad + i as i32 * (col_w + 8);
-        o.push(
-            Hit::new(rect(x, y, x + col_w, y + 34), Kind::Button, id)
-                .text(*text)
-                .active(*on)
-                .hover(hov(id, v)),
-        );
-    }
-    let y = 96;
-    o.push(Hit::new(rect(pad, y, right, y + 1), Kind::Sep, "sep2"));
+    let bottom = sections::build(v, 48, &mut o);
 
-    // ---- appearance ---------------------------------------------------------
-    o.push(Hit::new(rect(pad, 106, right, 124), Kind::Label, "l_badge").text("AI 提示"));
-    o.push(
-        Hit::new(rect(pad + 116, 102, pad + 166, 128), Kind::Button, "badge_on")
-            .text("开")
-            .active(v.badge)
-            .hover(hov("badge_on", v)),
-    );
-    o.push(
-        Hit::new(rect(pad + 174, 102, pad + 224, 128), Kind::Button, "badge_off")
-            .text("关")
-            .active(!v.badge)
-            .hover(hov("badge_off", v)),
-    );
-    o.push(
-        Hit::new(rect(pad + 240, 106, right, 124), Kind::LabelRight, "l_opacity")
-            .text(format!("透明度 {}%", (v.opacity * 100.0).round() as i32)),
-    );
-    o.push(Hit::new(rect(pad, 134, right, 152), Kind::Slider, "opacity"));
-
-    o.push(Hit::new(rect(pad, 162, right, 180), Kind::Label, "l_color").text("颜色"));
-    let sy = 184;
-    for (i, (id, rgb)) in SWATCH_IDS.iter().zip(SWATCHES.iter()).enumerate() {
-        let x = pad + i as i32 * 36;
-        o.push(
-            Hit::new(rect(x, sy, x + 26, sy + 26), Kind::Swatch, id)
-                .text(hex(*rgb))
-                .active(v.accent & 0xFFFFFF == *rgb)
-                .hover(hov(id, v)),
-        );
-    }
-    o.push(
-        Hit::new(rect(pad + 268, 188, right, 206), Kind::LabelRight, "l_hex")
-            .text(hex(v.accent)),
-    );
-
-    let y = 226;
-    o.push(Hit::new(rect(pad, y, right, y + 1), Kind::Sep, "sep3"));
-
-    // ---- cursor style -------------------------------------------------------
-    o.push(Hit::new(rect(pad, 238, right, 256), Kind::Label, "l_style").text("造型"));
-    let themes: [(&str, &str); 3] = [("whale", "鲸鱼"), ("dot", "圆点"), ("arrow", "箭头")];
-    for (i, (tid, text)) in themes.iter().enumerate() {
-        let x = pad + 116 + i as i32 * 66;
-        let id = match *tid {
-            "whale" => "theme_whale",
-            "dot" => "theme_dot",
-            _ => "theme_arrow",
-        };
-        o.push(
-            Hit::new(rect(x, 234, x + 58, 260), Kind::Button, id)
-                .text(*text)
-                .active(v.theme == *tid)
-                .hover(hov(id, v)),
-        );
-    }
-    o.push(
-        Hit::new(rect(pad + 320, 238, right, 256), Kind::LabelRight, "l_scale")
-            .text(format!("大小 {}%", (v.scale * 100.0).round() as i32)),
-    );
-    o.push(Hit::new(rect(pad, 264, right, 282), Kind::Slider, "scale"));
-
-    let y = 292;
-    o.push(Hit::new(rect(pad, y, right, y + 1), Kind::Sep, "sep4"));
-
-    // ---- permission ---------------------------------------------------------
-    o.push(Hit::new(rect(pad, 302, right, 320), Kind::Label, "l_perm").text("权限等级"));
-    let perms: [(&str, &str, u8); 4] = [
-        ("perm_0", "停止", 0),
-        ("perm_1", "只读", 1),
-        ("perm_2", "操作", 2),
-        ("perm_3", "管理员", 3),
-    ];
-    for (i, (id, text, lvl)) in perms.iter().enumerate() {
-        let x = pad + i as i32 * (col_w + 8);
-        o.push(
-            Hit::new(rect(x, 324, x + col_w, y + 56), Kind::Button, id)
-                .text(*text)
-                .active(v.permission == *lvl)
-                .hover(hov(id, v)),
-        );
-    }
-
-    let y = 366;
-    o.push(Hit::new(rect(pad, y, right, y + 1), Kind::Sep, "sep5"));
+    o.push(Hit::new(rect(pad, bottom, right, bottom + 1), Kind::Sep, "sep5"));
     let perm_name = match v.permission {
         0 => "停止",
         1 => "只读",
@@ -453,22 +299,11 @@ fn panel_layout(v: &PanelView) -> Vec<Hit> {
         v.fps,
         perm_name
     );
-    o.push(Hit::new(rect(pad, y + 6, right, PH - 6), Kind::Label, "footer").text(footer));
-    if v.label.is_empty() {
-        // keeps the field referenced even when empty; the badge is drawn separately
-    }
+    o.push(Hit::new(rect(pad, bottom + 6, right, bottom + 24), Kind::Label, "footer").text(footer));
     o
 }
 
-impl Hit {
-    fn hover(mut self, h: bool) -> Self {
-        self.hover = h;
-        self
-    }
-}
-
 // ------------------------------------------------------------------ canvas ---
-
 struct Fonts {
     title: HGDIOBJ,
     label: HGDIOBJ,
@@ -1053,7 +888,7 @@ impl Canvas {
 
 // -------------------------------------------------------------- panel paint ---
 
-unsafe fn draw_panel(cv: &Canvas, v: &PanelView, hits: &[Hit]) {
+unsafe fn draw_panel(cv: &Canvas, v: &PanelView, hits: &[Hit], h: i32) {
     cv.clear();
 
     if !v.full {
@@ -1070,7 +905,7 @@ unsafe fn draw_panel(cv: &Canvas, v: &PanelView, hits: &[Hit]) {
     }
 
     // background
-    let body = rect(0, 0, PW, PH);
+    let body = rect(0, 0, PW, h);
     cv.fill_round(body, 14, C_PANEL);
     cv.stroke_round(body, 14, C_BORDER, 1);
     // header strip
@@ -1138,11 +973,44 @@ unsafe fn draw_panel(cv: &Canvas, v: &PanelView, hits: &[Hit]) {
                     cv.ring_circle(cx, cy, 13, 1, C_BORDER);
                 }
             }
+            Kind::Section => {
+                if h.hover {
+                    cv.fill_round(h.r, 6, C_BTN_HOVER);
+                }
+                cv.text_at(
+                    cv.fonts.button,
+                    h.r.left + 2,
+                    h.r.top + 3,
+                    &h.text,
+                    if h.hover { C_TEXT } else { C_MUTED },
+                );
+            }
+            Kind::Channel => {
+                let cy = (h.r.top + h.r.bottom) / 2;
+                let track = rect(h.r.left, cy - 5, h.r.right, cy + 5);
+                let ch = h.data.clamp(0, 2) as usize;
+                let mut rgb = [0u32; 3];
+                rgb[ch] = 255;
+                let full = (rgb[0] << 16) | (rgb[1] << 8) | rgb[2];
+                let w = track.right - track.left;
+                let steps = 48;
+                for i in 0..steps {
+                    let a = i as f64 / (steps - 1) as f64;
+                    let x0 = track.left + (w * i) / steps;
+                    let x1 = track.left + (w * (i + 1)) / steps;
+                    cv.fill_rect(rect(x0, track.top, x1, track.bottom), blend(0x000000, full, a));
+                }
+                let value = h.text.trim().parse::<f64>().unwrap_or(0.0) / 255.0;
+                let kx = track.left + (w as f64 * value) as i32;
+                cv.fill_circle(kx, cy, 6, 0xFFFFFF);
+                cv.ring_circle(kx, cy, 6, 1, 0x101820);
+            }
+            Kind::Wheel => {}
             Kind::Header | Kind::Chip => {}
         }
     }
 
-    cv.present(state().lock().unwrap().panel_hwnd, PW, PH, None, 0.98);
+    cv.present(state().lock().unwrap().panel_hwnd, PW, h, None, 0.98);
 }
 
 // ---------------------------------------------------------------- windows ----
@@ -1222,7 +1090,47 @@ fn view_of(st: &St) -> PanelView {
         cur: st.cur,
         fps: st.fps,
         label: st.label.clone(),
+        collapsed: st.collapsed.clone(),
+        slots: [
+            slot_view(&st.slots[SLOT_CURSOR], "光标"),
+            slot_view(&st.slots[SLOT_HINT], "提示"),
+            slot_view(&st.slots[SLOT_ORNAMENT], "附属"),
+        ],
+        assets: st.assets.clone(),
+        rgb: channels_of(st.accent),
     }
+}
+
+fn slot_view(slot: &Slot, name: &str) -> SlotView {
+    let mut v = SlotView {
+        name: name.to_string(),
+        source: slot.source.clone(),
+        size: slot.size,
+        opacity: slot.opacity,
+        flip: slot.flip_x,
+        frames: 1,
+        error: None,
+    };
+    if slot.is_image() {
+        let mut cache = sprites().lock().unwrap();
+        if let Some(r) = cache.get(Path::new(&slot.source)) {
+            match r {
+                Ok(spr) => v.frames = spr.frames.len(),
+                Err(e) => v.error = Some(e.clone()),
+            }
+        }
+    }
+    v
+}
+
+/// Height the panel needs for the current expansion state.
+fn panel_height(v: &PanelView) -> i32 {
+    if !v.full {
+        return CHIP_H;
+    }
+    let mut sink: Vec<Hit> = Vec::new();
+    let bottom = sections::build(v, 48, &mut sink);
+    (bottom + 30).clamp(160, PH_MAX)
 }
 
 fn cursor_view(st: &St) -> CursorView {
@@ -1303,7 +1211,17 @@ fn on_toggle(st: &mut St, id: &str) {
             st.dirty = true;
         }
         _ => {
-            if let Some(rest) = id.strip_prefix("perm_") {
+            if let Some(sec) = sections::SECTIONS.iter().find(|d| d.header == id) {
+                if let Some(pos) = st.collapsed.iter().position(|k| k == sec.key) {
+                    st.collapsed.remove(pos);
+                } else {
+                    st.collapsed.push(sec.key.to_string());
+                }
+            } else if id.starts_with("art_prev") || id.starts_with("art_next") {
+                let dir: i32 = if id.starts_with("art_prev") { -1 } else { 1 };
+                let slot = id[8..].parse::<usize>().unwrap_or(0);
+                cycle_slot_source(st, slot, dir);
+            } else if let Some(rest) = id.strip_prefix("perm_") {
                 let lvl: u8 = rest.parse().unwrap_or(3).min(3);
                 if lvl == 0 {
                     st.prev_permission = st.permission.max(2);
@@ -1331,6 +1249,33 @@ fn on_toggle(st: &mut St, id: &str) {
     st.panel_dirty = true;
 }
 
+fn id_channel(id: &str) -> i32 {
+    match id {
+        "ch_r" => 0,
+        "ch_g" => 1,
+        _ => 2,
+    }
+}
+
+/// Set one 0-255 colour channel from the pointer position on its bar.
+fn channel_value(st: &mut St, channel: i32, x: i32, hits: &[Hit]) {
+    let channel = channel.clamp(0, 2);
+    let id = match channel {
+        0 => "ch_r",
+        1 => "ch_g",
+        _ => "ch_b",
+    };
+    let Some(h) = hits.iter().find(|h| h.id == id && h.kind == Kind::Channel) else {
+        return;
+    };
+    let t = ((x - h.r.left) as f64 / (h.r.right - h.r.left).max(1) as f64).clamp(0.0, 1.0);
+    let mut c = channels_of(st.accent);
+    c[channel as usize] = (t * 255.0).round() as u8;
+    st.accent = ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32;
+    st.dirty = true;
+    st.panel_dirty = true;
+}
+
 unsafe fn slider_value(st: &mut St, id: &str, x: i32, hits: &[Hit]) {
     let Some(h) = hits.iter().find(|h| h.id == id) else { return };
     let (a, b) = (h.r.left + 9, h.r.right - 9);
@@ -1355,13 +1300,33 @@ unsafe fn slider_value(st: &mut St, id: &str, x: i32, hits: &[Hit]) {
 fn pick<'a>(hits: &'a [Hit], x: i32, y: i32) -> Option<&'a Hit> {
     fn rank(k: Kind) -> u8 {
         match k {
-            Kind::Button | Kind::Swatch | Kind::Chip => 0,
-            Kind::Slider => 1,
+            Kind::Button | Kind::Swatch | Kind::Chip | Kind::Section => 0,
+            Kind::Slider | Kind::Channel | Kind::Wheel => 1,
             Kind::Header => 2,
             Kind::Label | Kind::LabelRight | Kind::Sep => 3,
         }
     }
     hits.iter().filter(|h| h.hit(x, y)).min_by_key(|h| rank(h.kind))
+}
+
+/// Cycle a picture slot: builtin vector art -> every picture in the asset folder
+/// -> off. The panel half of the artwork module; the tools can set an exact path.
+fn cycle_slot_source(st: &mut St, slot_idx: usize, dir: i32) {
+    if slot_idx >= st.slots.len() {
+        return;
+    }
+    let options: Vec<String> = std::iter::once("builtin".to_string())
+        .chain(st.assets.iter().cloned())
+        .chain(std::iter::once(String::new()))
+        .collect();
+    let current = st.slots[slot_idx].source.clone();
+    let pos = options.iter().position(|o| *o == current).unwrap_or(0) as i32;
+    let next = (pos + dir).rem_euclid(options.len() as i32) as usize;
+    st.slots[slot_idx].source = options[next].clone();
+    st.slots[slot_idx].last_frame = usize::MAX;
+    st.sprite_epoch = Instant::now();
+    st.dirty = true;
+    st.panel_dirty = true;
 }
 
 fn client_xy(lparam: LPARAM) -> (i32, i32) {
@@ -1385,12 +1350,23 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
             }
             if let Some(id) = st.drag_slider {
                 let hits = panel_layout(&view_of(&st));
-                slider_value(&mut st, id, x, &hits);
+                let is_channel = hits.iter().any(|h| h.id == id && h.kind == Kind::Channel);
+                if is_channel {
+                    let ch = id_channel(id);
+                    channel_value(&mut st, ch, x, &hits);
+                } else {
+                    slider_value(&mut st, id, x, &hits);
+                }
                 return LRESULT(0);
             }
             let hits = panel_layout(&view_of(&st));
             let hover = pick(&hits, x, y)
-                .filter(|h| matches!(h.kind, Kind::Button | Kind::Swatch | Kind::Chip))
+                .filter(|h| {
+                    matches!(
+                        h.kind,
+                        Kind::Button | Kind::Swatch | Kind::Chip | Kind::Section | Kind::Channel
+                    )
+                })
                 .map(|h| h.id.to_string())
                 .unwrap_or_default();
             if hover != st.hover {
@@ -1413,13 +1389,19 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                         st.drag_panel = Some((p.x - st.panel_pos.0, p.y - st.panel_pos.1));
                         handled = true;
                     }
-                    Kind::Slider => {
+                    Kind::Slider | Kind::Channel => {
                         let id = h.id;
+                        let kind = h.kind;
+                        let data = h.data;
                         st.drag_slider = Some(id);
-                        slider_value(&mut st, id, x, &hits);
+                        if kind == Kind::Channel {
+                            channel_value(&mut st, data, x, &hits);
+                        } else {
+                            slider_value(&mut st, id, x, &hits);
+                        }
                         handled = true;
                     }
-                    Kind::Button | Kind::Swatch | Kind::Chip => {
+                    Kind::Button | Kind::Swatch | Kind::Chip | Kind::Section => {
                         let id = h.id;
                         drop(st);
                         {
@@ -1635,6 +1617,36 @@ fn handle_line(line: &str) {
                     st.dirty = true;
                 }
             }
+        }
+        "assets" => {
+            // Scan the folder the plugin shell resolved; the panel cycles through
+            // these when the user presses ◀ / ▶ on a slot.
+            let dir = v.get("dir").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let mut found: Vec<String> = Vec::new();
+            if !dir.is_empty() {
+                if let Ok(rd) = std::fs::read_dir(&dir) {
+                    for entry in rd.flatten() {
+                        let path = entry.path();
+                        let ext = path
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .map(|e| e.to_ascii_lowercase())
+                            .unwrap_or_default();
+                        if matches!(
+                            ext.as_str(),
+                            "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "tif"
+                                | "tiff" | "svg"
+                        ) {
+                            found.push(path.to_string_lossy().to_string());
+                        }
+                    }
+                }
+            }
+            found.sort();
+            st.assets = found.clone();
+            st.panel_dirty = true;
+            out["assets"] = serde_json::json!(found);
+            out["count"] = serde_json::json!(found.len());
         }
         "sprite_rescan" => {
             sprites().lock().unwrap().clear();
@@ -1893,7 +1905,7 @@ fn main() {
         }));
 
         let cursor_cv = Canvas::new(W, H, SS);
-        let panel_cv = Canvas::new(PW, PH, SS_PANEL);
+        let panel_cv = Canvas::new(PW, PH_MAX, SS_PANEL);
 
         loop {
             let mut msg = MSG::default();
@@ -1937,7 +1949,26 @@ fn main() {
 
             // Deferred Win32 actions run on the window thread, never while the
             // state lock is held (these calls can re-enter the wndproc).
-            let (do_show, do_hide, affinity, dump, p_show, p_hide, p_resize, p_move, p_pos, p_full) = {
+            // The panel grows and shrinks with its sections, so the requested
+            // height is recomputed from the live expansion state.
+            {
+                let want_h = {
+                    let s = st.lock().unwrap();
+                    if s.panel_full {
+                        panel_height(&view_of(&s))
+                    } else {
+                        CHIP_H
+                    }
+                };
+                let mut s = st.lock().unwrap();
+                if s.panel_px_h != want_h {
+                    s.panel_px_h = want_h;
+                    s.want_panel_resize = true;
+                    s.panel_dirty = true;
+                }
+            }
+
+            let (do_show, do_hide, affinity, dump, p_show, p_hide, p_resize, p_move, p_pos, p_full, p_h) = {
                 let mut s = st.lock().unwrap();
                 let show = s.want_show;
                 let hide = s.want_hide;
@@ -1954,7 +1985,7 @@ fn main() {
                 s.want_panel_resize = false;
                 s.want_panel_move = false;
                 s.panel_dirty = s.panel_dirty || ps || ph || pr;
-                (show, hide, aff, d, ps, ph, pr, pm, s.panel_pos, s.panel_full)
+                (show, hide, aff, d, ps, ph, pr, pm, s.panel_pos, s.panel_full, s.panel_px_h)
             };
 
             let (ohwnd, phwnd) = {
@@ -2014,7 +2045,8 @@ fn main() {
                 let _ = ShowWindow(hwnd_of(phwnd), SW_SHOWNOACTIVATE);
             }
             if p_resize {
-                let (w, h) = if p_full { (PW, PH) } else { (CHIP_W, CHIP_H) };
+                let w = if p_full { PW } else { CHIP_W };
+                let h = if p_full { p_h } else { CHIP_H };
                 let _ = SetWindowPos(
                     hwnd_of(phwnd),
                     HWND_TOPMOST,
@@ -2041,8 +2073,8 @@ fn main() {
                 if target_panel {
                     let vw = { view_of(&st.lock().unwrap()) };
                     let hits = panel_layout(&vw);
-                    draw_panel(&panel_cv, &vw, &hits);
-                    let (w, h) = if vw.full { (PW, PH) } else { (CHIP_W, CHIP_H) };
+                    let (w, h) = if vw.full { (PW, panel_height(&vw)) } else { (CHIP_W, CHIP_H) };
+                    draw_panel(&panel_cv, &vw, &hits, h);
                     panel_cv.dump_bmp(&path, w, h);
                 } else {
                     let cvv = { cursor_view(&st.lock().unwrap()) };
@@ -2135,7 +2167,8 @@ fn main() {
             };
             if draw_panel_now {
                 let hits = panel_layout(&pv);
-                draw_panel(&panel_cv, &pv, &hits);
+                let h = if pv.full { panel_height(&pv) } else { CHIP_H };
+                draw_panel(&panel_cv, &pv, &hits, h);
             }
 
             {

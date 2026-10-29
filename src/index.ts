@@ -162,6 +162,7 @@ export function apply(ctx: Context, config: ConfigShape): void {
     await send('opacity', { value: config.opacity })
     await send('color', { hex: config.color })
     await send('scale', { value: config.scale })
+    await send('assets', { dir: config.assetDir })
     await send('panel_expanded', { expanded: config.panelExpanded })
     await send('panel', { visible: config.panel })
     await send('permission', { level: config.permission })
@@ -579,6 +580,8 @@ export function apply(ctx: Context, config: ConfigShape): void {
       output: TEXT_OUTPUT,
       async execute(args: { limit?: number }) {
         const dir = config.assetDir || defaultAssetDir()
+        // Keep the panel's slot cyclers in step with what the tool reports.
+        await send('assets', { dir }).catch(() => undefined)
         const entries: AssetEntry[] = listAssets(dir)
         if (entries.length === 0) {
           return (
