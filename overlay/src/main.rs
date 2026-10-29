@@ -36,12 +36,13 @@ use windows::Win32::Foundation::{
     WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen, CreateSolidBrush, DeleteDC,
+    BitBlt, CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen, CreateSolidBrush, DeleteDC,
     DeleteObject, Ellipse, FillRect, GetDC, GetStockObject, GetTextExtentPoint32W, LineTo, MoveToEx,
     Polygon, ReleaseDC, RoundRect, SelectObject, SetBkMode, SetTextColor, TextOutW, AC_SRC_ALPHA,
     AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_USAGE, HDC, HGDIOBJ,
-    NULL_PEN, PS_SOLID, TRANSPARENT,
+    NULL_PEN, PS_SOLID, SRCCOPY, TRANSPARENT,
 };
+use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -1570,6 +1571,70 @@ fn rect_y_clamp(y: i32, h: i32, screen_h: i32) -> i32 {
     y.min(max_y).max(8)
 }
 
+// ---------------------------------------------------------- window layer ----
+
+/// Render one window into its own bitmap, as a self-contained layer the agent can
+/// look at and reason about.
+///
+/// This replaces fighting the OS z-order: instead of trying to wedge our cursor
+/// between live windows, each window is captured on demand and the cursor's
+/// position relative to it is computed from its rect. `PrintWindow` with
+/// PW_RENDERFULLCONTENT also captures DWM-composited (Electron / UWP) windows.
+unsafe fn capture_window(hwnd: isize, path: &str) -> Result<(i32, i32, RECT), String> {
+    let h = HWND(hwnd as *mut core::ffi::c_void);
+    let mut r = RECT::default();
+    if GetWindowRect(h, &mut r).is_err() {
+        return Err("GetWindowRect failed".to_string());
+    }
+    let w = (r.right - r.left).max(1);
+    let hh = (r.bottom - r.top).max(1);
+    if w > 8192 || hh > 8192 {
+        return Err(format!("window too large to capture: {w}x{hh}"));
+    }
+
+    let screen = GetDC(None);
+    let mem = CreateCompatibleDC(screen);
+    let mut bmi = BITMAPINFO::default();
+    bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+    bmi.bmiHeader.biWidth = w;
+    bmi.bmiHeader.biHeight = -hh; // top-down
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB.0;
+
+    let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+    let bmp = CreateDIBSection(mem, &bmi, DIB_USAGE(0), &mut bits, HANDLE::default(), 0)
+        .map_err(|e| format!("CreateDIBSection: {e}"))?;
+    SelectObject(mem, HGDIOBJ(bmp.0));
+
+    // 0x2 = PW_RENDERFULLCONTENT
+    let ok = PrintWindow(h, mem, PRINT_WINDOW_FLAGS(0x2));
+    if !ok.as_bool() {
+        // fall back to a plain blit for windows that refuse PrintWindow
+        let _ = BitBlt(mem, 0, 0, w, hh, screen, r.left, r.top, SRCCOPY);
+    }
+
+    let data = std::slice::from_raw_parts(bits as *const u8, (w * hh * 4) as usize);
+    let mut out = vec![0u8; 54 + (w * hh * 4) as usize];
+    out[0] = b'B';
+    out[1] = b'M';
+    out[2..6].copy_from_slice(&((54 + w * hh * 4) as u32).to_le_bytes());
+    out[10..14].copy_from_slice(&54u32.to_le_bytes());
+    out[14..18].copy_from_slice(&40u32.to_le_bytes());
+    out[18..22].copy_from_slice(&w.to_le_bytes());
+    out[22..26].copy_from_slice(&(-hh).to_le_bytes());
+    out[26..28].copy_from_slice(&1u16.to_le_bytes());
+    out[28..30].copy_from_slice(&32u16.to_le_bytes());
+    out[34..38].copy_from_slice(&((w * hh * 4) as u32).to_le_bytes());
+    out[54..].copy_from_slice(data);
+    std::fs::write(path, &out).map_err(|e| format!("write {path}: {e}"))?;
+
+    let _ = DeleteObject(HGDIOBJ(bmp.0));
+    let _ = DeleteDC(mem);
+    let _ = ReleaseDC(None, screen);
+    Ok((w, hh, r))
+}
+
 // ------------------------------------------------------------- z-order -----
 
 /// Walk the top-level windows in z-order (front to back) and report the visible
@@ -2102,6 +2167,34 @@ fn handle_line(line: &str) {
                     String::new()
                 };
                 st.want_layer = true;
+            }
+        }
+        "window_capture" => {
+            let hwnd = v
+                .get("hwnd")
+                .and_then(|h| h.as_str())
+                .and_then(|h| isize::from_str_radix(h.trim_start_matches("0x"), 16).ok())
+                .unwrap_or(0);
+            let path = v
+                .get("path")
+                .and_then(|p| p.as_str())
+                .unwrap_or("window-layer.bmp")
+                .to_string();
+            if hwnd == 0 {
+                out["ok"] = serde_json::json!(false);
+                out["error"] = serde_json::json!("window_capture needs an hwnd");
+            } else {
+                match unsafe { capture_window(hwnd, &path) } {
+                    Ok((w, hh, r)) => {
+                        out["path"] = serde_json::json!(path);
+                        out["size"] = serde_json::json!([w, hh]);
+                        out["rect"] = serde_json::json!([r.left, r.top, r.right - r.left, r.bottom - r.top]);
+                    }
+                    Err(e) => {
+                        out["ok"] = serde_json::json!(false);
+                        out["error"] = serde_json::json!(e);
+                    }
+                }
             }
         }
         "layer_probe" => {
@@ -2642,8 +2735,14 @@ fn main() {
                 };
                 if s.drag_enabled && s.visible {
                     if now_down && !s.drag_was_down && !s.dragging && near {
+                        // Stop the agent FIRST: a drag that starts while the agent is
+                        // still driving the cursor fights the user for it.
                         s.dragging = true;
                         s.drag_grab = (p.x as f64 - s.cur.0, p.y as f64 - s.cur.1);
+                        s.prev_permission = s.permission.max(2);
+                        s.permission = 0;
+                        s.drag_feedback = Some("用户按住了 AI 光标，AI 控制已立即停止，正在拖动。".to_string());
+                        s.panel_dirty = true;
                     } else if s.dragging {
                         if now_down {
                             s.cur = (p.x as f64 - s.drag_grab.0, p.y as f64 - s.drag_grab.1);
@@ -2652,13 +2751,9 @@ fn main() {
                             s.last_activity = Instant::now();
                             s.dirty = true;
                         } else {
-                            // released: hand control back to the human, and tell the
-                            // agent plainly that its cursor was taken away
                             s.dragging = false;
-                            s.prev_permission = s.permission.max(2);
-                            s.permission = 0;
                             s.drag_feedback = Some(format!(
-                                "用户用真实鼠标把 AI 光标拖到了 ({:.0}, {:.0})，AI 控制已自动停止。",
+                                "用户把 AI 光标放到了 ({:.0}, {:.0})。AI 控制仍是停止状态，需在面板上点「启用」恢复。",
                                 s.cur.0, s.cur.1
                             ));
                             s.dirty = true;
