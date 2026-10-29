@@ -76,7 +76,7 @@ pub const SECTIONS: &[SecDef] = &[
 | `actions` | 操作 | ✅ 显示/隐藏/停止/启用 |
 | `appearance` | 外观 | ✅ AI 提示开关、透明度 |
 | `style` | 造型 | ✅ 鲸鱼/圆点/箭头、大小 |
-| `colors` | 颜色 | 🟡 色板 + **256 级 RGB 三通道条**（色环待接） |
+| `colors` | 颜色 | ✅ 色板 + 256 级 RGB 三通道条 + **色环（色相环 + 明度/饱和度方块）** |
 | `artwork` | 图案（自定义鼠标 / 提示 / 附属） | 🟡 三个槽位 + `‹ ›` 循环切换（大小/偏移/透明度/翻转待接） |
 | `permission` | 权限等级 | ✅ 四档 |
 | `custom` | 自定义模块（JSON 驱动） | ✅ **读取 `custom-section.json`，标题可改** |
