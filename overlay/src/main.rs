@@ -54,7 +54,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, HMENU,
     PeekMessageW, RegisterClassExW, SetWindowDisplayAffinity, SetWindowPos, ShowWindow,
     TranslateMessage, UpdateLayeredWindow, HWND_TOPMOST, MA_NOACTIVATE, MSG, PM_REMOVE,
-    GW_HWNDPREV, HWND_BOTTOM, SET_WINDOW_POS_FLAGS, SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE,
+    GetWindowLongW, GWL_EXSTYLE, GW_HWNDPREV, HWND_BOTTOM, HWND_NOTOPMOST, SET_WINDOW_POS_FLAGS, SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE,
     SWP_NOMOVE, SWP_NOSIZE,
     SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, SYSTEM_METRICS_INDEX, ULW_ALPHA,
     WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE,
@@ -196,6 +196,11 @@ struct St {
     layer_title: String,
     /// Set when the anchor needs applying (or re-applying) on the window thread.
     want_layer: bool,
+    /// When the anchor was last applied; a low-rate watchdog re-pins it because
+    /// painting the layered window can put it back in front of the anchor.
+    layer_tick: Instant,
+    /// Read back after applying: is the window still WS_EX_TOPMOST?
+    layer_topmost: bool,
     want_dump: Option<(String, bool)>, // (path, panel?)
     dump_done: bool,
     dump_error: Option<String>,
@@ -263,6 +268,8 @@ impl St {
             layer_hwnd: 0,
             layer_title: String::new(),
             want_layer: false,
+            layer_tick: now,
+            layer_topmost: true,
             custom: custom::CustomSpec::default(),
             want_dump: None,
             dump_done: false,
@@ -1586,6 +1593,14 @@ unsafe fn probe_windows(x: i32, y: i32, limit: usize) -> Vec<serde_json::Value> 
 /// cursor travels between windows without disturbing anything the user is doing.
 unsafe fn apply_layer(overlay: HWND, mode: &str, anchor: isize) {
     let a = HWND(anchor as *mut core::ffi::c_void);
+    // Insert-after alone does not reliably clear WS_EX_TOPMOST here, so drop the
+    // style explicitly first; a window that stays topmost ignores the rest.
+    if mode != "topmost" {
+        let _ = SetWindowPos(
+            overlay, HWND_NOTOPMOST, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+    }
     match mode {
         "desktop" => {
             let _ = SetWindowPos(
@@ -2154,6 +2169,7 @@ fn handle_line(line: &str) {
     out["layer"] = serde_json::json!(st.layer_mode);
     out["layer_hwnd"] = serde_json::json!(format!("0x{:X}", st.layer_hwnd));
     out["layer_title"] = serde_json::json!(st.layer_title);
+    out["layer_topmost"] = serde_json::json!(st.layer_topmost);
     out["panel_x"] = serde_json::json!(st.panel_pos.0);
     out["panel_y"] = serde_json::json!(st.panel_pos.1);
     let mut slot_out = serde_json::Map::new();
@@ -2335,7 +2351,22 @@ fn main() {
 
             let p_layer = {
                 let mut s = st.lock().unwrap();
-                std::mem::take(&mut s.want_layer)
+                // Re-pin at a low rate: every paint of a layered window is free to
+                // put it back in front of the anchor, and the anchor itself may be
+                // raised or re-stacked by the user.
+                if s.layer_mode != "topmost" && !s.want_layer {
+                    let due = s.layer_mode == "below"
+                        || s.layer_mode == "above"
+                        || s.layer_mode == "desktop";
+                    if due && now.duration_since(s.layer_tick).as_millis() > 400 {
+                        s.want_layer = true;
+                    }
+                }
+                let take = std::mem::take(&mut s.want_layer);
+                if take {
+                    s.layer_tick = now;
+                }
+                take
             };
             let (do_show, do_hide, affinity, dump, p_show, p_hide, p_resize, p_move, p_pos, p_full, p_h) = {
                 let mut s = st.lock().unwrap();
@@ -2413,6 +2444,10 @@ fn main() {
                     (s.layer_mode.clone(), s.layer_hwnd, s.hwnd)
                 };
                 apply_layer(hwnd_of(ohwnd), &mode, anchor);
+                // Read back the truth instead of trusting the call.
+                let ex = GetWindowLongW(hwnd_of(ohwnd), GWL_EXSTYLE) as u32;
+                let topmost = ex & 0x0000_0008 != 0; // WS_EX_TOPMOST
+                st.lock().unwrap().layer_topmost = topmost;
             }
             if p_hide {
                 let _ = ShowWindow(hwnd_of(phwnd), SW_HIDE);

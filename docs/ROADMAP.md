@@ -25,7 +25,15 @@
 - `SetWinEventHook` 跟随锚点窗口移动/最小化
 - **只改自己窗口的 z 序**，对其他窗口只读不写
 
-**2026-10-29 实测状态**：`ai_mouse_layer` 能收下命令、能用 `GetClassNameW` 解析锚点、
+**2026-10-29 实测状态（第二轮，仍失败）**：又加了两步仍无效：
+1. 每次锚定后回读 `GWL_EXSTYLE` 写进 `status.layer_topmost`；
+2. 低频率看门狗（400ms）重复锚定，防重绘把窗口顶回去；
+3. 先显式 `SetWindowPos(HWND_NOTOPMOST)` 降级，再插入到锚点位置。
+结果：`below:0x2C1660` 之后 `EnumWindows` 里我们的窗口仍是 index 2、锚点 index 3，
+**依旧在锚点之前**。下一步要看 `status.layer_topmost` 的真值，以及 `SetWindowPos`
+的返回值/GetLastError——现在的代码把返回值丢掉了（`let _ =`），这是最该改的地方。
+
+**第一轮记录**：`ai_mouse_layer` 能收下命令、能用 `GetClassNameW` 解析锚点、
 `ai_mouse_windows_at` 能正确列出窗口栈（修复了跨进程读标题导致浮层挂死的问题）。
 但设成 `below:<窗口>` 之后，`WS_EX_TOPMOST` 仍然留在我们的两个窗口上，枚举出来的
 z 序里光标依旧排在锚点**之前**——也就是说 **`apply_layer` 的效果没有落地**。
