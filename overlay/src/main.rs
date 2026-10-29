@@ -49,8 +49,8 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows,
-    GetClassNameW, GetCursorPos, GetWindow, GetWindowRect, GetWindowTextW,
-    GetWindowThreadProcessId, IsWindowVisible,
+    GetClassNameW, GetCursorPos, GetWindow, GetWindowRect, GetWindowThreadProcessId,
+    IsWindowVisible,
     GetSystemMetrics, HMENU,
     PeekMessageW, RegisterClassExW, SetWindowDisplayAffinity, SetWindowPos, ShowWindow,
     TranslateMessage, UpdateLayeredWindow, HWND_TOPMOST, MA_NOACTIVATE, MSG, PM_REMOVE,
@@ -1557,9 +1557,9 @@ unsafe fn probe_windows(x: i32, y: i32, limit: usize) -> Vec<serde_json::Value> 
         if acc.x < r.left || acc.x >= r.right || acc.y < r.top || acc.y >= r.bottom {
             return TRUE;
         }
-        let mut tbuf = [0u16; 256];
-        let n = GetWindowTextW(hwnd, &mut tbuf).max(0) as usize;
-        let title = String::from_utf16_lossy(&tbuf[..n]);
+        // NOTE: no GetWindowTextW here. Reading another process's title can block
+        // on that process's message pump, which froze the whole overlay while the
+        // harness was busy. The class name is a cached read and never blocks.
         let mut cbuf = [0u16; 128];
         let cn = GetClassNameW(hwnd, &mut cbuf).max(0) as usize;
         let class = String::from_utf16_lossy(&cbuf[..cn]);
@@ -1567,7 +1567,7 @@ unsafe fn probe_windows(x: i32, y: i32, limit: usize) -> Vec<serde_json::Value> 
         let _ = GetWindowThreadProcessId(hwnd, Some(&mut pid));
         acc.out.push(serde_json::json!({
             "hwnd": format!("0x{:X}", hwnd.0 as isize),
-            "title": title,
+            "title": class.clone(),
             "class": class,
             "pid": pid,
             "rect": [r.left, r.top, r.right - r.left, r.bottom - r.top],
@@ -1995,8 +1995,8 @@ fn handle_line(line: &str) {
                 st.layer_hwnd = hwnd;
                 st.layer_title = if hwnd != 0 {
                     let h = HWND(hwnd as *mut core::ffi::c_void);
-                    let mut buf = [0u16; 256];
-                    let n = unsafe { GetWindowTextW(h, &mut buf) }.max(0) as usize;
+                    let mut buf = [0u16; 128];
+                    let n = unsafe { GetClassNameW(h, &mut buf) }.max(0) as usize;
                     String::from_utf16_lossy(&buf[..n])
                 } else {
                     String::new()
