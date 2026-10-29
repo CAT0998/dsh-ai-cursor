@@ -150,10 +150,12 @@ export function apply(ctx: Context, config: ConfigShape): void {
 
   // First touch applies the configured look so a plain move already looks right.
   // `permission` is applied last: lowering it earlier would block the rest.
-  let primed = false
+  let primedGeneration = -1
   const prime = async (): Promise<void> => {
-    if (primed) return
-    primed = true
+    // Re-apply whenever the child process is replaced: a fresh process starts
+    // with defaults, so the old "primed" state must not short-circuit.
+    if (primedGeneration === overlay.generation) return
+    primedGeneration = overlay.generation
     await send('idle', { idle_ms: config.idleMs })
     await send('affinity', { capture_visible: config.captureVisible })
     await send('label', { text: config.label })

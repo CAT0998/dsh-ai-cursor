@@ -78,6 +78,7 @@ export class Overlay {
   private seq = 0
   private starting: Promise<void> | undefined
   private disposed = false
+  private spawnCount = 0
   private readonly exe: string
 
   constructor(exePath: string) {
@@ -86,6 +87,15 @@ export class Overlay {
 
   get executable(): string {
     return this.exe
+  }
+
+  /**
+   * Bumped every time the overlay process is spawned. The plugin re-applies its
+   * config when this changes: a restarted child starts with defaults, and a
+   * stale "already primed" flag would leave the panel pointing at nothing.
+   */
+  get generation(): number {
+    return this.spawnCount
   }
 
   private async start(): Promise<void> {
@@ -101,6 +111,7 @@ export class Overlay {
     this.starting = new Promise<void>((resolveStart, rejectStart) => {
       const child = spawn(this.exe, [], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
       this.child = child
+      this.spawnCount += 1
 
       const timer = setTimeout(() => {
         rejectStart(new Error(`ai-mouse-overlay did not become ready within 5s (${this.exe})`))

@@ -1721,6 +1721,8 @@ fn handle_line(line: &str) {
                         st.sprite_epoch = Instant::now();
                     }
                     st.dirty = true;
+                    // the artwork section shows a live thumbnail of this slot
+                    st.panel_dirty = true;
                 }
             }
         }
@@ -2200,8 +2202,9 @@ fn main() {
 
             // Advance animated sprites: repaint only when the visible frame
             // actually changes, so an idle GIF does not burn a redraw per tick.
-            let now_visible = st.lock().unwrap().visible;
-            if now_visible {
+            // Sprite frames advance whether or not the cursor is on screen: the
+            // artwork thumbnails in the panel have to animate on their own.
+            {
                 let epoch = now.duration_since(st.lock().unwrap().sprite_epoch).as_millis() as u64;
                 let mut changed = false;
                 {
@@ -2230,9 +2233,10 @@ fn main() {
                 }
                 if changed {
                     let mut s = st.lock().unwrap();
-                    s.dirty = true;
+                    if s.visible {
+                        s.dirty = true;
+                    }
                     if s.panel_shown {
-                        // the artwork thumbnails animate too
                         s.panel_dirty = true;
                     }
                 }
