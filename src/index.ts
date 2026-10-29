@@ -53,6 +53,12 @@ export function describeStatus(status: OverlayStatus): string {
     `drag=${status.drag_enabled === false ? 'off' : 'on'}${status.dragging ? '/dragging' : ''}`,
     `press=${status.drag_seen_down ? 'seen' : 'no'}`,
   ]
+  if (status.anchor_rect) {
+    parts.push(
+      `anchor=${status.anchor_rect[2]}x${status.anchor_rect[3]}@(${status.anchor_rect[0]},${status.anchor_rect[1]})`,
+      `in_window=${status.anchor_rel ? `(${status.anchor_rel[0]},${status.anchor_rel[1]})` : '?'}${status.anchor_inside ? '' : ' outside'}`,
+    )
+  }
   if (status.drag_feedback) parts.push(`note=${status.drag_feedback}`)
   if (status.excluded_from_capture) parts.push('excluded_from_capture=true')
   return parts.join(' ')

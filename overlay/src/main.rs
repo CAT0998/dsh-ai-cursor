@@ -210,6 +210,9 @@ struct St {
     layer_topmost: bool,
     /// Last SetWindowPos result of the z-order call; -1 = not tried yet.
     layer_result: i32,
+    /// Screen rect of the bound window, so the cursor's position inside it can be
+    /// computed arithmetically instead of queried from the live stack.
+    layer_rect: Option<(i32, i32, i32, i32)>,
     /// The human may grab the AI cursor with their own pointer.
     drag_enabled: bool,
     dragging: bool,
@@ -297,6 +300,7 @@ impl St {
             layer_tick: now,
             layer_topmost: true,
             layer_result: -1,
+            layer_rect: None,
             drag_enabled: true,
             dragging: false,
             drag_grab: (0.0, 0.0),
@@ -1749,6 +1753,19 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
     CallNextHookEx(None, code, wparam, lparam)
 }
 
+/// Cached read of a window's screen rect — no cross-process messaging, so this
+/// can be called while the agent is busy without risking a stall.
+unsafe fn anchor_rect(hwnd: isize) -> Option<(i32, i32, i32, i32)> {
+    if hwnd == 0 {
+        return None;
+    }
+    let mut r = RECT::default();
+    if GetWindowRect(HWND(hwnd as *mut core::ffi::c_void), &mut r).is_err() {
+        return None;
+    }
+    Some((r.left, r.top, r.right - r.left, r.bottom - r.top))
+}
+
 fn last_layer_result() -> i32 {
     LAST_LAYER.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -2237,10 +2254,11 @@ fn handle_line(line: &str) {
                 .and_then(|h| isize::from_str_radix(h.trim_start_matches("0x"), 16).ok())
                 .or_else(|| v.get("hwnd").and_then(|h| h.as_i64()).map(|n| n as isize))
                 .unwrap_or(0);
-            if !matches!(mode.as_str(), "topmost" | "above" | "below" | "desktop") {
+            let window_mode = mode == "window";
+            if !matches!(mode.as_str(), "topmost" | "above" | "below" | "desktop" | "window") {
                 out["ok"] = serde_json::json!(false);
                 out["error"] = serde_json::json!("mode must be topmost | above | below | desktop");
-            } else if (mode == "above" || mode == "below") && hwnd == 0 {
+            } else if (mode == "above" || mode == "below" || window_mode) && hwnd == 0 {
                 out["ok"] = serde_json::json!(false);
                 out["error"] = serde_json::json!("above/below need an hwnd");
             } else {
@@ -2255,6 +2273,11 @@ fn handle_line(line: &str) {
                     String::new()
                 };
                 st.want_layer = true;
+                if window_mode {
+                    // Only the CURSOR and the state change; the anchored window
+                    // keeps its position, size, focus and stacking.
+                    st.layer_rect = unsafe { anchor_rect(hwnd) };
+                }
             }
         }
         "window_capture" => {
@@ -2436,6 +2459,14 @@ fn handle_line(line: &str) {
     out["layer_hwnd"] = serde_json::json!(format!("0x{:X}", st.layer_hwnd));
     out["layer_title"] = serde_json::json!(st.layer_title);
     out["layer_topmost"] = serde_json::json!(st.layer_topmost);
+    if let Some((rx, ry, rw, rh)) = st.layer_rect {
+        let cx = st.cur.0.round() as i32;
+        let cy = st.cur.1.round() as i32;
+        let inside = cx >= rx && cx < rx + rw && cy >= ry && cy < ry + rh;
+        out["anchor_rect"] = serde_json::json!([rx, ry, rw, rh]);
+        out["anchor_rel"] = serde_json::json!([cx - rx, cy - ry]);
+        out["anchor_inside"] = serde_json::json!(inside);
+    }
     out["layer_result"] = serde_json::json!(st.layer_result);
     out["drag_enabled"] = serde_json::json!(st.drag_enabled);
     out["dragging"] = serde_json::json!(st.dragging);
