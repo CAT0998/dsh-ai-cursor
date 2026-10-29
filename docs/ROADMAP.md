@@ -18,12 +18,25 @@
 ### P1b 收尾
 - 图案槽位的**文件选择框**（Win32 打开对话框）。目前可以：素材目录按文件名引用、绝对路径、`‹ ›` 循环、工具 `ai_mouse_sprite`。
 
-### P3 层级锚点
+### P3 层级锚点 —— ⚠️ 协议已实现，**z 序未生效，待修**
 让 AI 鼠标在**各应用窗口之间自由切换**，且**绝不打扰其他窗口**（不改 z 序、不移动、不缩放、不抢焦点）。
 - 锚点模式：`topmost` / `above:<窗口>` / `below:<窗口>` / `desktop`
 - 面板显示当前锚点窗口的标题、类名、进程、z 序号
 - `SetWinEventHook` 跟随锚点窗口移动/最小化
 - **只改自己窗口的 z 序**，对其他窗口只读不写
+
+**2026-10-29 实测状态**：`ai_mouse_layer` 能收下命令、能用 `GetClassNameW` 解析锚点、
+`ai_mouse_windows_at` 能正确列出窗口栈（修复了跨进程读标题导致浮层挂死的问题）。
+但设成 `below:<窗口>` 之后，`WS_EX_TOPMOST` 仍然留在我们的两个窗口上，枚举出来的
+z 序里光标依旧排在锚点**之前**——也就是说 **`apply_layer` 的效果没有落地**。
+
+下一步排查方向（按可能性排序）：
+1. `SetWindowPos(hwnd, anchor, …)` 是否真的被执行（在 apply 处加一行回读
+   `GetWindowLongW(GWL_EXSTYLE)` 并写进 `status`，直接看 topmost 位有没有被清掉）；
+2. 是否有别的路径在之后又把窗口推回 topmost（`make_window` 创建时设了
+   `HWND_TOPMOST`；`p_resize`/`p_move` 也传了 `HWND_TOPMOST`）；
+3. 确认 `want_layer` 是否被主循环及时取走（怀疑 `p_layer` 的 drain 位置在
+   `want_layer` 被设置之前的那一轮就已经跑过）。
 
 ### P4 两个小地图
 - 真实缩略图（屏幕实拍缩小）＋ 层级示意图（屏幕/窗口矩形 + 光点）
