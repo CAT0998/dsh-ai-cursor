@@ -11,7 +11,8 @@
 
 use crate::rect;
 use crate::widget::{
-    channels_of, hex, Hit, Kind, PanelView, SlotView, SWATCH_IDS, SWATCHES,
+    channels_of, hex, CustomRowView, Hit, Kind, PanelView, SlotView, CUSTOM_IDS, SWATCH_IDS,
+    SWATCHES,
 };
 
 pub const PAD: i32 = 14;
@@ -105,13 +106,18 @@ pub fn build(v: &PanelView, mut y: i32, out: &mut Vec<Hit>) -> i32 {
     for sec in SECTIONS {
         let collapsed = is_collapsed(v, sec.key);
         // header row: chevron + title, click toggles
+        let title = if sec.key == "custom" {
+            v.custom.title.clone().unwrap_or_else(|| sec.title.to_string())
+        } else {
+            sec.title.to_string()
+        };
         out.push(
             Hit::new(
                 rect(PAD, y, content_right(), y + SECTION_TITLE_H),
                 Kind::Section,
                 sec.header,
             )
-            .text(format!("{} {}", if collapsed { "\u{25B8}" } else { "\u{25BE}" }, sec.title))
+            .text(format!("{} {}", if collapsed { "\u{25B8}" } else { "\u{25BE}" }, title))
             .hover(hov(v, sec.header)),
         );
         y += SECTION_TITLE_H;
@@ -243,6 +249,8 @@ fn body_colors(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
     y + 24
 }
 
+const PREVIEW_IDS: [&'static str; 3] = ["prev0", "prev1", "prev2"];
+
 fn slot_row(
     v: &PanelView,
     x: i32,
@@ -253,25 +261,31 @@ fn slot_row(
     next_id: &'static str,
     out: &mut Vec<Hit>,
 ) -> i32 {
-    let label = format!("{} {}", slot.name, source_short(slot));
-    out.push(Hit::new(rect(x, y, x + 250, y + 20), Kind::Label, "l_slot").text(label));
+    // live thumbnail: the same frames the cursor uses, so an animated slot
+    // previews as an animation
     out.push(
-        Hit::new(rect(x + 256, y - 2, x + 286, y + 22), Kind::Button, prev_id)
+        Hit::new(rect(x, y - 4, x + 46, y + 24), Kind::Preview, PREVIEW_IDS[idx])
+            .data(idx as i32),
+    );
+    let label = format!("{} {}", slot.name, source_short(slot));
+    out.push(Hit::new(rect(x + 54, y, x + 250, y + 20), Kind::Label, "l_slot").text(label));
+    out.push(
+        Hit::new(rect(x + 250, y - 2, x + 280, y + 22), Kind::Button, prev_id)
             .text("\u{2039}")
             .hover(hov(v, prev_id))
             .data(idx as i32),
     );
     out.push(
-        Hit::new(rect(x + 290, y - 2, x + 320, y + 22), Kind::Button, next_id)
+        Hit::new(rect(x + 284, y - 2, x + 314, y + 22), Kind::Button, next_id)
             .text("\u{203A}")
             .hover(hov(v, next_id))
             .data(idx as i32),
     );
     out.push(
-        Hit::new(rect(x + 330, y, content_right(), y + 18), Kind::LabelRight, "l_slotinfo")
+        Hit::new(rect(x + 324, y, content_right(), y + 18), Kind::LabelRight, "l_slotinfo")
             .text(if slot.frames > 1 { format!("{}帧", slot.frames) } else { String::from("静图") }),
     );
-    y + 24
+    y + 30
 }
 
 fn source_short(slot: &SlotView) -> String {
@@ -325,13 +339,42 @@ fn body_permission(v: &PanelView, x: i32, y: i32, out: &mut Vec<Hit>) -> i32 {
     y + 34
 }
 
-/// The reserved slot. It is a real, registered module with no widgets of its
-/// own; `docs/MODULES.md` explains how to give it a body without touching the
-/// renderer, and this row is what the user sees until then.
-fn body_custom(_v: &PanelView, x: i32, y: i32, out: &mut Vec<Hit>) -> i32 {
-    out.push(
-        Hit::new(rect(x, y, content_right(), y + 20), Kind::Label, "l_custom")
-            .text("空位：见 docs/MODULES.md，可直接写进这个分区"),
-    );
-    y + 24
+/// The reserved slot, filled from `custom-section.json` in the asset folder.
+fn body_custom(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
+    if let Some(err) = &v.custom.error {
+        out.push(
+            Hit::new(rect(x, y, content_right(), y + 18), Kind::Label, "l_custom")
+                .text(format!("自定义模块有误：{err}")),
+        );
+        return y + 22;
+    }
+    if v.custom.rows.is_empty() {
+        for line in &v.custom.hint {
+            out.push(
+                Hit::new(rect(x, y, content_right(), y + 16), Kind::Label, "l_custom")
+                    .text(line.clone()),
+            );
+            y += 18;
+        }
+        return y;
+    }
+    for (i, row) in v.custom.rows.iter().enumerate() {
+        match row {
+            CustomRowView::Label(text) => {
+                out.push(Hit::new(rect(x, y, content_right(), y + 18), Kind::Label, "l_custom").text(text.clone()));
+                y += 20;
+            }
+            CustomRowView::Button(text) => {
+                let id = CUSTOM_IDS.get(i).copied().unwrap_or("cus0");
+                out.push(
+                    Hit::new(rect(x, y, x + 180, y + 26), Kind::Button, id)
+                        .text(text.clone())
+                        .hover(hov(v, id))
+                        .data(i as i32),
+                );
+                y += 30;
+            }
+        }
+    }
+    y
 }

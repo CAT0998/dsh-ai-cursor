@@ -16,6 +16,7 @@
 //! Nothing here moves the real mouse pointer, and nothing here takes keyboard focus:
 //! the panel is WS_EX_NOACTIVATE, so clicking a button never steals the foreground.
 
+mod custom;
 mod sections;
 mod sprite;
 mod widget;
@@ -179,6 +180,8 @@ struct St {
     collapsed: Vec<String>,
     assets: Vec<String>,
     panel_px_h: i32,
+    asset_dir: String,
+    custom: custom::CustomSpec,
     want_dump: Option<(String, bool)>, // (path, panel?)
     dump_done: bool,
     dump_error: Option<String>,
@@ -239,6 +242,8 @@ impl St {
                 .collect(),
             assets: Vec::new(),
             panel_px_h: PH,
+            asset_dir: String::new(),
+            custom: custom::CustomSpec::default(),
             want_dump: None,
             dump_done: false,
             dump_error: None,
@@ -1005,12 +1010,14 @@ unsafe fn draw_panel(cv: &Canvas, v: &PanelView, hits: &[Hit], h: i32) {
                 cv.fill_circle(kx, cy, 6, 0xFFFFFF);
                 cv.ring_circle(kx, cy, 6, 1, 0x101820);
             }
-            Kind::Wheel => {}
+            Kind::Wheel | Kind::Preview => {}
             Kind::Header | Kind::Chip => {}
         }
     }
 
-    cv.present(state().lock().unwrap().panel_hwnd, PW, h, None, 0.98);
+    cv.compose(PW, h, 0.98);
+    draw_previews(cv, v, hits, h);
+    cv.blit(state().lock().unwrap().panel_hwnd, PW, h, None);
 }
 
 // ---------------------------------------------------------------- windows ----
@@ -1076,6 +1083,41 @@ unsafe fn make_panel(x: i32, y: i32) -> HWND {
     hwnd
 }
 
+/// Draw the live thumbnails for the artwork slots.
+///
+/// The sprite cache lock is taken and released here, never held across a call
+/// that locks the state mutex — the window procedure takes them in the opposite
+/// order (state, then sprites) and holding both would deadlock the panel.
+unsafe fn draw_previews(cv: &Canvas, v: &PanelView, hits: &[Hit], h: i32) {
+    let boxes: Vec<(i32, i32, i32, i32, usize)> = hits
+        .iter()
+        .filter(|h| h.kind == Kind::Preview)
+        .map(|h| (h.r.left, h.r.top, h.r.right - h.r.left, h.r.bottom - h.r.top, h.data.max(0) as usize))
+        .collect();
+    if boxes.is_empty() {
+        return;
+    }
+    let mut cache = sprites().lock().unwrap();
+    for (bx, by, bw, bh, idx) in boxes {
+        let Some(slot) = v.slots.get(idx) else { continue };
+        if !slot.source.starts_with("builtin") && slot.source.is_empty() {
+            continue;
+        }
+        let Some(Ok(spr)) = cache.get(Path::new(&slot.source)) else { continue };
+        let frame = &spr.frames[spr.frame_at(v.epoch_ms).min(spr.frames.len() - 1)];
+        // fit inside the box, keeping the aspect ratio
+        let scale = ((bw as f64 - 4.0) / spr.w as f64)
+            .min((bh as f64 - 4.0) / spr.h as f64)
+            .max(0.01);
+        let tw = (spr.w as f64 * scale).round().max(1.0) as u32;
+        let th = (spr.h as f64 * scale).round().max(1.0) as u32;
+        let dx = bx + (bw - tw as i32) / 2;
+        let dy = by + (bh - th as i32) / 2;
+        sprite::composite(cv.small_mut(), PW, h, dx, dy,
+                          frame, spr.w, spr.h, tw, th, 1.0, false);
+    }
+}
+
 fn view_of(st: &St) -> PanelView {
     PanelView {
         full: st.panel_full,
@@ -1098,7 +1140,28 @@ fn view_of(st: &St) -> PanelView {
         ],
         assets: st.assets.clone(),
         rgb: channels_of(st.accent),
+        custom: custom_view(st),
+        epoch_ms: Instant::now().duration_since(st.sprite_epoch).as_millis() as u64,
     }
+}
+
+fn custom_view(st: &St) -> widget::CustomView {
+    let mut v = widget::CustomView {
+        title: st.custom.title.clone(),
+        error: st.custom.error.clone(),
+        hint: custom::hint_lines(&st.asset_dir),
+        rows: Vec::new(),
+    };
+    if st.custom.is_empty() && st.custom.error.is_none() {
+        return v;
+    }
+    for row in &st.custom.rows {
+        v.rows.push(match row {
+            custom::CustomRow::Label(t) => widget::CustomRowView::Label(t.clone()),
+            custom::CustomRow::Button { text, .. } => widget::CustomRowView::Button(text.clone()),
+        });
+    }
+    v
 }
 
 fn slot_view(slot: &Slot, name: &str) -> SlotView {
@@ -1211,7 +1274,20 @@ fn on_toggle(st: &mut St, id: &str) {
             st.dirty = true;
         }
         _ => {
-            if let Some(sec) = sections::SECTIONS.iter().find(|d| d.header == id) {
+            if let Some(rest) = id.strip_prefix("cus") {
+                if let Ok(i) = rest.parse::<usize>() {
+                    if let Some((action, set)) = st.custom.action_of(i) {
+                        let action = action.to_string();
+                        let set = set.cloned();
+                        if !action.is_empty() {
+                            on_toggle(st, &action);
+                        }
+                        if let Some(set) = set {
+                            apply_custom_set(st, &set);
+                        }
+                    }
+                }
+            } else if let Some(sec) = sections::SECTIONS.iter().find(|d| d.header == id) {
                 if let Some(pos) = st.collapsed.iter().position(|k| k == sec.key) {
                     st.collapsed.remove(pos);
                 } else {
@@ -1303,7 +1379,7 @@ fn pick<'a>(hits: &'a [Hit], x: i32, y: i32) -> Option<&'a Hit> {
             Kind::Button | Kind::Swatch | Kind::Chip | Kind::Section => 0,
             Kind::Slider | Kind::Channel | Kind::Wheel => 1,
             Kind::Header => 2,
-            Kind::Label | Kind::LabelRight | Kind::Sep => 3,
+            Kind::Label | Kind::LabelRight | Kind::Sep | Kind::Preview => 3,
         }
     }
     hits.iter().filter(|h| h.hit(x, y)).min_by_key(|h| rank(h.kind))
@@ -1311,6 +1387,36 @@ fn pick<'a>(hits: &'a [Hit], x: i32, y: i32) -> Option<&'a Hit> {
 
 /// Cycle a picture slot: builtin vector art -> every picture in the asset folder
 /// -> off. The panel half of the artwork module; the tools can set an exact path.
+/// The `set` escape hatch of the custom module: a tiny, explicit whitelist of
+/// numeric/boolean settings. Anything else is ignored rather than guessed at.
+fn apply_custom_set(st: &mut St, set: &serde_json::Value) {
+    if let Some(v) = set.get("opacity").and_then(|x| x.as_f64()) {
+        st.opacity = v.clamp(0.15, 1.0);
+        st.dirty = true;
+    }
+    if let Some(v) = set.get("scale").and_then(|x| x.as_f64()) {
+        st.scale = v.clamp(0.6, 2.0);
+        st.dirty = true;
+    }
+    if let Some(b) = set.get("badge").and_then(|x| x.as_bool()) {
+        st.badge = b;
+        st.dirty = true;
+    }
+    if let Some(t) = set.get("theme").and_then(|x| x.as_str()) {
+        if matches!(t, "whale" | "dot" | "arrow") {
+            st.theme = t.to_string();
+            st.dirty = true;
+        }
+    }
+    if let Some(hexs) = set.get("color").and_then(|x| x.as_str()) {
+        if let Some(rgb) = parse_hex(hexs) {
+            st.accent = rgb;
+            st.dirty = true;
+        }
+    }
+    st.panel_dirty = true;
+}
+
 fn cycle_slot_source(st: &mut St, slot_idx: usize, dir: i32) {
     if slot_idx >= st.slots.len() {
         return;
@@ -1644,6 +1750,8 @@ fn handle_line(line: &str) {
             }
             found.sort();
             st.assets = found.clone();
+            st.asset_dir = dir.clone();
+            st.custom = custom::load(&dir);
             st.panel_dirty = true;
             out["assets"] = serde_json::json!(found);
             out["count"] = serde_json::json!(found.len());
@@ -2121,7 +2229,12 @@ fn main() {
                     }
                 }
                 if changed {
-                    st.lock().unwrap().dirty = true;
+                    let mut s = st.lock().unwrap();
+                    s.dirty = true;
+                    if s.panel_shown {
+                        // the artwork thumbnails animate too
+                        s.panel_dirty = true;
+                    }
                 }
             }
 

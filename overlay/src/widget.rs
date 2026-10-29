@@ -25,6 +25,8 @@ pub enum Kind {
     Channel,
     /// The colour wheel (hue ring); owned by the colours section.
     Wheel,
+    /// A live thumbnail of a picture slot (animates with the sprite).
+    Preview,
     Sep,
 }
 
@@ -90,7 +92,37 @@ pub struct PanelView {
     pub assets: Vec<String>,
     /// Colour channels, 0-255.
     pub rgb: [u8; 3],
+    /// The reserved custom section's current contents.
+    pub custom: CustomView,
+    /// Milliseconds into the sprite timeline; drives thumbnail animation.
+    pub epoch_ms: u64,
 }
+
+#[allow(dead_code)]
+#[derive(Clone, Default)]
+pub struct CustomView {
+    /// Overrides the section header when the JSON supplies one.
+    pub title: Option<String>,
+    pub rows: Vec<CustomRowView>,
+    /// JSON/IO problem, rendered instead of silently showing nothing.
+    pub error: Option<String>,
+    /// What to show while the slot is still empty.
+    pub hint: Vec<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone)]
+pub enum CustomRowView {
+    Label(String),
+    Button(String),
+}
+
+/// Widget ids for the custom section, indexed by row. Fixed strings so a custom
+/// row costs nothing at draw time; the row itself is looked up by index.
+pub const CUSTOM_IDS: [&str; 12] = [
+    "cus0", "cus1", "cus2", "cus3", "cus4", "cus5",
+    "cus6", "cus7", "cus8", "cus9", "cus10", "cus11",
+];
 
 #[allow(dead_code)]
 #[derive(Clone, Default)]

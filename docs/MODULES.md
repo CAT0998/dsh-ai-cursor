@@ -77,7 +77,7 @@ pub const SECTIONS: &[SecDef] = &[
 | `colors` | 颜色 | 🟡 色板 + **256 级 RGB 三通道条**（色环待接） |
 | `artwork` | 图案（自定义鼠标 / 提示 / 附属） | 🟡 三个槽位 + `‹ ›` 循环切换（大小/偏移/透明度/翻转待接） |
 | `permission` | 权限等级 | ✅ 四档 |
-| `custom` | 自定义模块（空位） | ⬜ **预留** |
+| `custom` | 自定义模块（JSON 驱动） | ✅ **读取 `custom-section.json`，标题可改** |
 
 ## 5. 预留的空位（`custom`）
 
@@ -89,7 +89,7 @@ pub const SECTIONS: &[SecDef] = &[
   （`{ "title": "...", "rows": [{ "type": "button", "text": "...", "cmd": "..." }] }`），
   面板按描述渲染、点击时把 `cmd` 走行协议发给浮层。这条路最适合让 AI 直接改需求——写 JSON 即可。
 
-> 目前落地的是 A；B 的读取器还没写，接口就是上面这个形状。
+> **B 已经实现**：`~/.dsh/ai-mouse-assets/custom-section.json`，示例见第 7 节。
 
 ## 6. 验收方式
 
@@ -97,3 +97,29 @@ pub const SECTIONS: &[SecDef] = &[
 - 浮层协议自测：`pnpm run test:overlay`（35 项，覆盖显隐/移动/权限/折叠/图案）
 - 图案管线自测：`python scripts/selftest-sprites.py bin/ai-mouse-overlay.exe artifacts/sprites`（9 项）
 - 视觉：`ai_mouse_panel { visible: true }` 后用真实鼠标点一遍，再截图对比
+
+## 7. `custom-section.json` 示例
+
+```json
+{
+  "title": "我的模块",
+  "rows": [
+    { "type": "label",  "text": "这些按钮由 JSON 定义" },
+    { "type": "button", "text": "轮换光标图", "action": "art_next0" },
+    { "type": "button", "text": "半透明 50%", "set": { "opacity": 0.5 } },
+    { "type": "button", "text": "停止 AI",   "action": "stop" }
+  ]
+}
+```
+
+- `title` 会替换分区头部文字（不写就用「自定义模块」）。
+- `action` 用面板现有动作 id：`show` `hide` `stop` `start` `badge_on` `badge_off`
+  `theme_whale` `theme_dot` `theme_arrow` `perm_0`…`perm_3` `art_prev0/1/2` `art_next0/1/2`。
+- `set` 是受控的数值逃生口：`opacity` `scale` `badge` `theme` `color`，其余键忽略。
+- 最多 12 行；解析失败会在面板里显示具体错在哪一行，不会静默失效。
+- 这个文件**不能执行代码**，最多只能按面板自己的按钮。
+
+## 8. 图案槽位的预览缩略图
+
+「图案」分区每一行左边有一个 46×28 的实时缩略图：它和光标用的是同一批帧，
+**动图预览也会动**。槽位是 `builtin` 时缩略图显示当前矢量造型。
