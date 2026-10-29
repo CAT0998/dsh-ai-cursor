@@ -71,7 +71,7 @@ const PH: i32 = 396; // expanded panel height
 const CHIP_W: i32 = 132; // collapsed panel width
 const CHIP_H: i32 = 40; // collapsed panel height
 const SS_PANEL: i32 = 2; // supersample factor for the panel
-const PH_MAX: i32 = 900; // the panel canvas is allocated this tall and clipped per frame
+const PH_MAX: i32 = 1200; // the panel canvas is allocated this tall and clipped per frame
 
 // Palette. Accent-dependent colours are derived from the live accent value.
 const C_PANEL: u32 = 0x0F141C;
