@@ -97,6 +97,8 @@ export class Overlay {
   private starting: Promise<void> | undefined
   private disposed = false
   private spawnCount = 0
+  /** The separate minimap process (`--map`); a second instance, its own window. */
+  private mapChild: ChildProcessWithoutNullStreams | undefined
   private readonly exe: string
 
   constructor(exePath: string) {
@@ -222,5 +224,45 @@ export class Overlay {
     this.reader?.close()
     this.reader = undefined
     this.child = undefined
+  }
+
+  /**
+   * Start or stop the separate minimap process.
+   *
+   * It is the SAME binary with `--map`, so it reuses the window class that already
+   * works instead of needing a new one. Two processes is what keeps the minimap
+   * and the menu bar in separate blocks.
+   */
+  async setMap(visible: boolean): Promise<boolean> {
+    if (visible) {
+      if (this.mapChild) return true
+      const child = spawn(this.exe, ['--map'], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        windowsHide: true,
+      })
+      this.mapChild = child
+      child.on('exit', () => {
+        if (this.mapChild === child) this.mapChild = undefined
+      })
+      child.on('error', () => {
+        if (this.mapChild === child) this.mapChild = undefined
+      })
+      // drain so the child never blocks on a full pipe
+      child.stdout.resume()
+      child.stderr.resume()
+      return true
+    }
+    const child = this.mapChild
+    this.mapChild = undefined
+    if (child) {
+      child.kill()
+      return true
+    }
+    return false
+  }
+
+  /** Is the separate minimap window running? */
+  get mapRunning(): boolean {
+    return this.mapChild !== undefined
   }
 }

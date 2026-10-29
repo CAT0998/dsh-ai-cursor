@@ -613,6 +613,29 @@ export function apply(ctx: Context, config: ConfigShape): void {
 
   ctx.tools.register(
     defineTool({
+      name: 'ai_mouse_map',
+      description:
+        'Start or stop the separate minimap window: a schematic of the screen with the top windows and a dot for this AI cursor. It runs as its own process, so it is a separate block from the menu bar and can be moved, resized and minimised like any window.',
+      parameters: {
+        visible: { type: 'boolean', description: 'true = show, false = close. Omit to read.' },
+      },
+      output: TEXT_OUTPUT,
+      async execute(args: { visible?: boolean }) {
+        if (args.visible !== undefined) {
+          const refused = await gate(2, 'ai_mouse_map')
+          if (refused) return refused
+          await overlay.setMap(args.visible)
+          return args.visible
+            ? '小地图窗口已启动（独立进程，可拖动/缩放/最小化）。'
+            : '小地图窗口已关闭。'
+        }
+        return overlay.mapRunning ? '小地图窗口：开' : '小地图窗口：关'
+      },
+    }),
+  )
+
+  ctx.tools.register(
+    defineTool({
       name: 'ai_mouse_layer',
       description:
         'Put the AI cursor into the window stack: `topmost` (above everything, the default), `above`/`below` a specific window (needs `window`), or `desktop` (behind normal windows). Only the AI cursor\'s own window moves in the z-order — the anchored window and every other window keep their position, size, focus and stacking.',
