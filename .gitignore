@@ -1,0 +1,19 @@
+# Node / plugin build output
+node_modules/
+lib/
+*.tgz
+
+# Rust overlay build output
+overlay/target/
+
+# The overlay executable is produced by `pnpm run build:overlay` from overlay/.
+# Published packages include it; the git repo does not.
+bin/*.exe
+
+# Local verification artifacts
+artifacts/
+*.bmp
+frame-*.png
+*-capture-*.png
+verify-*.png
+ai-mouse-*.png

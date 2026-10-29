@@ -1,0 +1,43 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "1 · pnpm install",
+      "type": "shell",
+      "command": "pnpm install",
+      "problemMatcher": []
+    },
+    {
+      "label": "2 · build overlay (Rust)",
+      "type": "shell",
+      "command": "pnpm run build:overlay",
+      "group": "build",
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "3 · typecheck",
+      "type": "shell",
+      "command": "pnpm run typecheck",
+      "problemMatcher": ["$tsc"]
+    },
+    {
+      "label": "4 · test",
+      "type": "shell",
+      "command": "pnpm test",
+      "problemMatcher": []
+    },
+    {
+      "label": "5 · build plugin (tsdown)",
+      "type": "shell",
+      "command": "pnpm run build",
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "all (install → overlay → check → build)",
+      "dependsOrder": "sequence",
+      "dependsOn": ["1 · pnpm install", "2 · build overlay (Rust)", "3 · typecheck", "4 · test", "5 · build plugin (tsdown)"],
+      "problemMatcher": []
+    }
+  ]
+}
