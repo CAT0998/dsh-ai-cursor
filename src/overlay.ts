@@ -35,6 +35,24 @@ export interface OverlayStatus {
   /** Is the panel the full menu bar (true) or the collapsed chip (false)? */
   panel_expanded?: boolean
   panel_hwnd?: string
+  /** The human may drag the cursor with their own pointer. */
+  drag_enabled?: boolean
+  dragging?: boolean
+  /** Set when a drag ended: why the agent was stopped. */
+  drag_feedback?: string | null
+  /** Diagnostics for the grab detection. */
+  drag_seen_down?: boolean
+  drag_raw?: number
+  layer?: string
+  layer_hwnd?: string
+  layer_title?: string
+  layer_topmost?: boolean
+  layer_result?: number
+  /** Screen rect of the window the cursor is bound to. */
+  anchor_rect?: [number, number, number, number]
+  /** Cursor position inside that window. */
+  anchor_rel?: [number, number]
+  anchor_inside?: boolean
   error?: string
 }
 
