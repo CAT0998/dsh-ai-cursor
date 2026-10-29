@@ -46,7 +46,9 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, ReleaseCapture, SetCapture, VK_LBUTTON,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows,
     GetClassNameW, GetCursorPos, GetWindow, GetWindowRect, GetWindowThreadProcessId,
@@ -201,6 +203,16 @@ struct St {
     layer_tick: Instant,
     /// Read back after applying: is the window still WS_EX_TOPMOST?
     layer_topmost: bool,
+    /// Last SetWindowPos result of the z-order call; -1 = not tried yet.
+    layer_result: i32,
+    /// The human may grab the AI cursor with their own pointer.
+    drag_enabled: bool,
+    dragging: bool,
+    /// Offset from the pointer to the cursor tip while dragging.
+    drag_grab: (f64, f64),
+    drag_was_down: bool,
+    /// What to tell the agent after the user took the cursor away.
+    drag_feedback: Option<String>,
     want_dump: Option<(String, bool)>, // (path, panel?)
     dump_done: bool,
     dump_error: Option<String>,
@@ -270,6 +282,12 @@ impl St {
             want_layer: false,
             layer_tick: now,
             layer_topmost: true,
+            layer_result: -1,
+            drag_enabled: true,
+            dragging: false,
+            drag_grab: (0.0, 0.0),
+            drag_was_down: false,
+            drag_feedback: None,
             custom: custom::CustomSpec::default(),
             want_dump: None,
             dump_done: false,
@@ -1205,6 +1223,8 @@ fn view_of(st: &St) -> PanelView {
         custom: custom_view(st),
         epoch_ms: Instant::now().duration_since(st.sprite_epoch).as_millis() as u64,
         art_sel: st.art_sel,
+        drag_enabled: st.drag_enabled,
+        dragging: st.dragging,
     }
 }
 
@@ -1338,7 +1358,10 @@ fn on_toggle(st: &mut St, id: &str) {
             st.dirty = true;
         }
         _ => {
-            if id == "art_flip" {
+            if id == "drag_toggle" {
+                st.drag_enabled = !st.drag_enabled;
+                st.panel_dirty = true;
+            } else if id == "art_flip" {
                 let i = st.art_sel.min(2);
                 st.slots[i].flip_x = !st.slots[i].flip_x;
                 st.dirty = true;
@@ -1591,6 +1614,13 @@ unsafe fn probe_windows(x: i32, y: i32, limit: usize) -> Vec<serde_json::Value> 
 /// Only OUR window moves in the z-order; the anchor and every other window keep
 /// their position, size, focus and stacking. That is the whole point: the AI
 /// cursor travels between windows without disturbing anything the user is doing.
+/// The BOOL from the last z-order call, stashed so `status` can report it.
+static LAST_LAYER: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+fn last_layer_result() -> i32 {
+    LAST_LAYER.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 unsafe fn apply_layer(overlay: HWND, mode: &str, anchor: isize) {
     let a = HWND(anchor as *mut core::ffi::c_void);
     // Insert-after alone does not reliably clear WS_EX_TOPMOST here, so drop the
@@ -1601,37 +1631,51 @@ unsafe fn apply_layer(overlay: HWND, mode: &str, anchor: isize) {
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
         );
     }
+    let mut rc: i32 = -1;
     match mode {
         "desktop" => {
-            let _ = SetWindowPos(
+            SetWindowPos(
                 overlay, HWND_BOTTOM, 0, 0, 0, 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-            );
+            )
+                .map(|_| 1)
+                .unwrap_or(0)
+                .min(1);
         }
         "below" if anchor != 0 => {
             // insert-after places us immediately BEHIND the anchor
-            let _ = SetWindowPos(
+            SetWindowPos(
                 overlay, a, 0, 0, 0, 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-            );
+            )
+                .map(|_| 1)
+                .unwrap_or(0)
+                .min(1);
         }
         "above" if anchor != 0 => {
             // to sit in FRONT of the anchor, insert after whatever is currently
             // in front of it
             let prev = GetWindow(a, GW_HWNDPREV).unwrap_or_default();
             let insert = if prev.0.is_null() { HWND_TOPMOST } else { prev };
-            let _ = SetWindowPos(
+            SetWindowPos(
                 overlay, insert, 0, 0, 0, 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-            );
+            )
+                .map(|_| 1)
+                .unwrap_or(0)
+                .min(1);
         }
         _ => {
-            let _ = SetWindowPos(
+            SetWindowPos(
                 overlay, HWND_TOPMOST, 0, 0, 0, 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-            );
+            )
+                .map(|_| 1)
+                .unwrap_or(0)
+                .min(1);
         }
     }
+    LAST_LAYER.store(rc, std::sync::atomic::Ordering::Relaxed);
 }
 
 fn client_xy(lparam: LPARAM) -> (i32, i32) {
@@ -2170,6 +2214,10 @@ fn handle_line(line: &str) {
     out["layer_hwnd"] = serde_json::json!(format!("0x{:X}", st.layer_hwnd));
     out["layer_title"] = serde_json::json!(st.layer_title);
     out["layer_topmost"] = serde_json::json!(st.layer_topmost);
+    out["layer_result"] = serde_json::json!(st.layer_result);
+    out["drag_enabled"] = serde_json::json!(st.drag_enabled);
+    out["dragging"] = serde_json::json!(st.dragging);
+    out["drag_feedback"] = serde_json::json!(st.drag_feedback);
     out["panel_x"] = serde_json::json!(st.panel_pos.0);
     out["panel_y"] = serde_json::json!(st.panel_pos.1);
     let mut slot_out = serde_json::Map::new();
@@ -2445,9 +2493,14 @@ fn main() {
                 };
                 apply_layer(hwnd_of(ohwnd), &mode, anchor);
                 // Read back the truth instead of trusting the call.
+                let rc = last_layer_result();
                 let ex = GetWindowLongW(hwnd_of(ohwnd), GWL_EXSTYLE) as u32;
                 let topmost = ex & 0x0000_0008 != 0; // WS_EX_TOPMOST
-                st.lock().unwrap().layer_topmost = topmost;
+                {
+                    let mut s = st.lock().unwrap();
+                    s.layer_topmost = topmost;
+                    s.layer_result = rc;
+                }
             }
             if p_hide {
                 let _ = ShowWindow(hwnd_of(phwnd), SW_HIDE);
@@ -2512,6 +2565,50 @@ fn main() {
 
             // Advance animated sprites: repaint only when the visible frame
             // actually changes, so an idle GIF does not burn a redraw per tick.
+            // ---- the human can grab the AI cursor with their own pointer ----
+            //
+            // The cursor window is click-through, so it never receives the mouse
+            // message; the pointer is polled instead. The press also reaches
+            // whatever is underneath, which is the price of staying click-through.
+            let now_down = (GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16 & 0x8000) != 0;
+            {
+                let mut p = POINT::default();
+                let _ = GetCursorPos(&mut p);
+                let mut s = st.lock().unwrap();
+                let near = {
+                    let dx = p.x as f64 - s.cur.0;
+                    let dy = p.y as f64 - s.cur.1;
+                    (dx * dx + dy * dy).sqrt() <= 46.0
+                };
+                if s.drag_enabled && s.visible {
+                    if now_down && !s.drag_was_down && !s.dragging && near {
+                        s.dragging = true;
+                        s.drag_grab = (p.x as f64 - s.cur.0, p.y as f64 - s.cur.1);
+                    } else if s.dragging {
+                        if now_down {
+                            s.cur = (p.x as f64 - s.drag_grab.0, p.y as f64 - s.drag_grab.1);
+                            s.target = s.cur;
+                            s.dur_ms = 0.0;
+                            s.last_activity = Instant::now();
+                            s.dirty = true;
+                        } else {
+                            // released: hand control back to the human, and tell the
+                            // agent plainly that its cursor was taken away
+                            s.dragging = false;
+                            s.prev_permission = s.permission.max(2);
+                            s.permission = 0;
+                            s.drag_feedback = Some(format!(
+                                "用户用真实鼠标把 AI 光标拖到了 ({:.0}, {:.0})，AI 控制已自动停止。",
+                                s.cur.0, s.cur.1
+                            ));
+                            s.dirty = true;
+                            s.panel_dirty = true;
+                        }
+                    }
+                }
+                s.drag_was_down = now_down;
+            }
+
             // Sprite frames advance whether or not the cursor is on screen: the
             // artwork thumbnails in the panel have to animate on their own.
             {

@@ -98,6 +98,9 @@ pub struct PanelView {
     pub epoch_ms: u64,
     /// Which artwork slot the editor block below the rows is editing.
     pub art_sel: usize,
+    /// The human may drag the cursor with their own pointer.
+    pub drag_enabled: bool,
+    pub dragging: bool,
 }
 
 #[allow(dead_code)]

@@ -133,7 +133,7 @@ pub fn build(v: &PanelView, mut y: i32, out: &mut Vec<Hit>) -> i32 {
 
 // ------------------------------------------------------------------ bodies ---
 
-fn body_actions(v: &PanelView, x: i32, y: i32, out: &mut Vec<Hit>) -> i32 {
+fn body_actions(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
     let w = col_w();
     let acts: [(&'static str, &str, bool); 4] = [
         ("show", "显示", v.visible),
@@ -150,7 +150,19 @@ fn body_actions(v: &PanelView, x: i32, y: i32, out: &mut Vec<Hit>) -> i32 {
                 .hover(hov(v, id)),
         );
     }
-    y + 38
+    y += 38;
+    out.push(Hit::new(rect(x, y, x + 34, y + 16), Kind::Label, "l_drag").text("拖拽"));
+    out.push(
+        Hit::new(rect(x + 38, y - 2, x + 130, y + 22), Kind::Button, "drag_toggle")
+            .text(if v.drag_enabled { "可用" } else { "禁用" })
+            .active(v.drag_enabled)
+            .hover(hov(v, "drag_toggle")),
+    );
+    out.push(
+        Hit::new(rect(x + 140, y, content_right(), y + 18), Kind::Label, "l_drag_hint")
+            .text(if v.dragging { "正在被用户拖动…" } else { "按住光标即可用真实鼠标拖动它" }),
+    );
+    y + 28
 }
 
 fn body_appearance(v: &PanelView, x: i32, y: i32, out: &mut Vec<Hit>) -> i32 {
