@@ -1,4 +1,5 @@
 import Schema from '@deepseek-ai/schemastery'
+import { defaultAssetDir } from './assets'
 import { DEFAULT_MOUSE_TOOLS, INTERCEPT_MODES } from './intercept'
 import type { InterceptMode } from './intercept'
 
@@ -44,6 +45,8 @@ export interface Config {
   intercept: InterceptMode
   /** Tool names (or `prefix*` patterns) treated as real-mouse tools. */
   interceptTools: string[]
+  /** Folder to scan for custom artwork. A bare file name resolves here. */
+  assetDir: string
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -92,6 +95,12 @@ export const Config: Schema<Config> = Schema.object({
   interceptTools: Schema.array(Schema.string())
     .default([...DEFAULT_MOUSE_TOOLS])
     .description('Tool names treated as real-mouse tools. A trailing * matches a prefix.'),
+  assetDir: Schema.string()
+    .default(defaultAssetDir())
+    .description(
+      'Folder scanned for custom artwork. A bare file name in ai_mouse_sprite resolves here; '
+        + 'an absolute path is used as-is.',
+    ),
   permission: Schema.union([0, 1, 2, 3] as const)
     .default(3)
     .description(

@@ -12,6 +12,8 @@ import {
   normalizeMode,
 } from './intercept'
 import type { InterceptMode } from './intercept'
+import { defaultAssetDir, listAssets, resolveSource } from './assets'
+import type { AssetEntry } from './assets'
 
 export const name = 'dsh-ai-cursor'
 export const inject = ['tools']
@@ -481,6 +483,114 @@ export function apply(ctx: Context, config: ConfigShape): void {
           )
         }
         return lines.join('\n')
+      },
+    }),
+  )
+
+  // ------------------------------------------------------------- artwork ---
+
+  const SLOT_NAMES = ['cursor', 'hint', 'ornament'] as const
+
+  const slotSummary = (status: OverlayStatus): string => {
+    const slots = (status as unknown as { slots?: Record<string, Record<string, unknown>> }).slots
+    if (!slots) return '（浮层未返回图案状态）'
+    return SLOT_NAMES.map((name) => {
+      const s = slots[name]
+      if (!s) return `${name}=?`
+      const src = String(s.source ?? '')
+      const shown = src === 'builtin' ? 'vector' : src === '' ? 'off' : src.split(/[\\/]/).pop()
+      const frames = typeof s.frames === 'number' ? `/${s.frames}f` : ''
+      const err = s.error ? ` ERROR(${String(s.error)})` : ''
+      return `${name}=${shown}${frames}${err}`
+    }).join('  ')
+  }
+
+  ctx.tools.register(
+    defineTool({
+      name: 'ai_mouse_sprite',
+      description:
+        'Set the artwork of one picture slot: `cursor` (the pointer itself), `hint` (the "AI 鼠标" badge) or `ornament` (a decoration attached to the cursor). `source` accepts an absolute image path, a bare file name inside the asset folder, "builtin" for the vector artwork, or "none" to switch the slot off. Formats: png / jpg / gif (animated) / webp / bmp / ico / tif / tiff / svg. Transparency is preserved per pixel.',
+      parameters: {
+        slot: { type: 'string', required: true, description: 'cursor | hint | ornament' },
+        source: {
+          type: 'string',
+          description: 'Absolute path, file name in the asset folder, "builtin", or "none".',
+        },
+        size: { type: 'number', description: 'Target width in device pixels; 0 keeps the natural size.' },
+        offset: {
+          type: 'array',
+          items: { type: 'number' },
+          description: 'Where the hotspot sits relative to the cursor tip, [x, y] device px.',
+        },
+        hotspot: {
+          type: 'array',
+          items: { type: 'number' },
+          description: 'Which point of the image lands on the offset, normalised [0..1, 0..1].',
+        },
+        opacity: { type: 'number', description: 'Slot opacity 0..1, multiplied by the global opacity.' },
+        flip: { type: 'boolean', description: 'Mirror the artwork horizontally.' },
+        visible: { type: 'boolean', description: 'Show or hide this slot.' },
+      },
+      output: TEXT_OUTPUT,
+      async execute(args: {
+        slot: string
+        source?: string
+        size?: number
+        offset?: number[]
+        hotspot?: number[]
+        opacity?: number
+        flip?: boolean
+        visible?: boolean
+      }) {
+        const refused = await gate(3, 'ai_mouse_sprite')
+        if (refused) return refused
+        if (!(SLOT_NAMES as readonly string[]).includes(args.slot)) {
+          return `slot 必须是 ${SLOT_NAMES.join(' | ')}，收到「${args.slot}」。`
+        }
+        const payload: Record<string, unknown> = { slot: args.slot }
+        if (args.source !== undefined) {
+          const resolved = resolveSource(args.source, config.assetDir)
+          if (resolved.kind === 'missing') return `加载失败：${resolved.error}`
+          payload.source = resolved.wire
+        }
+        if (args.size !== undefined) payload.size = args.size
+        if (args.opacity !== undefined) payload.opacity = args.opacity
+        if (args.flip !== undefined) payload.flip = args.flip
+        if (args.visible !== undefined) payload.visible = args.visible
+        if (Array.isArray(args.offset) && args.offset.length >= 2) payload.offset = args.offset.slice(0, 2)
+        if (Array.isArray(args.hotspot) && args.hotspot.length >= 2) payload.hotspot = args.hotspot.slice(0, 2)
+
+        await prime()
+        const reply = await send('sprite', payload)
+        const status = await send('status')
+        return `${describeStatus(reply)}\n图案: ${slotSummary(status)}`
+      },
+    }),
+  )
+
+  ctx.tools.register(
+    defineTool({
+      name: 'ai_mouse_assets',
+      description:
+        'List the pictures available in the asset folder (the folder ai_mouse_sprite resolves bare file names against). Newest first.',
+      parameters: {
+        limit: { type: 'number', description: 'Maximum entries to list (default 30).' },
+      },
+      output: TEXT_OUTPUT,
+      async execute(args: { limit?: number }) {
+        const dir = config.assetDir || defaultAssetDir()
+        const entries: AssetEntry[] = listAssets(dir)
+        if (entries.length === 0) {
+          return (
+            `素材目录为空或不存在：${dir}\n` +
+            '把 png / gif / svg / webp 等图片放进去，然后用 ai_mouse_sprite 按文件名引用即可。'
+          )
+        }
+        const limit = Math.max(1, Math.min(args.limit ?? 30, 200))
+        const lines = entries
+          .slice(0, limit)
+          .map((e) => `  ${e.name}  (${(e.size / 1024).toFixed(1)} KB)`)
+        return `素材目录：${dir}（共 ${entries.length} 个）\n${lines.join('\n')}`
       },
     }),
   )

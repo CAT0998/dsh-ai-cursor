@@ -11,6 +11,18 @@ path = "src/main.rs"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Raster decoding: PNG / JPEG / GIF (animated) / WebP / BMP / ICO / TIFF.
+image = { version = "0.25", default-features = false, features = [
+  "png",
+  "jpeg",
+  "gif",
+  "webp",
+  "bmp",
+  "ico",
+  "tiff",
+] }
+# SVG rasterisation: a maintained implementation instead of hand-rolled parsing.
+resvg = "0.45"
 
 [dependencies.windows]
 version = "0.58"
