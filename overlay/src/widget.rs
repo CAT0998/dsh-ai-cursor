@@ -27,6 +27,8 @@ pub enum Kind {
     Wheel,
     /// A live thumbnail of a picture slot (animates with the sprite).
     Preview,
+    /// The minimap box: screen outline + window rects + the cursor dot.
+    Minimap,
     Sep,
 }
 
@@ -101,6 +103,10 @@ pub struct PanelView {
     /// The human may drag the cursor with their own pointer.
     pub drag_enabled: bool,
     pub dragging: bool,
+    /// Minimap: zoom (0.5..2), opacity (0.2..1), visible.
+    pub map_zoom: f64,
+    pub map_opacity: f64,
+    pub map_visible: bool,
 }
 
 #[allow(dead_code)]

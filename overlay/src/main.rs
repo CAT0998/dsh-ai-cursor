@@ -213,6 +213,10 @@ struct St {
     /// Screen rect of the bound window, so the cursor's position inside it can be
     /// computed arithmetically instead of queried from the live stack.
     layer_rect: Option<(i32, i32, i32, i32)>,
+    /// Minimap settings.
+    map_zoom: f64,
+    map_opacity: f64,
+    map_visible: bool,
     /// The human may grab the AI cursor with their own pointer.
     drag_enabled: bool,
     dragging: bool,
@@ -301,6 +305,9 @@ impl St {
             layer_topmost: true,
             layer_result: -1,
             layer_rect: None,
+            map_zoom: 1.0,
+            map_opacity: 1.0,
+            map_visible: true,
             drag_enabled: true,
             dragging: false,
             drag_grab: (0.0, 0.0),
@@ -1115,6 +1122,36 @@ unsafe fn draw_panel(cv: &Canvas, v: &PanelView, hits: &[Hit], h: i32) {
                 cv.ring_circle(sx, sy, 6, 1, 0x101820);
             }
             Kind::Preview => {}
+            Kind::Minimap => {
+                // screen outline, then the windows on top of it, then the cursor
+                cv.fill_round(h.r, 8, 0x0B1016);
+                cv.stroke_round(h.r, 8, C_BORDER, 1);
+                let sw = GetSystemMetrics(SYSTEM_METRICS_INDEX(SM_CXSCREEN.0)).max(1) as f64;
+                let sh = GetSystemMetrics(SYSTEM_METRICS_INDEX(SM_CYSCREEN.0)).max(1) as f64;
+                let bw = (h.r.right - h.r.left - 8) as f64;
+                let bh = (h.r.bottom - h.r.top - 8) as f64;
+                let k = (bw / sw).min(bh / sh);
+                let ox = h.r.left + 4 + ((bw - sw * k) / 2.0) as i32;
+                let oy = h.r.top + 4 + ((bh - sh * k) / 2.0) as i32;
+                let map = |x: i32, y: i32| -> (i32, i32) {
+                    (ox + (x as f64 * k) as i32, oy + (y as f64 * k) as i32)
+                };
+                let (sx, sy) = map(0, 0);
+                cv.stroke_round(
+                    rect(sx, sy, sx + (sw * k) as i32, sy + (sh * k) as i32),
+                    3,
+                    0x2A3542,
+                    1,
+                );
+                for (wx, wy, ww, wh) in top_window_rects(10) {
+                    let (a, b) = map(wx, wy);
+                    let (c, d) = map(wx + ww, wy + wh);
+                    cv.fill_round(rect(a, b, c.max(a + 1), d.max(b + 1)), 2, 0x1D2733);
+                }
+                let (cx, cy) = map(v.cur.0 as i32, v.cur.1 as i32);
+                cv.fill_circle(cx, cy, 4, v.accent);
+                cv.ring_circle(cx, cy, 5, 1, 0xFFFFFF);
+            }
             Kind::Header | Kind::Chip => {}
         }
     }
@@ -1261,6 +1298,9 @@ fn view_of(st: &St) -> PanelView {
         custom: custom_view(st),
         epoch_ms: Instant::now().duration_since(st.sprite_epoch).as_millis() as u64,
         art_sel: st.art_sel,
+        map_zoom: st.map_zoom,
+        map_opacity: st.map_opacity,
+        map_visible: st.map_visible,
         drag_enabled: st.drag_enabled,
         dragging: st.dragging,
     }
@@ -1396,7 +1436,22 @@ fn on_toggle(st: &mut St, id: &str) {
             st.dirty = true;
         }
         _ => {
-            if id == "drag_toggle" {
+            if id == "map_zoom_in" {
+                st.map_zoom = (st.map_zoom + 0.25).min(3.0);
+                st.panel_dirty = true;
+            } else if id == "map_zoom_out" {
+                st.map_zoom = (st.map_zoom - 0.25).max(0.5);
+                st.panel_dirty = true;
+            } else if id == "map_op_up" {
+                st.map_opacity = (st.map_opacity + 0.1).min(1.0);
+                st.panel_dirty = true;
+            } else if id == "map_op_down" {
+                st.map_opacity = (st.map_opacity - 0.1).max(0.2);
+                st.panel_dirty = true;
+            } else if id == "map_toggle" {
+                st.map_visible = !st.map_visible;
+                st.panel_dirty = true;
+            } else if id == "drag_toggle" {
                 st.drag_enabled = !st.drag_enabled;
                 st.panel_dirty = true;
             } else if id == "art_flip" {
@@ -1537,6 +1592,7 @@ fn pick<'a>(hits: &'a [Hit], x: i32, y: i32) -> Option<&'a Hit> {
             Kind::Slider | Kind::Channel | Kind::Wheel => 1,
             Kind::Header => 2,
             Kind::Preview => 0,
+            Kind::Minimap => 3,
             Kind::Label | Kind::LabelRight | Kind::Sep => 3,
         }
     }
@@ -1751,6 +1807,36 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
         }
     }
     CallNextHookEx(None, code, wparam, lparam)
+}
+
+/// Top-level visible windows, front to back, as rects. Read-only: used to draw
+/// the minimap and never to change anything.
+unsafe fn top_window_rects(limit: usize) -> Vec<(i32, i32, i32, i32)> {
+    struct Acc {
+        limit: usize,
+        out: Vec<(i32, i32, i32, i32)>,
+    }
+    unsafe extern "system" fn cb(hwnd: HWND, lp: LPARAM) -> BOOL {
+        let acc = &mut *(lp.0 as *mut Acc);
+        if acc.out.len() >= acc.limit {
+            return FALSE;
+        }
+        if !IsWindowVisible(hwnd).as_bool() {
+            return TRUE;
+        }
+        let mut r = RECT::default();
+        if GetWindowRect(hwnd, &mut r).is_err() {
+            return TRUE;
+        }
+        if r.right - r.left < 24 || r.bottom - r.top < 24 {
+            return TRUE;
+        }
+        acc.out.push((r.left, r.top, r.right - r.left, r.bottom - r.top));
+        TRUE
+    }
+    let mut acc = Acc { limit, out: Vec::new() };
+    let _ = EnumWindows(Some(cb), LPARAM(&mut acc as *mut Acc as isize));
+    acc.out
 }
 
 /// Cached read of a window's screen rect — no cross-process messaging, so this
@@ -2458,6 +2544,9 @@ fn handle_line(line: &str) {
     out["layer"] = serde_json::json!(st.layer_mode);
     out["layer_hwnd"] = serde_json::json!(format!("0x{:X}", st.layer_hwnd));
     out["layer_title"] = serde_json::json!(st.layer_title);
+    out["map_zoom"] = serde_json::json!(st.map_zoom);
+    out["map_opacity"] = serde_json::json!(st.map_opacity);
+    out["map_visible"] = serde_json::json!(st.map_visible);
     out["layer_topmost"] = serde_json::json!(st.layer_topmost);
     if let Some((rx, ry, rw, rh)) = st.layer_rect {
         let cx = st.cur.0.round() as i32;
