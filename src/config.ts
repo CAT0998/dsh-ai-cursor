@@ -1,4 +1,6 @@
 import Schema from '@deepseek-ai/schemastery'
+import { DEFAULT_MOUSE_TOOLS, INTERCEPT_MODES } from './intercept'
+import type { InterceptMode } from './intercept'
 
 /**
  * Tunable configuration must be a Schemastery Schema, never a plain object:
@@ -34,6 +36,14 @@ export interface Config {
   badge: boolean
   /** Starting permission ceiling for the agent (0 stopped … 3 admin). */
   permission: 0 | 1 | 2 | 3
+  /**
+   * What to do with other plugins' real-mouse tools.
+   * off = leave them alone, refuse = deny, redirect = move the AI cursor there and
+   * deny the real call, mirror = let the real call through and follow with the cursor.
+   */
+  intercept: InterceptMode
+  /** Tool names (or `prefix*` patterns) treated as real-mouse tools. */
+  interceptTools: string[]
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -71,6 +81,17 @@ export const Config: Schema<Config> = Schema.object({
   badge: Schema.boolean()
     .default(true)
     .description('Show the "AI 鼠标" badge under the cursor.'),
+  intercept: Schema.union(INTERCEPT_MODES)
+    .default('off')
+    .description(
+      'Real-mouse interception: off leaves other plugins alone; refuse denies their mouse '
+        + 'tools; redirect moves the AI cursor to the target and denies the real call (the '
+        + 'real click does NOT happen); mirror lets the real call through and follows it '
+        + 'with the AI cursor.',
+    ),
+  interceptTools: Schema.array(Schema.string())
+    .default([...DEFAULT_MOUSE_TOOLS])
+    .description('Tool names treated as real-mouse tools. A trailing * matches a prefix.'),
   permission: Schema.union([0, 1, 2, 3] as const)
     .default(3)
     .description(

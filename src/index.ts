@@ -4,6 +4,14 @@ import { Config } from './config'
 import type { Config as ConfigShape } from './config'
 import { Overlay, type OverlayStatus } from './overlay'
 import { denial, levelInfo, levelName, normalizeLevel, permits } from './permissions'
+import {
+  DEFAULT_MOUSE_TOOLS,
+  extractPoint,
+  interceptReason,
+  matchesTool,
+  normalizeMode,
+} from './intercept'
+import type { InterceptMode } from './intercept'
 
 export const name = 'dsh-ai-cursor'
 export const inject = ['tools']
@@ -12,6 +20,15 @@ export const inject = ['tools']
 export { Config }
 export { Overlay, resolveExePath } from './overlay'
 export { LEVELS, levelInfo, levelName, normalizeLevel, permits, denial } from './permissions'
+export {
+  DEFAULT_MOUSE_TOOLS,
+  INTERCEPT_MODES,
+  extractPoint,
+  interceptReason,
+  matchesTool,
+  normalizeMode,
+} from './intercept'
+export type { InterceptMode } from './intercept'
 export type { OverlayStatus } from './overlay'
 
 /** One-line human/machine readable rendering of an overlay reply (pure, testable). */
@@ -52,7 +69,11 @@ export function apply(ctx: Context, config: ConfigShape): void {
    * stays fresh without polling; `gate()` refreshes it explicitly when the cached
    * value is too low, because a human may have raised the ceiling in the panel.
    */
-  const state = { permission: normalizeLevel(config.permission, 3) }
+  const state = {
+    permission: normalizeLevel(config.permission, 3),
+    intercept: normalizeMode(config.intercept, 'off') as InterceptMode,
+    interceptTools: [...config.interceptTools],
+  }
 
   const send = async (
     cmd: string,
@@ -65,6 +86,44 @@ export function apply(ctx: Context, config: ConfigShape): void {
     }
     return reply
   }
+
+  // ---------------------------------------------------------------- intercept
+  //
+  // Other plugins drive the real pointer. `tools/pre-execute` is the only honest
+  // seam: it can allow/deny, never rewrite. So "redirect" moves the AI cursor and
+  // then denies the real call — the agent is told the real action did not happen,
+  // instead of being left to believe it clicked something.
+  ctx.on('tools/pre-execute', async (exec, next) => {
+    if (state.intercept === 'off') return next()
+    const name = exec.name
+    if (name.startsWith('ai_mouse_')) return next()
+    if (!matchesTool(name, state.interceptTools)) return next()
+    if (exec.signal?.aborted) return next()
+
+    const point = extractPoint(exec.arguments)
+
+    if (state.intercept === 'mirror') {
+      if (point) {
+        void send('move', { x: point.x, y: point.y, duration_ms: 200 }).catch(() => {})
+      }
+      return next()
+    }
+
+    if (state.intercept === 'redirect' && point) {
+      // Walk the AI cursor there first so the human sees where the blocked call
+      // was aimed; a failure to draw must not change the decision.
+      try {
+        await send('move', { x: point.x, y: point.y, duration_ms: 200 })
+      } catch {
+        /* the overlay being down does not make the real call acceptable */
+      }
+    }
+    return {
+      kind: 'deny',
+      reason: interceptReason({ mode: state.intercept, tool: name, point }),
+      info: { name: 'ai-mouse-intercept', code: 'REAL_MOUSE_BLOCKED' },
+    }
+  })
 
   const refreshLevel = async (): Promise<number> => {
     try {
@@ -359,6 +418,69 @@ export function apply(ctx: Context, config: ConfigShape): void {
         const reply = await send('permission', { level: target })
         const info = levelInfo(target)
         return `${describeStatus(reply)}\n权限已降为「${info.zh}」(${info.level})：${info.capability}。只有人能在浮动面板上把它调回去。`
+      },
+    }),
+  )
+
+  ctx.tools.register(
+    defineTool({
+      name: 'ai_mouse_intercept',
+      description:
+        "Read or set what happens to other plugins' real-mouse tools (computer_click, cua_driver_native__click, ...). off leaves them alone; refuse denies them; redirect moves the AI cursor to the target and denies the real call (the real click does NOT happen); mirror lets the real call through and follows it with the AI cursor. Report which of the configured tool names actually exist with `describe: true`.",
+      parameters: {
+        mode: {
+          type: 'string',
+          description: 'off | refuse | redirect | mirror. Omit to just read the current mode.',
+        },
+        add_tools: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Extra tool names (or `prefix*` patterns) to treat as real-mouse tools.',
+        },
+        describe: {
+          type: 'boolean',
+          description: 'Also report which configured names are currently registered.',
+        },
+      },
+      output: TEXT_OUTPUT,
+      async execute(args: { mode?: string; add_tools?: string[]; describe?: boolean }) {
+        if (args.mode !== undefined) {
+          const refused = await gate(3, 'ai_mouse_intercept')
+          if (refused) return refused
+          state.intercept = normalizeMode(args.mode, state.intercept)
+        }
+        if (args.add_tools !== undefined) {
+          const refused = await gate(3, 'ai_mouse_intercept')
+          if (refused) return refused
+          for (const extra of args.add_tools) {
+            if (typeof extra === 'string' && extra.trim() !== '' && !state.interceptTools.includes(extra.trim())) {
+              state.interceptTools.push(extra.trim())
+            }
+          }
+        }
+        const lines = [
+          `拦截模式 = ${state.intercept}`,
+          `监视的鼠标工具（${state.interceptTools.length}）: ${state.interceptTools.join(', ')}`,
+        ]
+        if (args.describe) {
+          const missing = state.interceptTools.filter((name) => ctx.tools.get(name) === undefined)
+          lines.push(
+            missing.length === 0
+              ? '全部已注册 ✓'
+              : `未注册（不会命中）: ${missing.join(', ')}`,
+          )
+        }
+        if (state.intercept === 'off') {
+          lines.push('当前放行：其他插件的真实鼠标操作不会被拦截。')
+        } else if (state.intercept === 'mirror') {
+          lines.push('当前 mirror：真实操作照常执行，AI 光标同步跟随（只用于显示）。')
+        } else {
+          lines.push(
+            `当前 ${state.intercept}：命中的调用会被拒绝，真实点击/拖拽不会发生；` +
+              'redirect 会先把 AI 光标移到目标点。',
+          )
+        }
+        return lines.join('\n')
       },
     }),
   )

@@ -1,6 +1,6 @@
 {
   "name": "dsh-ai-cursor",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "AI 鼠标 (AI cursor) for DeepSeek Harness: a click-through second cursor that shows where the agent is working, plus a floating, collapsible control panel for style, opacity, colour, badge and permission level. Never moves the real mouse pointer.",
   "type": "module",
   "main": "lib/index.js",
