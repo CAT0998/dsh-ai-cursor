@@ -184,6 +184,7 @@ struct St {
     panel_px_h: i32,
     asset_dir: String,
     custom: custom::CustomSpec,
+    art_sel: usize,
     want_dump: Option<(String, bool)>, // (path, panel?)
     dump_done: bool,
     dump_error: Option<String>,
@@ -246,6 +247,7 @@ impl St {
             assets: Vec::new(),
             panel_px_h: PH,
             asset_dir: String::new(),
+            art_sel: 0,
             custom: custom::CustomSpec::default(),
             want_dump: None,
             dump_done: false,
@@ -976,11 +978,7 @@ unsafe fn draw_panel(cv: &Canvas, v: &PanelView, hits: &[Hit], h: i32) {
                 let knob = (h.r.left + 9, h.r.right - 9);
                 let track = rect(knob.0, cy - 2, knob.1, cy + 2);
                 cv.fill_round(track, 2, C_TRACK);
-                let value = if h.id == "opacity" {
-                    ((v.opacity - 0.15) / 0.85).clamp(0.0, 1.0)
-                } else {
-                    ((v.scale - 0.6) / 1.4).clamp(0.0, 1.0)
-                };
+                let value = (h.data as f64 / 1000.0).clamp(0.0, 1.0);
                 let kx = knob.0 + ((knob.1 - knob.0) as f64 * value) as i32;
                 cv.fill_round(rect(knob.0, cy - 2, kx, cy + 2), 2, v.accent);
                 cv.fill_circle(kx, cy, 7, if h.hover { 0xFFFFFF } else { shade(v.accent, 1.5) });
@@ -1184,6 +1182,7 @@ fn view_of(st: &St) -> PanelView {
         rgb: channels_of(st.accent),
         custom: custom_view(st),
         epoch_ms: Instant::now().duration_since(st.sprite_epoch).as_millis() as u64,
+        art_sel: st.art_sel,
     }
 }
 
@@ -1215,6 +1214,7 @@ fn slot_view(slot: &Slot, name: &str) -> SlotView {
         flip: slot.flip_x,
         frames: 1,
         error: None,
+        offset: slot.offset,
     };
     if slot.is_image() {
         let mut cache = sprites().lock().unwrap();
@@ -1316,7 +1316,27 @@ fn on_toggle(st: &mut St, id: &str) {
             st.dirty = true;
         }
         _ => {
-            if let Some(rest) = id.strip_prefix("cus") {
+            if id == "art_flip" {
+                let i = st.art_sel.min(2);
+                st.slots[i].flip_x = !st.slots[i].flip_x;
+                st.dirty = true;
+            } else if id == "art_reset" {
+                let i = st.art_sel.min(2);
+                let s = &mut st.slots[i];
+                s.size = 0.0;
+                s.opacity = 1.0;
+                s.flip_x = false;
+                s.offset = match i {
+                    SLOT_HINT => (12.0, 50.0),
+                    SLOT_ORNAMENT => (-80.0, 10.0),
+                    _ => (0.0, 0.0),
+                };
+                s.hotspot = match i {
+                    SLOT_ORNAMENT => (0.5, 0.5),
+                    _ => (0.0, 0.0),
+                };
+                st.dirty = true;
+            } else if let Some(rest) = id.strip_prefix("cus") {
                 if let Ok(i) = rest.parse::<usize>() {
                     if let Some((action, set)) = st.custom.action_of(i) {
                         let action = action.to_string();
@@ -1395,13 +1415,28 @@ unsafe fn slider_value(st: &mut St, id: &str, x: i32, hits: &[Hit]) {
     let Some(h) = hits.iter().find(|h| h.id == id) else { return };
     let (a, b) = (h.r.left + 9, h.r.right - 9);
     let t = ((x - a) as f64 / (b - a) as f64).clamp(0.0, 1.0);
-    if id == "opacity" {
-        st.opacity = 0.15 + t * 0.85;
-        st.dirty = true;
-    } else {
-        st.scale = 0.6 + t * 1.4;
-        st.dirty = true;
+    match id {
+        "opacity" => st.opacity = 0.15 + t * 0.85,
+        "scale" => st.scale = 0.6 + t * 1.4,
+        "art_opacity" => {
+            let i = st.art_sel.min(2);
+            st.slots[i].opacity = t;
+        }
+        "art_size" => {
+            let i = st.art_sel.min(2);
+            st.slots[i].size = (8.0 + t * 248.0).round();
+        }
+        "art_offx" => {
+            let i = st.art_sel.min(2);
+            st.slots[i].offset.0 = (-200.0 + t * 400.0).round();
+        }
+        "art_offy" => {
+            let i = st.art_sel.min(2);
+            st.slots[i].offset.1 = (-200.0 + t * 400.0).round();
+        }
+        _ => {}
     }
+    st.dirty = true;
     st.panel_dirty = true;
 }
 
@@ -1418,7 +1453,8 @@ fn pick<'a>(hits: &'a [Hit], x: i32, y: i32) -> Option<&'a Hit> {
             Kind::Button | Kind::Swatch | Kind::Chip | Kind::Section => 0,
             Kind::Slider | Kind::Channel | Kind::Wheel => 1,
             Kind::Header => 2,
-            Kind::Label | Kind::LabelRight | Kind::Sep | Kind::Preview => 3,
+            Kind::Preview => 0,
+            Kind::Label | Kind::LabelRight | Kind::Sep => 3,
         }
     }
     hits.iter().filter(|h| h.hit(x, y)).min_by_key(|h| rank(h.kind))
@@ -1573,6 +1609,11 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                         } else {
                             slider_value(&mut st, id, x, &hits);
                         }
+                        handled = true;
+                    }
+                    Kind::Preview => {
+                        st.art_sel = (h.data.max(0) as usize).min(2);
+                        st.panel_dirty = true;
                         handled = true;
                     }
                     Kind::Button | Kind::Swatch | Kind::Chip | Kind::Section => {

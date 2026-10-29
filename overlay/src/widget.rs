@@ -96,6 +96,8 @@ pub struct PanelView {
     pub custom: CustomView,
     /// Milliseconds into the sprite timeline; drives thumbnail animation.
     pub epoch_ms: u64,
+    /// Which artwork slot the editor block below the rows is editing.
+    pub art_sel: usize,
 }
 
 #[allow(dead_code)]
@@ -134,6 +136,7 @@ pub struct SlotView {
     pub flip: bool,
     pub frames: usize,
     pub error: Option<String>,
+    pub offset: (f64, f64),
 }
 
 pub const SWATCHES: [u32; 8] = [

@@ -171,7 +171,10 @@ fn body_appearance(v: &PanelView, x: i32, y: i32, out: &mut Vec<Hit>) -> i32 {
         Hit::new(rect(x + 240, y, content_right(), y + 18), Kind::LabelRight, "l_opacity")
             .text(format!("透明度 {}%", (v.opacity * 100.0).round() as i32)),
     );
-    out.push(Hit::new(rect(x, y + 28, content_right(), y + 46), Kind::Slider, "opacity"));
+    out.push(
+        Hit::new(rect(x, y + 28, content_right(), y + 46), Kind::Slider, "opacity")
+            .data(((v.opacity - 0.15) / 0.85 * 1000.0).clamp(0.0, 1000.0) as i32),
+    );
     y + 50
 }
 
@@ -191,7 +194,10 @@ fn body_style(v: &PanelView, x: i32, y: i32, out: &mut Vec<Hit>) -> i32 {
         Hit::new(rect(x + 226, y, content_right(), y + 18), Kind::LabelRight, "l_scale")
             .text(format!("大小 {}%", (v.scale * 100.0).round() as i32)),
     );
-    out.push(Hit::new(rect(x, y + 28, content_right(), y + 46), Kind::Slider, "scale"));
+    out.push(
+        Hit::new(rect(x, y + 28, content_right(), y + 46), Kind::Slider, "scale")
+            .data(((v.scale - 0.6) / 1.4 * 1000.0).clamp(0.0, 1000.0) as i32),
+    );
     y + 50
 }
 
@@ -278,7 +284,9 @@ fn slot_row(
     // previews as an animation
     out.push(
         Hit::new(rect(x, y - 4, x + 46, y + 24), Kind::Preview, PREVIEW_IDS[idx])
-            .data(idx as i32),
+            .data(idx as i32)
+            .active(v.art_sel == idx)
+            .hover(hov(v, PREVIEW_IDS[idx])),
     );
     let label = format!("{} {}", slot.name, source_short(slot));
     out.push(Hit::new(rect(x + 54, y, x + 250, y + 20), Kind::Label, "l_slot").text(label));
