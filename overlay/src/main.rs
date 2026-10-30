@@ -142,6 +142,43 @@ fn dock_frame_interval() -> std::time::Duration {
     std::time::Duration::from_micros(1_000_000 / fps as u64)
 }
 
+/// Which berths the user has selected. Written to a file the plugin reads, so the
+/// dock and the menu bar stay in step without a second communication channel.
+static DOCK_SELECTED: std::sync::Mutex<Vec<bool>> = std::sync::Mutex::new(Vec::new());
+
+fn dock_berth_index_at(cx: i32, cy: i32, count: usize, zoom: f64) -> Option<usize> {
+    let sc = |v: i32| (v as f64 * zoom).round() as i32;
+    let pad = sc(DOCK_PAD);
+    let gap = sc(BERTH_GAP);
+    let w = sc(BERTH_W);
+    let top = sc(40);
+    let h = sc(64);
+    for i in 0..count.clamp(DOCK_MIN, DOCK_MAX) {
+        let x = pad + i as i32 * (w + gap);
+        if cx >= x && cx < x + w && cy >= top && cy < top + h {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn dock_write_selection() {
+    let Some(path) = DOCK_FILE.get() else { return };
+    let sel = DOCK_SELECTED.lock().map(|s| s.clone()).unwrap_or_default();
+    let names: Vec<String> = sel
+        .iter()
+        .enumerate()
+        .filter(|(_, on)| **on)
+        .map(|(i, _)| i.to_string())
+        .collect();
+    if let Some(dir) = std::path::Path::new(path).parent() {
+        let out = dir.join("dock-selection.json");
+        let body = serde_json::json!({ "selected": names }).to_string();
+        let _ = std::fs::write(&out, body);
+        logline!("INFO", "dock selection -> {out:?} {names:?}");
+    }
+}
+
 static DOCK_TOPMOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static DOCK_ZOOM: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(100);
 static INIT_PANEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -231,9 +268,18 @@ unsafe fn draw_dock_surface(cv: &Canvas, count: usize, zoom: f64) {
         let x = pad + i as i32 * (w + gap);
         let b = held.get(i).cloned().unwrap_or_default();
         let berth = rect(x, top, x + w, top + berth_h);
+        let selected = DOCK_SELECTED
+            .lock()
+            .map(|s| s.get(i).copied().unwrap_or(false))
+            .unwrap_or(false);
         if b.occupied {
-            cv.fill_round(berth, sc(10), 0x1B2A38);
-            cv.stroke_round(berth, sc(10), b.color & 0xFFFFFF, (2.0 * z).round().max(1.0) as i32);
+            cv.fill_round(berth, sc(10), if selected { 0x22405C } else { 0x1B2A38 });
+            let bw = if selected { (3.0 * z).round().max(2.0) as i32 } else { (2.0 * z).round().max(1.0) as i32 };
+            cv.stroke_round(berth, sc(10), b.color & 0xFFFFFF, bw);
+            if selected {
+                // a white outer ring makes "selected" unmistakable at a glance
+                cv.stroke_round(rect(x - sc(3), top - sc(3), x + w + sc(3), top + berth_h + sc(3)), sc(12), 0xFFFFFF, 1);
+            }
             cv.fill_circle(x + w / 2, top + sc(26), sc(11), b.color & 0xFFFFFF);
             cv.ring_circle(x + w / 2, top + sc(26), sc(14), 1, 0xFFFFFF);
         } else {
@@ -2548,6 +2594,24 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                 let _ = GetCursorPos(&mut p);
                 let mut r = RECT::default();
                 let _ = GetWindowRect(hwnd, &mut r);
+                // a click on a berth selects or deselects it; anything else drags
+                {
+                    let cx = p.x - r.left;
+                    let cy = p.y - r.top;
+                    let count = dock_berth_count();
+                    let z = DOCK_ZOOM.load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0;
+                    if let Some(i) = dock_berth_index_at(cx, cy, count, z) {
+                        if let Ok(mut sel) = DOCK_SELECTED.lock() {
+                            if sel.len() < DOCK_MAX {
+                                sel.resize(DOCK_MAX, false);
+                            }
+                            sel[i] = !sel[i];
+                            logline!("INFO", "berth {i} selected={}", sel[i]);
+                        }
+                        dock_write_selection();
+                        return LRESULT(0);
+                    }
+                }
                 // both axes: packing only x left the vertical drag dead
                 DRAG_ORIGIN.store(((p.x as i64) << 32) | (p.y as i64 & 0xFFFF_FFFF), std::sync::atomic::Ordering::Relaxed);
                 DRAG_CORNER.store(((r.left as i64) << 32) | (r.top as i64 & 0xFFFF_FFFF), std::sync::atomic::Ordering::Relaxed);
