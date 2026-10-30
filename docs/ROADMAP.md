@@ -280,3 +280,13 @@ struct Layout {
 - 保存/删除/导入仍在插件工具里，面板上有提示文字说明
 - 实测：展开分区看到 `测试A`；点「导出预设」后
   `bin/logs/presets-export.json` 生成，内容与 `presets.json` 一致
+
+### 侧边栏（浏览器虚拟界面）已实现并验证 —— 2026-10-30
+- 工具 `ai_mouse_sidebar { path? }` → 生成自包含 HTML（数据内嵌，file:// 可直接打开）
+- 默认位置 `<assetDir>/sidebar.html`
+- 内容：停靠站（每只光标一张卡：子代理/几号位/预设/四态带色）+ 预设列表，均可折叠
+- 实测（本地 8791 端口预览后截图 docs/sidebar.png）：
+  `停靠站（2）agent-b / 1号位 / 待机中`、`agent-c / 2号位 / 待机中`、
+  `预设（1）测试A · arrow · #FF0044 · 100%`
+- 说明：这是"浏览器虚拟界面"路线；要真正嵌进 DSH 界面内部，需要 DSH client plugin，
+  属于另一套工程，可后续再做
