@@ -650,11 +650,23 @@ fn body_presets(v: &PanelView, x: i32, y: i32, out: &mut Vec<Hit>) -> i32 {
             .text("导出预设")
             .hover(hov(v, "preset_export")),
     );
+    // 保存/删除需要写素材目录，浮层写不了，所以把意图写给宿主执行
     out.push(
-        Hit::new(rect(x + 118, y + 6, content_right(), y + 24), Kind::Label, "l_preset_hint")
-            .text("导出到 exe 目录的 logs/，保存与删除请用工具"),
+        Hit::new(rect(x + 118, y + 2, x + 228, y + 26), Kind::Button, "preset_save")
+            .text("保存当前")
+            .hover(hov(v, "preset_save")),
     );
-    y + 30
+    out.push(
+        Hit::new(rect(x + 236, y + 2, x + 346, y + 26), Kind::Button, "preset_delete")
+            .text("删除所选")
+            .hover(hov(v, "preset_delete")),
+    );
+    // 提示放到按钮下面一行：原来它从 x+118 开始，正好压在「保存当前」上面
+    out.push(
+        Hit::new(rect(x, y + 32, content_right(), y + 50), Kind::Label, "l_preset_hint")
+            .text("导出到 logs/；保存与删除由宿主写回 presets.json"),
+    );
+    y + 56
 }
 
 fn body_permission(v: &PanelView, x: i32, y: i32, out: &mut Vec<Hit>) -> i32 {

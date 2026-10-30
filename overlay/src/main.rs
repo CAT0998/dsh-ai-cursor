@@ -2093,6 +2093,18 @@ fn on_toggle(st: &mut St, id: &str) {
                 }
                 st.dirty = true;
                 st.panel_dirty = true;
+            } else if id == "preset_save" || id == "preset_delete" {
+                // 名字取自当前高亮项；保存时若没选中则留空，由宿主生成
+                let sel = st.preset_sel;
+                let name = st.presets.get(sel).cloned().unwrap_or_default();
+                if let Some(path) = dock_command_path().map(|p| p.display().to_string()) {
+                    let action = if id == "preset_save" { "preset_save" } else { "preset_delete" };
+                    let body = serde_json::json!({ "action": action, "name": name }).to_string();
+                    match std::fs::write(&path, body) {
+                        Ok(_) => logline!("INFO", "{action} {name:?} -> {path}"),
+                        Err(e) => logline!("ERROR", "{action} write {path:?}: {e}"),
+                    }
+                }
             } else if id == "preset_export" {
                 match export_presets(&st.asset_dir) {
                     Ok(p) => logline!("INFO", "presets exported to {p:?}"),

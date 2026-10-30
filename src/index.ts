@@ -117,6 +117,32 @@ export function apply(ctx: Context, config: ConfigShape): void {
     } catch {
       return null
     }
+    if (cmd.action === 'preset_save' || cmd.action === 'preset_delete') {
+      await rm(cmdFile, { force: true })
+      const wanted = String((cmd as { name?: string }).name ?? '').trim()
+      const file = presetsFile()
+      const list = await loadPresets(file)
+      if (cmd.action === 'preset_delete') {
+        if (!wanted) return '没有选中要删除的预设'
+        const next = removePreset(list, wanted)
+        if (next.length === list.length) return `没有名为 ${wanted} 的预设`
+        await savePresets(file, next)
+        return `已删除预设 ${wanted}`
+      }
+      // 保存：有名字覆盖，没名字新建
+      const st = (await send('status')) as unknown as Record<string, unknown>
+      const name = wanted || `预设${list.length + 1}`
+      const preset = capturePreset(name, {
+        theme: String(st.theme ?? 'whale'),
+        label: String(st.label ?? ''),
+        color: String(st.color ?? '#4FC3F7'),
+        opacity: Number(st.opacity ?? 1),
+        scale: Number(st.scale ?? 1),
+        badge: Boolean(st.badge),
+      })
+      await savePresets(file, upsertPreset(list, preset))
+      return `已保存预设 ${name}`
+    }
     if (cmd.action !== 'toggle_column') return null
     const idx = Number(cmd.index ?? -1)
     await rm(cmdFile, { force: true })
@@ -133,6 +159,9 @@ export function apply(ctx: Context, config: ConfigShape): void {
       return `第 ${idx + 1} 栏没有可关闭的状态`
     }
   }
+
+  const presetsFile = () =>
+    `${(config.assetDir || '').replace(/[\/]+$/, '')}/presets.json`
 
   const dockFile = () =>
     `${(config.assetDir || '').replace(/[\/]+$/, '')}/berths.json`
@@ -731,7 +760,8 @@ export function apply(ctx: Context, config: ConfigShape): void {
         if (args.visible === undefined) {
           const handled = await consumeDockCommands()
           const dir = (config.assetDir || '').replace(/[\/]+$/, '')
-          if (!overlay.dockRunning) return '停靠站：关'
+          // 命令已经执行过了，别因为停靠站没开就把结果吞掉
+          if (!overlay.dockRunning) return `${handled ? `${handled}。` : ''}停靠站：关`
           const list = [...cursors.keys()].map((name) => ({
             name,
             color: meta.get(name)?.color,
