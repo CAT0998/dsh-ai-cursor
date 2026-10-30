@@ -160,6 +160,13 @@ pub fn build(v: &PanelView, mut y: i32, out: &mut Vec<Hit>) -> i32 {
     let zoom = v.zoom.clamp(0.6, 2.0);
     let start = out.len();
     let bottom = build_design(v, y, out);
+    // A grip in the footer: dragging it changes the zoom. Authored at the design
+    // size like everything else, so it scales with the panel.
+    out.push(
+        Hit::new(rect(content_right() - 84, bottom + 4, content_right(), bottom + 24), Kind::Button, "panel_grip")
+            .text("大小")
+            .hover(hov(v, "panel_grip")),
+    );
     if (zoom - 1.0).abs() > 0.001 {
         for h in out[start..].iter_mut() {
             h.r.left = (h.r.left as f64 * zoom).round() as i32;

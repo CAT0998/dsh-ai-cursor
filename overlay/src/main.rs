@@ -324,6 +324,8 @@ struct St {
     drag_slider: Option<&'static str>,
     drag_panel: Option<(i32, i32)>,
     drag_wheel: bool,
+    drag_grip: bool,
+    grip_start: (f64, i32),
 
     // --- permission ---
     permission: u8,
@@ -431,6 +433,8 @@ impl St {
             drag_slider: None,
             drag_panel: None,
             drag_wheel: false,
+            drag_grip: false,
+            grip_start: (1.0, 0),
             permission: 3,
             prev_permission: 3,
             slots: [Slot::new(SLOT_CURSOR), Slot::new(SLOT_HINT), Slot::new(SLOT_ORNAMENT)],
@@ -1879,6 +1883,11 @@ fn cycle_slot_source(st: &mut St, slot_idx: usize, dir: i32) {
 }
 
 /// Keep a panel of height `h` fully visible in a screen of height `screen_h`.
+fn rect_x_clamp(x: i32, w: i32, screen_w: i32) -> i32 {
+    let max_x = (screen_w - w - 8).max(8);
+    x.min(max_x).max(8)
+}
+
 fn rect_y_clamp(y: i32, h: i32, screen_h: i32) -> i32 {
     let max_y = (screen_h - h - 8).max(8);
     y.min(max_y).max(8)
@@ -2162,6 +2171,16 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                 st.want_panel_move = true;
                 return LRESULT(0);
             }
+            if st.drag_grip {
+                // the client is the zoomed panel, so client_x / design width is the
+                // zoom the user is asking for
+                let (z0, x0) = st.grip_start;
+                let z = (z0 + (x - x0) as f64 / PW as f64).clamp(0.6, 2.0);
+                st.panel_zoom = (z * 100.0).round() / 100.0;
+                st.want_panel_resize = true;
+                st.panel_dirty = true;
+                return LRESULT(0);
+            }
             if st.drag_wheel {
                 let hits = panel_layout(&view_of(&st));
                 if let Some(h) = hits.iter().find(|h| h.kind == Kind::Wheel) {
@@ -2217,6 +2236,11 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                         let mut p = POINT::default();
                         let _ = GetCursorPos(&mut p);
                         st.drag_panel = Some((p.x - st.panel_pos.0, p.y - st.panel_pos.1));
+                        handled = true;
+                    }
+                    Kind::Button if h.id == "panel_grip" => {
+                        st.drag_grip = true;
+                        st.grip_start = (st.panel_zoom, x);
                         handled = true;
                     }
                     Kind::Wheel => {
@@ -2275,6 +2299,7 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                 st.drag_slider = None;
                 st.drag_panel = None;
                 st.drag_wheel = false;
+                st.drag_grip = false;
                 st.panel_dirty = true;
             }
             let _ = ReleaseCapture();
@@ -3263,7 +3288,7 @@ fn main() {
             if p_resize {
                 let z = st.lock().unwrap().panel_zoom;
                 let w = if p_full { ((PW as f64) * z).round() as i32 } else { CHIP_W };
-                let h = if p_full { ((p_h as f64) * z).round() as i32 } else { CHIP_H };
+                let h = if p_full { p_h } else { CHIP_H };
                 // Opening a section grows the panel downward; keep it on screen by
                 // sliding it up rather than letting it run off the bottom edge.
                 let screen_h = GetSystemMetrics(SYSTEM_METRICS_INDEX(SM_CYSCREEN.0));
@@ -3271,6 +3296,12 @@ fn main() {
                     let moved = rect_y_clamp(p_pos.1, h, screen_h);
                     let mut s = st.lock().unwrap();
                     s.panel_pos.1 = moved;
+                }
+                let screen_w = GetSystemMetrics(SYSTEM_METRICS_INDEX(SM_CXSCREEN.0));
+                if p_pos.0 + w > screen_w - 8 || p_pos.0 < 8 {
+                    let moved = rect_x_clamp(p_pos.0, w, screen_w);
+                    let mut s = st.lock().unwrap();
+                    s.panel_pos.0 = moved;
                 }
                 let p_pos = { st.lock().unwrap().panel_pos };
                 let _ = SetWindowPos(
