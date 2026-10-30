@@ -178,12 +178,13 @@ export function apply(ctx: Context, config: ConfigShape): void {
 
   // First touch applies the configured look so a plain move already looks right.
   // `permission` is applied last: lowering it earlier would block the rest.
-  let primedGeneration = -1
+  /** Primed process generation, per cursor. A switch must not re-prime. */
+  const primed = new WeakMap<Overlay, number>()
   const prime = async (): Promise<void> => {
     // Re-apply whenever the child process is replaced: a fresh process starts
     // with defaults, so the old "primed" state must not short-circuit.
-    if (primedGeneration === active.generation) return
-    primedGeneration = active.generation
+    if (primed.get(active) === active.generation) return
+    primed.set(active, active.generation)
     await send('idle', { idle_ms: config.idleMs })
     await send('affinity', { capture_visible: config.captureVisible })
     await send('label', { text: config.label })
@@ -656,7 +657,6 @@ export function apply(ctx: Context, config: ConfigShape): void {
           const target = cursors.get(name)
           if (!target) return `没有名为「${name}」的光标。现有：${[...cursors.keys()].join(', ')}`
           active = target
-          primedGeneration = -1
           await prime()
           return describeStatus(await send('status'))
         }
@@ -669,7 +669,6 @@ export function apply(ctx: Context, config: ConfigShape): void {
           cursors.delete(name)
           if (active === target) {
             active = overlay
-            primedGeneration = -1
             await prime()
           }
           return `已关闭光标「${name}」。`
@@ -682,7 +681,6 @@ export function apply(ctx: Context, config: ConfigShape): void {
           const fresh = new Overlay(config.exePath)
           cursors.set(name, fresh)
           active = fresh
-          primedGeneration = -1
           await prime()
           let applied = ''
           if (args.preset) {
