@@ -93,7 +93,7 @@ const BERTH_GAP: i32 = 8;
 const DOCK_PAD: i32 = 12;
 const DOCK_MIN: usize = 3;
 const DOCK_MAX: usize = 12;
-const DOCK_H: i32 = 208;
+const DOCK_H: i32 = 252;
 
 fn dock_width(n: usize) -> i32 {
     dock_width_z(n, 1.0)
@@ -166,6 +166,15 @@ fn cursor_state(st: &St) -> &'static str {
 /// dock and the menu bar stay in step without a second communication channel.
 static DOCK_SELECTED: std::sync::Mutex<Vec<bool>> = std::sync::Mutex::new(Vec::new());
 
+/// The "back to the station" button under a berth, and the plate area above it.
+fn dock_plate_rects(x: i32, top: i32, berth_h: i32, w: i32, zoom: f64) -> (RECT, (RECT, RECT)) {
+    let sc = |v: i32| (v as f64 * zoom).round() as i32;
+    let plate = rect(x, top + berth_h + sc(4), x + w, top + berth_h + sc(28));
+    // sits below the three text lines, so nothing overlaps
+    let rest = rect(x, top + berth_h + sc(76), x + w, top + berth_h + sc(100));
+    (plate, (rest, plate))
+}
+
 fn dock_berth_index_at(cx: i32, cy: i32, count: usize, zoom: f64) -> Option<usize> {
     let sc = |v: i32| (v as f64 * zoom).round() as i32;
     let pad = sc(DOCK_PAD);
@@ -180,6 +189,29 @@ fn dock_berth_index_at(cx: i32, cy: i32, count: usize, zoom: f64) -> Option<usiz
         }
     }
     None
+}
+
+/// Ask for something to happen to a berth. Written next to the berth file so the
+/// cursor processes can pick it up without any extra channel.
+fn dock_write_command(action: &str, index: usize, win_left: i32, win_top: i32, count: usize, zoom: f64) {
+    let Some(path) = DOCK_FILE.get() else { return };
+    let sc = |v: i32| (v as f64 * zoom).round() as i32;
+    let pad = sc(DOCK_PAD);
+    let gap = sc(BERTH_GAP);
+    let bw = sc(BERTH_W);
+    let bx = pad + index as i32 * (bw + gap);
+    // the cursor should end up centred in its berth
+    let x = win_left + bx + bw / 2;
+    let y = win_top + sc(40) + sc(32);
+    if let Some(dir) = std::path::Path::new(path).parent() {
+        let out = dir.join("dock-command.json");
+        let body = serde_json::json!({
+            "action": action, "index": index, "x": x, "y": y, "count": count
+        })
+        .to_string();
+        let _ = std::fs::write(&out, body);
+        logline!("INFO", "dock command {action} berth {index} -> ({x},{y})");
+    }
 }
 
 fn dock_write_selection() {
@@ -212,6 +244,7 @@ struct Berth {
     preset: String,
     color: u32,
     occupied: bool,
+    state: String,
 }
 
 static BERTHS: std::sync::OnceLock<std::sync::Mutex<Vec<Berth>>> = std::sync::OnceLock::new();
@@ -269,6 +302,7 @@ unsafe fn draw_dock_surface(cv: &Canvas, count: usize, zoom: f64) {
                                     preset: slot.get("preset").and_then(|a| a.as_str()).unwrap_or("").to_string(),
                                     color: slot.get("color").and_then(|a| a.as_str()).and_then(parse_hex).unwrap_or(0x4FC3F7),
                                     occupied: slot.get("occupied").and_then(|o| o.as_bool()).unwrap_or(true),
+                                    state: slot.get("state").and_then(|o| o.as_str()).unwrap_or("").to_string(),
                                 };
                             }
                             None => *b = Berth::default(),
@@ -306,7 +340,8 @@ unsafe fn draw_dock_surface(cv: &Canvas, count: usize, zoom: f64) {
             cv.fill_round(berth, sc(10), 0x141C26);
             cv.stroke_round(berth, sc(10), 0x2F4152, 1);
         }
-        let plate = rect(x, top + berth_h + sc(4), x + w, top + berth_h + sc(28));
+        // number plate
+        let (plate, (rest, _)) = dock_plate_rects(x, top, berth_h, w, z);
         cv.fill_round(plate, sc(6), 0x18222E);
         let title = format!("{}号位", i + 1);
         cv.text_at(cv.fonts.label, x + sc(5), top + berth_h + sc(8), &title, 0x6E8199);
@@ -315,6 +350,22 @@ unsafe fn draw_dock_surface(cv: &Canvas, count: usize, zoom: f64) {
             cv.text_at(cv.fonts.label, x + sc(5), top + berth_h + sc(32), &short, 0xBFD2E5);
             let pshort: String = b.preset.chars().take(7).collect();
             cv.text_at(cv.fonts.label, x + sc(5), top + berth_h + sc(50), &pshort, 0x5F7186);
+            if !b.state.is_empty() {
+                let st: String = b.state.chars().take(3).collect();
+                cv.text_at(cv.fonts.label, x + sc(5), top + berth_h + sc(66), &st, 0x86B4D8);
+            }
+            // "back to the station": stop first, then walk home
+            let label = "休整";
+            let tw = cv.text_w(cv.fonts.label, label);
+            cv.fill_round(rest, sc(4), 0x24313F);
+            cv.stroke_round(rest, sc(4), 0x2F4152, 1);
+            cv.text_at(
+                cv.fonts.label,
+                rest.left + (rest.right - rest.left - tw) / 2,
+                rest.top + sc(3),
+                label,
+                0x9CC3E0,
+            );
         } else {
             cv.text_at(cv.fonts.label, x + sc(5), top + berth_h + sc(32), "空闲", 0x46586B);
         }
@@ -2623,6 +2674,22 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                     let cy = p.y - r.top;
                     let count = dock_berth_count();
                     let z = DOCK_ZOOM.load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0;
+                    {
+                        let sc = |v: i32| (v as f64 * z).round() as i32;
+                        let pad = sc(DOCK_PAD);
+                        let gap = sc(BERTH_GAP);
+                        let bw = sc(BERTH_W);
+                        let top = sc(40);
+                        let bh = sc(64);
+                        for i in 0..count.clamp(DOCK_MIN, DOCK_MAX) {
+                            let bx = pad + i as i32 * (bw + gap);
+                            let (_, (rest, _)) = dock_plate_rects(bx, top, bh, bw, z);
+                            if cx >= rest.left && cx < rest.right && cy >= rest.top && cy < rest.bottom {
+                                dock_write_command("rest", i, r.left, r.top, count, z);
+                                return LRESULT(0);
+                            }
+                        }
+                    }
                     if let Some(i) = dock_berth_index_at(cx, cy, count, z) {
                         if let Ok(mut sel) = DOCK_SELECTED.lock() {
                             if sel.len() < DOCK_MAX {
