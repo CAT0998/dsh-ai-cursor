@@ -92,6 +92,13 @@ export function apply(ctx: Context, config: ConfigShape): void {
   const cursors = new Map<string, Overlay>([['default', overlay]])
   /** Colour and preset per cursor, for the dock's number plates. */
   const meta = new Map<string, { color?: string; preset?: string }>()
+  /** Berth index for a cursor name: the same order berthsFrom publishes. */
+  const berthIndex = (name: string): number =>
+    [...cursors.keys()].filter((n) => n !== 'default').indexOf(name)
+
+  const dockCommandFile = () =>
+    `${(config.assetDir || '').replace(/[\/]+$/, '')}/dock-command.json`
+
   const dockFile = () =>
     `${(config.assetDir || '').replace(/[\/]+$/, '')}/berths.json`
 
@@ -102,11 +109,20 @@ export function apply(ctx: Context, config: ConfigShape): void {
   const refreshDock = async (): Promise<void> => {
     const dir = (config.assetDir || '').replace(/[\/]+$/, '')
     if (!dir) return
-    const list = [...cursors.keys()].map((name) => ({
-      name,
-      color: meta.get(name)?.color,
-      preset: meta.get(name)?.preset,
-    }))
+    const prev = active
+    const list: Array<{ name: string; color?: string; preset?: string; state?: string }> = []
+    for (const [name, ov] of cursors) {
+      let state = ''
+      try {
+        active = ov
+        const st = await send('status')
+        state = (st as unknown as { cursor_state?: string }).cursor_state ?? ''
+      } catch {
+        state = ''
+      }
+      list.push({ name, color: meta.get(name)?.color, preset: meta.get(name)?.preset, state })
+    }
+    active = prev
     try {
       await writeBerths(dockFile(), berthsFrom(list))
     } catch {
@@ -218,6 +234,13 @@ export function apply(ctx: Context, config: ConfigShape): void {
     await send('color', { hex: config.color })
     await send('scale', { value: config.scale })
     await send('assets', { dir: config.assetDir })
+    {
+      // which berth this cursor owns, and where the dock writes commands
+      const name = [...cursors.entries()].find(([, ov]) => ov === active)?.[0] ?? 'default'
+      const idx = berthIndex(name)
+      if (idx >= 0) await send('cursor_index', { index: idx })
+      if (config.assetDir) await send('dock_command_file', { path: dockCommandFile() })
+    }
     await send('panel_expanded', { expanded: config.panelExpanded })
     await send('panel', { visible: config.panel })
     await send('permission', { level: config.permission })

@@ -13,6 +13,8 @@ export interface Berth {
   preset: string
   color: string
   occupied: boolean
+  /** 运行中 / 待机中 / 已停用 / 休整中, as reported by that cursor. */
+  state: string
 }
 
 export const BERTH_SLOTS = 5
@@ -23,6 +25,7 @@ export function emptyBerths(count = BERTH_SLOTS): Berth[] {
     preset: '',
     color: '',
     occupied: false,
+    state: '',
   }))
 }
 
@@ -30,6 +33,7 @@ export interface BerthCursor {
   name: string
   color?: string
   preset?: string
+  state?: string
 }
 
 /**
@@ -51,6 +55,7 @@ export function berthsFrom(cursors: BerthCursor[], count = BERTH_SLOTS): Berth[]
       preset: c.preset ?? '',
       color: c.color ?? '#4FC3F7',
       occupied: true,
+      state: c.state ?? '',
     }
     i += 1
   }
