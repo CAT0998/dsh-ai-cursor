@@ -97,8 +97,13 @@ let o = ((oy*self.w + ox)*4);        // 写出步长仍是 self.w
    两侧分别是机身 `0x0B1016` 和背景。已排除两个原因：
    - 不是描边：把 `stroke_round` 内缩 1px 后黑边依旧
    - 不是清屏色：`clear()` 填的是洋红 `0xFF00FF`，`compose` 也确实按 (255,0,255) 判透明
-   下一步该逐层排查是谁画了黑：怀疑 `text_at` 的 `SetBkMode` 是 OPAQUE（文字背景会被
-   刷成黑），而标题文字正好在左上角——先加一次 `SetBkMode(TRANSPARENT)` 试试。
+   已按「逐个组件关掉」二分，又排除两个：
+   - `text_at` 早已是 `SetBkMode(TRANSPARENT)` ✅ 不是文字
+   - 把 `stroke_round` **整条注释掉**后黑边依旧 ✅ 不是描边
+   - `fill_round` 用 `RoundRect` 只画圆角内，不会刷黑 ✅ 不是机身
+   剩下怀疑：`compose`/`blit` 在「窗口尺寸 vs 画布尺寸」不一致时的角落，或
+   `UpdateLayeredWindow(dst=None)` 时对未覆盖区域的合成。下一轮应打印
+   `canvas w/h` 与 `compose w/h` 的实际数值对照（日志已有能力）。
 3. **预设组**：全局预设开关、多组预设、自定义全局/多组
 4. **P8 DSH 侧边栏**：可收起的侧边窗口，显示菜单 + 停靠站
 5. **P9 线程与渲染**：解码/合成移出主循环；GPU 之前**先量 CPU**
