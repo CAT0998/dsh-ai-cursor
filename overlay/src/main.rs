@@ -117,6 +117,7 @@ static DOCK_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool:
 /// Initial panel zoom x1000, from `--panel-zoom`.
 static INIT_ZOOM: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1000);
 /// `--panel` shows the panel at startup, for development and screenshots.
+static DOCK_TOPMOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static DOCK_ZOOM: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(100);
 static INIT_PANEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -1412,13 +1413,25 @@ unsafe fn make_window(class: PCWSTR, title: PCWSTR, ex: u32, w: i32, h: i32) -> 
         None,
     )
     .expect("CreateWindowExW");
-    let _ = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, w, h, SET_WINDOW_POS_FLAGS(0));
+    let insert = if DOCK_MODE.load(std::sync::atomic::Ordering::Relaxed)
+        && !DOCK_TOPMOST.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        windows::Win32::UI::WindowsAndMessaging::HWND_TOP
+    } else {
+        HWND_TOPMOST
+    };
+    let _ = SetWindowPos(hwnd, insert, 0, 0, w, h, SET_WINDOW_POS_FLAGS(0));
     hwnd
 }
 
 unsafe fn make_overlay() -> HWND {
     let dock = DOCK_MODE.load(std::sync::atomic::Ordering::Relaxed);
-    let mut ex = WS_EX_LAYERED.0 | WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0 | WS_EX_TOPMOST.0;
+    // The dock lives at normal window level by default: a panel that floats over
+    // everything gets in the way. `dock_topmost` raises it when asked.
+    let mut ex = WS_EX_LAYERED.0 | WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0;
+    if !dock || DOCK_TOPMOST.load(std::sync::atomic::Ordering::Relaxed) {
+        ex |= WS_EX_TOPMOST.0;
+    }
     if !dock {
         // click-through for the cursor; the dock must be draggable, so it takes input
         ex |= WS_EX_TRANSPARENT.0;
@@ -2422,6 +2435,16 @@ static DRAG_CORNER: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64:
 ///
 /// Only the DOCK moves. The panel's rect is read, never written: snapping must not
 /// disturb the window we are docking against.
+/// Where the dock belongs in the z-order: normal level unless it was asked to
+/// float. A panel that is always on top gets in the way of real work.
+fn dock_insert() -> HWND {
+    if DOCK_TOPMOST.load(std::sync::atomic::Ordering::Relaxed) {
+        HWND_TOPMOST
+    } else {
+        windows::Win32::UI::WindowsAndMessaging::HWND_TOP
+    }
+}
+
 unsafe fn snap_dock(hwnd: HWND) {
     let mut r = RECT::default();
     if GetWindowRect(hwnd, &mut r).is_err() {
@@ -2477,7 +2500,17 @@ unsafe fn snap_dock(hwnd: HWND) {
     }
 }
 
+static MSG_COUNT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
 unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // Rule 1: what actually arrives, logged as an id, before any assumption about
+    // which message it is. Capped so a busy window cannot flood the log.
+    if DOCK_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+        let n = MSG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 80 {
+            logline!("MSG", "msg=0x{msg:04X} wparam=0x{:X} lparam=0x{:X}", wparam.0, lparam.0);
+        }
+    }
     // The dock moves itself; nothing else in this process is draggable.
     if DOCK_MODE.load(std::sync::atomic::Ordering::Relaxed) {
         match msg {
@@ -2508,7 +2541,7 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                         let _ = GetCursorPos(&mut p);
                         let _ = SetWindowPos(
                             hwnd,
-                            windows::Win32::UI::WindowsAndMessaging::HWND_TOP,
+                            dock_insert(),
                             wx + (p.x - sx),
                             wy + (p.y - sy),
                             0,
@@ -2519,7 +2552,7 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                 }
                 return LRESULT(0);
             }
-            WM_MOUSEWHEEL => {
+            0x020A => { // WM_MOUSEWHEEL
                 // a wheel over the dock zooms it: no grip to hunt for
                 // rule 1: log the RAW value first, derive afterwards
                 let raw = wparam.0;
@@ -2844,6 +2877,11 @@ fn handle_line(line: &str) {
                 }
             }
         }
+        "dock_topmost" => {
+            let on = v.get("on").and_then(|b| b.as_bool()).unwrap_or(true);
+            DOCK_TOPMOST.store(on, std::sync::atomic::Ordering::Relaxed);
+            logline!("INFO", "dock topmost -> {on}");
+        }
         "dock_zoom" => {
             let v = v.get("value").and_then(|x| x.as_f64()).unwrap_or(1.0);
             DOCK_ZOOM.store((v.clamp(0.6, 2.0) * 100.0) as i32, std::sync::atomic::Ordering::Relaxed);
@@ -3127,6 +3165,9 @@ fn main() {
                 INIT_ZOOM.store((v.clamp(0.6, 2.0) * 1000.0) as i32, std::sync::atomic::Ordering::Relaxed);
             }
         }
+        if args.iter().any(|a| a == "--dock-topmost") {
+            DOCK_TOPMOST.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         if let Some(i) = args.iter().position(|a| a == "--dock-zoom") {
             if let Some(v) = args.get(i + 1).and_then(|x| x.parse::<f64>().ok()) {
                 DOCK_ZOOM.store((v.clamp(0.6, 2.0) * 100.0) as i32, std::sync::atomic::Ordering::Relaxed);
@@ -3208,7 +3249,7 @@ fn main() {
         if DOCK_MODE.load(std::sync::atomic::Ordering::Relaxed) {
             let _ = ShowWindow(panel, SW_HIDE);
             let _ = ShowWindow(grab, SW_HIDE);
-            let _ = SetWindowPos(hwnd, HWND_TOPMOST, DOCK_X, DOCK_Y, DOCK_W, DOCK_H, SWP_NOACTIVATE);
+            let _ = SetWindowPos(hwnd, dock_insert(), DOCK_X, DOCK_Y, DOCK_W, DOCK_H, SWP_NOACTIVATE | SET_WINDOW_POS_FLAGS(0x0040));
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         }
         if MAP_MODE.load(std::sync::atomic::Ordering::Relaxed) {
@@ -3345,7 +3386,7 @@ fn main() {
                         let _ = GetWindowRect(hwnd_of(h), &mut r);
                         let _ = SetWindowPos(
                             hwnd_of(h),
-                            windows::Win32::UI::WindowsAndMessaging::HWND_TOP,
+                            dock_insert(),
                             r.left,
                             r.top,
                             want_w,
@@ -3357,7 +3398,9 @@ fn main() {
                     draw_dock_surface(&dock_cv, count, z);
                     dock_cv.present(h, want_w, want_h, None, 1.0);
                 }
-                std::thread::sleep(std::time::Duration::from_millis(400));
+                // ~60 Hz while the strip is alive; the drag felt laggy at 400ms because
+                // the content visibly caught up only a few times a second
+                std::thread::sleep(std::time::Duration::from_millis(16));
                 continue;
             }
             if MAP_MODE.load(std::sync::atomic::Ordering::Relaxed) {
