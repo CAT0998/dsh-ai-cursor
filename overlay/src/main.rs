@@ -240,11 +240,15 @@ fn dock_write_selection() {
         .filter(|(_, on)| **on)
         .map(|(i, _)| i.to_string())
         .collect();
-    if let Some(dir) = std::path::Path::new(path).parent() {
-        let out = dir.join("dock-selection.json");
+    // next to the exe, like the command file: the asset directory is not writable
+    // from this process
+    let _ = path;
+    if let Some(out) = dock_command_path().and_then(|p| p.parent().map(|d| d.join("dock-selection.json"))) {
         let body = serde_json::json!({ "selected": names }).to_string();
-        let _ = std::fs::write(&out, body);
-        logline!("INFO", "dock selection -> {out:?} {names:?}");
+        match std::fs::write(&out, body) {
+            Ok(_) => logline!("INFO", "dock selection -> {out:?} {names:?}"),
+            Err(e) => logline!("ERROR", "dock selection write {out:?}: {e}"),
+        }
     }
 }
 

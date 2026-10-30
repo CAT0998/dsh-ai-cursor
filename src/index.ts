@@ -40,6 +40,7 @@ import {
   savePresets,
   upsertPreset,
 } from './presets'
+import { dirname } from 'node:path'
 import { berthsFrom, describeBerths, readBerths, readSelection, selectedNames, writeBerths } from './dock'
 export type { InterceptMode } from './intercept'
 export type { OverlayStatus } from './overlay'
@@ -701,9 +702,10 @@ export function apply(ctx: Context, config: ConfigShape): void {
           }))
           let sel = ''
           if (dir) {
+            const stateDir = `${dirname(config.exePath)}/logs`
             const chosen = selectedNames(
               await readBerths(`${dir}/berths.json`),
-              await readSelection(`${dir}/dock-selection.json`),
+              await readSelection(`${stateDir}/dock-selection.json`),
             )
             sel = chosen.length
               ? ` | 停靠站里选中：${chosen.join(', ')}`
