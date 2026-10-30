@@ -748,6 +748,9 @@ export function apply(ctx: Context, config: ConfigShape): void {
               const p = findPreset(await loadPresets(`${dir}/presets.json`), args.preset)
               if (p) {
                 for (const [cmd, payload] of presetCommands(p)) await send(cmd, payload)
+                // The plate must reflect what was just applied, otherwise a cursor
+                // created with a preset shows up blank on the dock.
+                meta.set(name, { preset: p.name, color: p.color })
                 applied = `，已套用预设「${p.name}」`
               } else {
                 applied = `，但没有预设「${args.preset}」`
