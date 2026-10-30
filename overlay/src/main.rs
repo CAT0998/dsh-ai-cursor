@@ -117,6 +117,60 @@ const MAP_Y: i32 = 64;
 
 static MAP_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static DOCK_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 托盘模式：只放一个通知区图标表示"AI 鼠标正在运行"，不做别的。
+static TRAY_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+const TRAY_MSG: u32 = 0x0400 + 1; // WM_APP + 1
+
+unsafe fn tray_add(hwnd: HWND) {
+    use windows::Win32::UI::Shell::{
+        Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NOTIFYICONDATAW,
+    };
+    let mut nid = NOTIFYICONDATAW::default();
+    nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+    nid.hWnd = hwnd;
+    nid.uID = 1;
+    nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    nid.uCallbackMessage = TRAY_MSG;
+    nid.hIcon = windows::Win32::UI::WindowsAndMessaging::LoadIconW(None, windows::Win32::UI::WindowsAndMessaging::IDI_APPLICATION)
+        .unwrap_or_default();
+    let tip = "AI 鼠标 · 运行中";
+    for (i, c) in tip.encode_utf16().take(127).enumerate() {
+        nid.szTip[i] = c;
+    }
+    let ok = Shell_NotifyIconW(NIM_ADD, &nid);
+    let err = windows::Win32::Foundation::GetLastError().0;
+    logline!(
+        "INFO",
+        "tray icon added: {} err={} hwnd={:?} hicon={:?} cbsize={}",
+        ok.as_bool(),
+        err,
+        nid.hWnd,
+        nid.hIcon,
+        nid.cbSize
+    );
+}
+
+/// 托盘窗口的消息处理：只认右键退出，其它一概不处理。
+unsafe extern "system" fn tray_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if msg == TRAY_MSG {
+        // lParam 低字节是鼠标消息；WM_RBUTTONUP = 0x0205
+        let ev = (lparam.0 & 0xFFFF) as u32;
+        if ev == 0x0205 {
+            if let Some(path) = dock_command_path().map(|p| p.display().to_string()) {
+                let epoch = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let body = serde_json::json!({ "action": "shutdown", "epoch": epoch }).to_string();
+                let _ = std::fs::write(&path, body);
+                logline!("INFO", "tray: quit requested epoch={epoch}");
+            }
+            std::process::exit(0);
+        }
+        return LRESULT(0);
+    }
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+}
 /// Initial panel zoom x1000, from `--panel-zoom`.
 static INIT_ZOOM: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1000);
 /// `--panel` shows the panel at startup, for development and screenshots.
@@ -3629,6 +3683,9 @@ fn main() {
     if std::env::args().any(|a| a == "--dock") {
         DOCK_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+    if std::env::args().any(|a| a == "--tray") {
+        TRAY_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     {
         let args: Vec<String> = std::env::args().collect();
         if let Some(i) = args.iter().position(|a| a == "--panel-zoom") {
@@ -3687,6 +3744,7 @@ fn main() {
             (w!("AiMouseOverlay"), overlay_proc as unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT),
             (w!("AiMousePanel"), panel_proc as unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT),
             (w!("AiMouseGrab"), grab_proc as unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT),
+            (w!("AiMouseTray"), tray_proc as unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT),
         ] {
             let wc = WNDCLASSEXW {
                 cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
@@ -3717,6 +3775,32 @@ fn main() {
             s.panel_pos = (px, py);
         }
 
+        if TRAY_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = ShowWindow(panel, SW_HIDE);
+            let _ = ShowWindow(grab, SW_HIDE);
+            let tray = CreateWindowExW(
+                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
+                w!("AiMouseTray"),
+                w!("AI Mouse Tray"),
+                WS_POPUP,
+                0,
+                0,
+                0,
+                0,
+                null_hwnd(),
+                HMENU(std::ptr::null_mut()),
+                hinst,
+                None,
+            )
+            .unwrap_or_default();
+            if !tray.0.is_null() {
+                tray_add(tray);
+            }
+            // 图标挂上之后就不需要再做别的事了，等消息即可
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        }
         if DOCK_MODE.load(std::sync::atomic::Ordering::Relaxed) {
             let _ = ShowWindow(panel, SW_HIDE);
             let _ = ShowWindow(grab, SW_HIDE);

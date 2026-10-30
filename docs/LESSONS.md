@@ -48,6 +48,20 @@
 浮层能写的只有**自己 exe 所在目录**（日志就在那儿）。
 所以跨进程的通信用 `<exeDir>/logs/dock-command.json`，不要用 assetDir。
 
+### 3e. 托盘图标：Shell_NotifyIconW 返回 false + err=5
+实测（本机，进程以管理员运行）：
+```
+tray icon added: false err=5 hwnd=HWND(0xd0716) hicon=HICON(0x1002b) cbsize=976
+```
+句柄、图标、结构体大小都正确，仍然 ACCESS_DENIED。explorer.exe 以普通级别运行，
+我们的进程是管理员（`net session` 通过）。这是**同一家族**的第三个平台怪象：
+`CreateWindowExW` 新类返回 null、`GetWindowTextW` 跨进程挂死、现在 `Shell_NotifyIcon` 被拒。
+
+下一步可选：
+1. 用一个**非提权**的辅助进程只挂托盘图标（需要 `ShellExecuteW` runas=false 启动）
+2. 放弃托盘，改用停靠站/小地图表示"正在运行"（已具备）
+3. 继续查：确认窗口是否与 explorer 在同一 window station/desktop
+
 ### 4. `compose()` 只能产出画布自己的宽度
 ```rust
 let stride_big = self.w * self.ss;   // 绑死画布尺寸
