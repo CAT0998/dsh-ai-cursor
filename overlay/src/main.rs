@@ -36,7 +36,7 @@ use windows::Win32::Foundation::{
     WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    BitBlt, CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen, CreateSolidBrush, DeleteDC,
+    BitBlt, CreateCompatibleDC, CreateCompatibleBitmap, HALFTONE, SetStretchBltMode, StretchBlt, CreateDIBSection, CreateFontW, CreatePen, CreateSolidBrush, DeleteDC,
     DeleteObject, Ellipse, FillRect, GetDC, GetStockObject, GetTextExtentPoint32W, LineTo, MoveToEx,
     Polygon, ReleaseDC, RoundRect, SelectObject, SetBkMode, SetTextColor, TextOutW, AC_SRC_ALPHA,
     AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_USAGE, HDC, HGDIOBJ,
@@ -97,6 +97,8 @@ const MAP_Y: i32 = 64;
 
 static MAP_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static DOCK_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Initial panel zoom x1000, from `--panel-zoom`.
+static INIT_ZOOM: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1000);
 
 /// What each berth currently holds. Pushed over stdin as one JSON line, so the
 /// dock stays a dumb renderer: all the knowledge (which subagent, which preset)
@@ -330,6 +332,8 @@ struct St {
     collapsed: Vec<String>,
     assets: Vec<String>,
     panel_px_h: i32,
+    /// Panel zoom: layout stays at design size, only the image is stretched.
+    panel_zoom: f64,
     asset_dir: String,
     custom: custom::CustomSpec,
     art_sel: usize,
@@ -436,6 +440,7 @@ impl St {
                 .collect(),
             assets: Vec::new(),
             panel_px_h: PH,
+            panel_zoom: INIT_ZOOM.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0,
             asset_dir: String::new(),
             art_sel: 0,
             layer_mode: "topmost".to_string(),
@@ -782,6 +787,70 @@ impl Canvas {
             Some(&blend),
             ULW_ALPHA,
         );
+    }
+
+    /// Present the panel at a zoom factor.
+    ///
+    /// The layout is always computed at its design size, so nothing has to know
+    /// about the zoom; only the finished image is stretched. That is what makes
+    /// the controls and the text scale together and re-flow as one piece.
+    unsafe fn present_scaled(
+        &self,
+        hwnd: isize,
+        dw: i32,
+        dh: i32,
+        zoom: f64,
+        dst: Option<POINT>,
+        alpha: f64,
+    ) {
+        let tw = ((dw as f64) * zoom).round().max(1.0) as i32;
+        let th = ((dh as f64) * zoom).round().max(1.0) as i32;
+        self.compose(dw, dh, alpha);
+        if (zoom - 1.0).abs() < 0.001 {
+            self.blit(hwnd, dw, dh, dst);
+            return;
+        }
+        // A scratch surface for the stretched frame. Creating it per present is
+        // acceptable: the panel only repaints when something changed.
+        // Must be a 32bpp DIB section: a compatible bitmap has no alpha channel,
+        // so UpdateLayeredWindow would come out empty.
+        let mem = CreateCompatibleDC(self.hdc_screen);
+        let mut bmi = BITMAPINFO::default();
+        bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+        bmi.bmiHeader.biWidth = tw;
+        bmi.bmiHeader.biHeight = -th;
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB.0;
+        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+        let bmp = CreateDIBSection(mem, &bmi, DIB_USAGE(0), &mut bits, HANDLE::default(), 0)
+            .unwrap_or_default();
+        let prev = SelectObject(mem, HGDIOBJ(bmp.0));
+        let _ = SetStretchBltMode(mem, HALFTONE);
+        let _ = StretchBlt(mem, 0, 0, tw, th, self.hdc_small, 0, 0, dw, dh, SRCCOPY);
+
+        let size = SIZE { cx: tw, cy: th };
+        let src = POINT { x: 0, y: 0 };
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            BlendFlags: 0,
+            SourceConstantAlpha: 255,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+        };
+        let _ = UpdateLayeredWindow(
+            hwnd_of(hwnd),
+            self.hdc_screen,
+            dst.as_ref().map(|p| p as *const POINT),
+            Some(&size),
+            mem,
+            Some(&src),
+            COLORREF(0),
+            Some(&blend),
+            ULW_ALPHA,
+        );
+        SelectObject(mem, prev);
+        let _ = DeleteObject(HGDIOBJ(bmp.0));
+        let _ = DeleteDC(mem);
     }
 
     unsafe fn present(&self, hwnd: isize, w: i32, h: i32, dst: Option<POINT>, alpha: f64) {
@@ -1302,7 +1371,13 @@ unsafe fn draw_panel(cv: &Canvas, v: &PanelView, hits: &[Hit], h: i32) {
 
     cv.compose(PW, h, 0.98);
     draw_previews(cv, v, hits, h);
-    cv.blit(state().lock().unwrap().panel_hwnd, PW, h, None);
+    {
+        let (ph, z) = {
+            let s = state().lock().unwrap();
+            (s.panel_hwnd, s.panel_zoom)
+        };
+        cv.present_scaled(ph, PW, h, z, None, 1.0);
+    }
 }
 
 // ---------------------------------------------------------------- windows ----
@@ -2575,6 +2650,12 @@ fn handle_line(line: &str) {
                 }
             }
         }
+        "panel_zoom" => {
+            let v = v.get("value").and_then(|x| x.as_f64()).unwrap_or(1.0);
+            st.panel_zoom = v.clamp(0.6, 2.0);
+            st.panel_dirty = true;
+            st.want_panel_resize = true;
+        }
         "dock_slots" => {
             if let Some(list) = v.get("slots").and_then(|x| x.as_array()) {
                 if let Ok(mut berths) = berths().lock() {
@@ -2840,6 +2921,11 @@ fn main() {
     }
     {
         let args: Vec<String> = std::env::args().collect();
+        if let Some(i) = args.iter().position(|a| a == "--panel-zoom") {
+            if let Some(v) = args.get(i + 1).and_then(|x| x.parse::<f64>().ok()) {
+                INIT_ZOOM.store((v.clamp(0.6, 2.0) * 1000.0) as i32, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         if let Some(i) = args.iter().position(|a| a == "--slots") {
             if let Some(path) = args.get(i + 1) {
                 let _ = DOCK_FILE.set(path.clone());
@@ -3189,8 +3275,9 @@ fn main() {
                 let _ = ShowWindow(hwnd_of(phwnd), SW_SHOWNOACTIVATE);
             }
             if p_resize {
-                let w = if p_full { PW } else { CHIP_W };
-                let h = if p_full { p_h } else { CHIP_H };
+                let z = st.lock().unwrap().panel_zoom;
+                let w = if p_full { ((PW as f64) * z).round() as i32 } else { CHIP_W };
+                let h = if p_full { ((p_h as f64) * z).round() as i32 } else { CHIP_H };
                 // Opening a section grows the panel downward; keep it on screen by
                 // sliding it up rather than letting it run off the bottom edge.
                 let screen_h = GetSystemMetrics(SYSTEM_METRICS_INDEX(SM_CYSCREEN.0));
