@@ -84,12 +84,65 @@ const SS_PANEL: i32 = 2; // supersample factor for the panel
 const GRAB: i32 = 40; // side of the clickable grab hotspot at the cursor tip
 /// The minimap runs as a second instance of this binary (`--map`), drawn into the
 /// same window class that already works instead of a new one.
+const DOCK_W: i32 = 352;
+const DOCK_H: i32 = 208;
+const DOCK_SLOTS: usize = 5;
+const DOCK_X: i32 = 1068;
+const DOCK_Y: i32 = 700;
+
 const MAP_W: i32 = 380;
 const MAP_H: i32 = 260;
 const MAP_X: i32 = 64;
 const MAP_Y: i32 = 64;
 
 static MAP_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static DOCK_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+unsafe fn draw_dock_surface(cv: &Canvas) {
+    let full = rect(0, 0, DOCK_W, DOCK_H);
+    cv.fill_round(full, 12, 0x0B1016);
+    cv.stroke_round(full, 12, 0x2A3542, 1);
+    cv.text_at(cv.fonts.title, 14, 10, "停靠站", 0x9FB2C6);
+    cv.text_at(cv.fonts.label, DOCK_W - 118, 13, "鼠标停靠处", 0x5F7186);
+
+    // slots: an empty berth is a dashed-looking dim box, a taken one is filled
+    let pad = 12;
+    let gap = 8;
+    let w = (DOCK_W - pad * 2 - gap * (DOCK_SLOTS as i32 - 1)) / DOCK_SLOTS as i32;
+    for i in 0..DOCK_SLOTS {
+        let x = pad + i as i32 * (w + gap);
+        let y = 40;
+        let berth = rect(x, y, x + w, y + 64);
+        cv.fill_round(berth, 10, 0x141C26);
+        cv.stroke_round(berth, 10, 0x2F4152, 1);
+        // the number plate under the berth
+        let plate = rect(x, y + 68, x + w, y + 92);
+        cv.fill_round(plate, 6, 0x18222E);
+        let title = format!("{}号位", i + 1);
+        let tw = cv.text_w(cv.fonts.label, &title);
+        cv.text_at(
+            cv.fonts.label,
+            x + (w - tw) / 2,
+            y + 72,
+            &title,
+            0x6E8199,
+        );
+        cv.text_at(
+            cv.fonts.label,
+            x + 6,
+            y + 94,
+            "空闲",
+            0x46586B,
+        );
+    }
+    cv.text_at(
+        cv.fonts.label,
+        14,
+        DOCK_H - 24,
+        "子代理 / 预设 / 颜色 会显示在站牌上",
+        0x4C5E72,
+    );
+}
 
 unsafe fn draw_map_surface(cv: &Canvas, cx: i32, cy: i32, accent: u32) {
     let full = rect(0, 0, MAP_W, MAP_H);
@@ -2702,6 +2755,9 @@ fn main() {
     if std::env::args().any(|a| a == "--map") {
         MAP_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+    if std::env::args().any(|a| a == "--dock") {
+        DOCK_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
@@ -2763,6 +2819,12 @@ fn main() {
             s.panel_pos = (px, py);
         }
 
+        if DOCK_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = ShowWindow(panel, SW_HIDE);
+            let _ = ShowWindow(grab, SW_HIDE);
+            let _ = SetWindowPos(hwnd, HWND_TOPMOST, DOCK_X, DOCK_Y, DOCK_W, DOCK_H, SWP_NOACTIVATE);
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
         if MAP_MODE.load(std::sync::atomic::Ordering::Relaxed) {
             let _ = ShowWindow(panel, SW_HIDE);
             let _ = ShowWindow(grab, SW_HIDE);
@@ -2807,6 +2869,7 @@ fn main() {
 
         let cursor_cv = Canvas::new(W, H, SS);
         let map_cv = Canvas::new(MAP_W, MAP_H, SS);
+        let dock_cv = Canvas::new(DOCK_W, DOCK_H, SS);
         let panel_cv = Canvas::new(PW, PH_MAX, SS_PANEL);
 
         loop {
@@ -2870,6 +2933,21 @@ fn main() {
                 }
             }
 
+            if DOCK_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+                let h = { st.lock().unwrap().hwnd };
+                unsafe {
+                    draw_dock_surface(&dock_cv);
+                    dock_cv.present(
+                        h,
+                        DOCK_W,
+                        DOCK_H,
+                        Some(POINT { x: DOCK_X, y: DOCK_Y }),
+                        1.0,
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                continue;
+            }
             if MAP_MODE.load(std::sync::atomic::Ordering::Relaxed) {
                 let (h, acc, cx, cy) = {
                     let s = st.lock().unwrap();
