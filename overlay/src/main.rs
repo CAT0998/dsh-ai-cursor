@@ -166,6 +166,16 @@ fn cursor_state(st: &St) -> &'static str {
 
 /// Which berths the user has selected. Written to a file the plugin reads, so the
 /// dock and the menu bar stay in step without a second communication channel.
+/// Where the dock command lives. The overlay process cannot write into the asset
+/// directory (access denied), but it can write next to its own executable, and every
+/// cursor process shares that location.
+fn dock_command_path() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?.join("logs");
+    let _ = std::fs::create_dir_all(&dir);
+    Some(dir.join("dock-command.json"))
+}
+
 static DOCK_SELECTED: std::sync::Mutex<Vec<bool>> = std::sync::Mutex::new(Vec::new());
 
 /// The "back to the station" button under a berth, and the plate area above it.
@@ -205,14 +215,15 @@ fn dock_write_command(action: &str, index: usize, win_left: i32, win_top: i32, c
     // the cursor should end up centred in its berth
     let x = win_left + bx + bw / 2;
     let y = win_top + sc(40) + sc(32);
-    if let Some(dir) = std::path::Path::new(path).parent() {
-        let out = dir.join("dock-command.json");
+    if let Some(out) = dock_command_path() {
         let body = serde_json::json!({
             "action": action, "index": index, "x": x, "y": y, "count": count
         })
         .to_string();
-        let _ = std::fs::write(&out, body);
-        logline!("INFO", "dock command {action} berth {index} -> ({x},{y})");
+        match std::fs::write(&out, body) {
+            Ok(_) => logline!("INFO", "dock command {action} berth {index} -> ({x},{y}) at {out:?}"),
+            Err(e) => logline!("ERROR", "dock command write {out:?}: {e}"),
+        }
     }
 }
 
@@ -1851,7 +1862,7 @@ fn on_toggle(st: &mut St, id: &str) {
             if id == "stop_all" {
                 // broadcast through the same file the dock uses; every cursor process
                 // stops itself once per epoch
-                match st.command_file.clone() {
+                match dock_command_path().map(|p| p.display().to_string()) {
                     Some(path) => {
                         let epoch = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -3100,6 +3111,35 @@ fn handle_line(line: &str) {
             st.command_file = v.get("path").and_then(|p| p.as_str()).map(|x| x.to_string());
             logline!("INFO", "watching dock commands at {:?}", st.command_file);
         }
+        "stop_all" => {
+            match dock_command_path().map(|p| p.display().to_string()) {
+                Some(path) => {
+                    let epoch = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let body = serde_json::json!({ "action": "stop_all", "epoch": epoch }).to_string();
+                    match std::fs::write(&path, &body) {
+                        Ok(_) => {
+                            out["broadcast"] = serde_json::json!(path);
+                            logline!("INFO", "stop_all broadcast epoch={epoch} -> {path}");
+                        }
+                        Err(e) => {
+                            out["ok"] = serde_json::json!(false);
+                            out["error"] = serde_json::json!(format!("write {path}: {e}"));
+                            logline!("ERROR", "stop_all write failed for {path:?}: {e}");
+                        }
+                    }
+                }
+                None => {
+                    out["ok"] = serde_json::json!(false);
+                    out["error"] = serde_json::json!("no command file configured");
+                }
+            }
+            st.prev_permission = st.permission.max(2);
+            st.permission = 0;
+            st.dirty = true;
+        }
         "dock_topmost" => {
             let on = v.get("on").and_then(|b| b.as_bool()).unwrap_or(true);
             DOCK_TOPMOST.store(on, std::sync::atomic::Ordering::Relaxed);
@@ -3618,7 +3658,10 @@ fn main() {
             {
                 let (path, my_index) = {
                     let s = st.lock().unwrap();
-                    (s.command_file.clone(), s.cursor_index)
+                    (
+                        dock_command_path().map(|p| p.display().to_string()),
+                        s.cursor_index,
+                    )
                 };
                 if let Some(path) = path {
                     let lim = std::time::SystemTime::now();

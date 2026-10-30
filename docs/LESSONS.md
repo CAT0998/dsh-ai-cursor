@@ -40,6 +40,11 @@
 `bin/logs/overlay.log` 是**按 exe 目录**开的，插件拉起的浮层、我手动起的 `--dock` 测试进程
 都会写同一个文件，日志会交错。排查时先看 `args=[...]` 那行确认是哪个进程。
 
+### 3d. 浮层进程不能写 `~/.dsh/ai-mouse-assets`
+`std::fs::write` 到资产目录返回 **os error 5（拒绝访问）**，而同一个目录用 shell 写是成功的。
+浮层能写的只有**自己 exe 所在目录**（日志就在那儿）。
+所以跨进程的通信用 `<exeDir>/logs/dock-command.json`，不要用 assetDir。
+
 ### 4. `compose()` 只能产出画布自己的宽度
 ```rust
 let stride_big = self.w * self.ss;   // 绑死画布尺寸
