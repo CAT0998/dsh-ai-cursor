@@ -99,6 +99,8 @@ export class Overlay {
   private spawnCount = 0
   /** The separate minimap process (`--map`); a second instance, its own window. */
   private mapChild: ChildProcessWithoutNullStreams | undefined
+  /** The dock station process (`--dock`); berths come from a JSON file. */
+  private dockChild: ChildProcessWithoutNullStreams | undefined
   private readonly exe: string
 
   constructor(exePath: string) {
@@ -264,5 +266,42 @@ export class Overlay {
   /** Is the separate minimap window running? */
   get mapRunning(): boolean {
     return this.mapChild !== undefined
+  }
+
+  /**
+   * Start or stop the dock station.
+   *
+   * It gets its berths from a file rather than a pipe, so it never needs anyone
+   * connected: the plugin writes the file, the dock re-reads it on every repaint.
+   */
+  async setDock(visible: boolean, slotsFile: string): Promise<boolean> {
+    if (visible) {
+      if (this.dockChild) return true
+      const child = spawn(this.exe, ['--dock', '--slots', slotsFile], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        windowsHide: true,
+      })
+      this.dockChild = child
+      child.on('exit', () => {
+        if (this.dockChild === child) this.dockChild = undefined
+      })
+      child.on('error', () => {
+        if (this.dockChild === child) this.dockChild = undefined
+      })
+      child.stdout.resume()
+      child.stderr.resume()
+      return true
+    }
+    const child = this.dockChild
+    this.dockChild = undefined
+    if (child) {
+      child.kill()
+      return true
+    }
+    return false
+  }
+
+  get dockRunning(): boolean {
+    return this.dockChild !== undefined
   }
 }

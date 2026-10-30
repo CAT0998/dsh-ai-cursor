@@ -40,6 +40,7 @@ import {
   savePresets,
   upsertPreset,
 } from './presets'
+import { berthsFrom, describeBerths, writeBerths } from './dock'
 export type { InterceptMode } from './intercept'
 export type { OverlayStatus } from './overlay'
 
@@ -89,6 +90,29 @@ export function apply(ctx: Context, config: ConfigShape): void {
    * that is what lets a subagent have a cursor of its own.
    */
   const cursors = new Map<string, Overlay>([['default', overlay]])
+  /** Colour and preset per cursor, for the dock's number plates. */
+  const meta = new Map<string, { color?: string; preset?: string }>()
+  const dockFile = () =>
+    `${(config.assetDir || '').replace(/[\/]+$/, '')}/berths.json`
+
+  /**
+   * Push the current cursors into the dock's berth file. The dock re-reads that
+   * file on every repaint, so this is the whole communication channel.
+   */
+  const refreshDock = async (): Promise<void> => {
+    const dir = (config.assetDir || '').replace(/[\/]+$/, '')
+    if (!dir) return
+    const list = [...cursors.keys()].map((name) => ({
+      name,
+      color: meta.get(name)?.color,
+      preset: meta.get(name)?.preset,
+    }))
+    try {
+      await writeBerths(dockFile(), berthsFrom(list))
+    } catch {
+      // a dock file that cannot be written must never break the cursor tools
+    }
+  }
   let active: Overlay = overlay
   ctx.effect(() => () => {
     for (const c of cursors.values()) c.dispose()
@@ -389,7 +413,10 @@ export function apply(ctx: Context, config: ConfigShape): void {
       async execute(args) {
         const refused = await gate(3, 'ai_mouse_color')
         if (refused) return refused
-        return describeStatus(await send('color', { hex: args.hex }))
+        const r = await send('color', { hex: args.hex })
+        for (const [name, ov] of cursors) if (ov === active) meta.set(name, { ...meta.get(name), color: args.hex })
+        void refreshDock()
+        return describeStatus(r)
       },
     }),
   )
@@ -633,6 +660,36 @@ export function apply(ctx: Context, config: ConfigShape): void {
 
   ctx.tools.register(
     defineTool({
+      name: 'ai_mouse_dock',
+      description:
+        'Start or stop the dock station: a strip of berths next to the menu bar, one per subagent cursor, each with a number plate showing the subagent and its preset. Berths are published through a JSON file, so the dock survives restarts without anyone staying connected.',
+      parameters: {
+        visible: { type: 'boolean', description: 'true = show, false = close. Omit to read.' },
+      },
+      output: TEXT_OUTPUT,
+      async execute(args: { visible?: boolean }) {
+        if (args.visible === undefined) {
+          const dir = (config.assetDir || '').replace(/[\/]+$/, '')
+          if (!overlay.dockRunning) return '停靠站：关'
+          const list = [...cursors.keys()].map((name) => ({
+            name,
+            color: meta.get(name)?.color,
+            preset: meta.get(name)?.preset,
+          }))
+          return `停靠站：开（${dir ? describeBerths(berthsFrom(list)) : '素材目录未配置'}）`
+        }
+        const refused = await gate(2, 'ai_mouse_dock')
+        if (refused) return refused
+        if (!config.assetDir) return '素材目录未配置，停靠站无法读写站牌数据。'
+        await refreshDock()
+        await overlay.setDock(args.visible, dockFile())
+        return args.visible ? '停靠站已启动。' : '停靠站已关闭。'
+      },
+    }),
+  )
+
+  ctx.tools.register(
+    defineTool({
       name: 'ai_mouse_cursor',
       description:
         'Manage AI cursors: each one is a separate process with its own window, position, look and configuration, so every subagent can have a cursor of its own. `create` makes one (optionally applying a saved preset to it) and switches to it; `use` switches which cursor the other ai_mouse_* tools act on; `list` shows them; `kill` closes one.',
@@ -671,6 +728,8 @@ export function apply(ctx: Context, config: ConfigShape): void {
             active = overlay
             await prime()
           }
+          meta.delete(name)
+          void refreshDock()
           return `已关闭光标「${name}」。`
         }
 
@@ -695,6 +754,7 @@ export function apply(ctx: Context, config: ConfigShape): void {
               }
             }
           }
+          void refreshDock()
           return `已创建光标「${name}」${applied}。${describeStatus(await send('status'))}`
         }
         return `未知 action：${action}（可用 create / use / list / kill）`
@@ -751,6 +811,10 @@ export function apply(ctx: Context, config: ConfigShape): void {
           const cmds = presetCommands(p)
           if (cmds.length === 0) return `预设「${p.name}」是空的，没有可应用的项。`
           for (const [cmd, payload] of cmds) await send(cmd, payload)
+          for (const [n2, ov] of cursors) {
+            if (ov === active) meta.set(n2, { ...meta.get(n2), preset: p.name })
+          }
+          void refreshDock()
           return `已应用预设「${p.name}」（${cmds.length} 项）。`
         }
         if (action === 'delete') {
