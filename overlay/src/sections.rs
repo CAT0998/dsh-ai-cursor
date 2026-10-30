@@ -154,6 +154,24 @@ pub fn build(v: &PanelView, mut y: i32, out: &mut Vec<Hit>) -> i32 {
     if !v.full {
         return y;
     }
+    // Geometry is authored once at the design size and scaled here, at the single
+    // exit point. Drawing and hit testing both consume these hits, so they cannot
+    // drift apart when the zoom changes.
+    let zoom = v.zoom.clamp(0.6, 2.0);
+    let start = out.len();
+    let bottom = build_design(v, y, out);
+    if (zoom - 1.0).abs() > 0.001 {
+        for h in out[start..].iter_mut() {
+            h.r.left = (h.r.left as f64 * zoom).round() as i32;
+            h.r.top = (h.r.top as f64 * zoom).round() as i32;
+            h.r.right = (h.r.right as f64 * zoom).round() as i32;
+            h.r.bottom = (h.r.bottom as f64 * zoom).round() as i32;
+        }
+    }
+    return (bottom as f64 * zoom).round() as i32;
+}
+
+fn build_design(v: &PanelView, mut y: i32, out: &mut Vec<Hit>) -> i32 {
     for sec in SECTIONS {
         let collapsed = is_collapsed(v, sec.key);
         // header row: chevron + title, click toggles
@@ -185,7 +203,8 @@ pub fn build(v: &PanelView, mut y: i32, out: &mut Vec<Hit>) -> i32 {
 // ------------------------------------------------------------------ bodies ---
 
 fn body_actions(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
-    let l = Layout::new(v.zoom);
+    // authored at design size; build() scales the whole panel in one place
+    let l = Layout::new(1.0);
     let acts: [(&'static str, &str, bool); 4] = [
         ("show", "显示", v.visible),
         ("hide", "隐藏", !v.visible),

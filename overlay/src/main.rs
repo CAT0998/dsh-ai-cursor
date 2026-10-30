@@ -565,6 +565,10 @@ unsafe fn make_font(px: i32, weight: i32) -> HGDIOBJ {
 
 impl Canvas {
     unsafe fn new(w: i32, h: i32, ss: i32) -> Canvas {
+        Canvas::new_scaled(w, h, ss, 1.0)
+    }
+
+    unsafe fn new_scaled(w: i32, h: i32, ss: i32, font_scale: f64) -> Canvas {
         let hdc_screen = GetDC(null_hwnd());
         let hdc_big = CreateCompatibleDC(hdc_screen);
         let hdc_small = CreateCompatibleDC(hdc_screen);
@@ -611,11 +615,11 @@ impl Canvas {
             h,
             ss,
             fonts: Fonts {
-                title: make_font(-15 * ss, 700),
-                label: make_font(-13 * ss, 400),
-                button: make_font(-13 * ss, 500),
-                value: make_font(-12 * ss, 400),
-                badge: make_font(-14 * ss, 600),
+                title: make_font(-(15.0 * font_scale * ss as f64) as i32, 700),
+                label: make_font(-(13.0 * font_scale * ss as f64) as i32, 400),
+                button: make_font(-(13.0 * font_scale * ss as f64) as i32, 500),
+                value: make_font(-(12.0 * font_scale * ss as f64) as i32, 400),
+                badge: make_font(-(14.0 * font_scale * ss as f64) as i32, 600),
             },
         }
     }
@@ -3020,7 +3024,12 @@ fn main() {
         let cursor_cv = Canvas::new(W, H, SS);
         let map_cv = Canvas::new(MAP_W, MAP_H, SS);
         let dock_cv = Canvas::new(DOCK_W, DOCK_H, SS);
-        let mut panel_cv = Canvas::new(PW, PH_MAX, SS_PANEL);
+        let mut panel_cv = Canvas::new_scaled(
+            PW,
+            PH_MAX,
+            SS_PANEL,
+            INIT_ZOOM.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0,
+        );
         let mut panel_cv_w = PW;
 
         loop {
@@ -3458,10 +3467,11 @@ fn main() {
             if draw_panel_now {
                 let want_w = ((PW as f64) * pv.zoom.clamp(0.6, 2.0)).round() as i32;
                 if want_w != panel_cv_w {
-                    panel_cv = Canvas::new(
+                    panel_cv = Canvas::new_scaled(
                         want_w,
                         ((PH_MAX as f64) * pv.zoom.clamp(0.6, 2.0)).round() as i32,
                         SS_PANEL,
+                        pv.zoom.clamp(0.6, 2.0),
                     );
                     panel_cv_w = want_w;
                 }
