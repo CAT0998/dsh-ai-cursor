@@ -713,18 +713,19 @@ export function apply(ctx: Context, config: ConfigShape): void {
                 name: n2,
                 color: meta.get(n2)?.color ?? '#4FC3F7',
               }))
+              // every cursor is its own process with its own panel, so each one needs
+              // the list - sending it only to the first left the visible panel blank
+              const prevActive = active
               for (const [cn, ov] of cursors) {
                 if (!chosen.includes(cn)) continue
-                const prevActive = active
                 active = ov
                 try {
                   await send('panel_columns', { columns: cols })
                 } catch {
-                  /* the panel may not be up yet */
+                  /* this cursor's panel may not be up yet */
                 }
-                active = prevActive
-                break
               }
+              active = prevActive
             }
             sel = chosen.length
               ? ` | 停靠站里选中：${chosen.join(', ')}`
