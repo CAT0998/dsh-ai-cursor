@@ -149,11 +149,13 @@ fn dock_frame_interval() -> std::time::Duration {
 /// - 休整中: it finished and was parked back at the station
 /// - 待机中: everything else - alive, idle, still away from the station
 fn cursor_state(st: &St) -> &'static str {
-    if st.permission == 0 {
-        return "已停用";
-    }
+    // resting wins over 已停用: a rest also drops the permission to 0, but the state
+    // the user asked for is 休整中 until the cursor is put to work again
     if st.resting {
         return "休整中";
+    }
+    if st.permission == 0 {
+        return "已停用";
     }
     let moving = (st.target.0 - st.cur.0).abs() > 0.5 || (st.target.1 - st.cur.1).abs() > 0.5;
     if moving || st.last_activity.elapsed().as_millis() < 400 {
@@ -550,6 +552,9 @@ struct St {
     map_err: i32,
     /// True while the cursor is parked at its berth rather than in use.
     resting: bool,
+    /// Which berth this cursor belongs to, and where to watch for dock commands.
+    cursor_index: usize,
+    command_file: Option<String>,
     /// The human may grab the AI cursor with their own pointer.
     drag_enabled: bool,
     dragging: bool,
@@ -648,6 +653,8 @@ impl St {
             map_proc: None,
             map_err: -1,
             resting: false,
+            cursor_index: 0,
+            command_file: None,
             drag_enabled: true,
             dragging: false,
             drag_grab: (0.0, 0.0),
@@ -3060,6 +3067,14 @@ fn handle_line(line: &str) {
                 }
             }
         }
+        "cursor_index" => {
+            st.cursor_index = v.get("index").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+            logline!("INFO", "this cursor is berth {}", st.cursor_index);
+        }
+        "dock_command_file" => {
+            st.command_file = v.get("path").and_then(|p| p.as_str()).map(|x| x.to_string());
+            logline!("INFO", "watching dock commands at {:?}", st.command_file);
+        }
         "dock_topmost" => {
             let on = v.get("on").and_then(|b| b.as_bool()).unwrap_or(true);
             DOCK_TOPMOST.store(on, std::sync::atomic::Ordering::Relaxed);
@@ -3275,6 +3290,7 @@ fn handle_line(line: &str) {
     out["log_path"] = serde_json::json!(log::path().map(|p| p.display().to_string()).unwrap_or_default());
     out["cursor_state"] = serde_json::json!(cursor_state(&st));
     out["resting"] = serde_json::json!(st.resting);
+    out["cursor_index"] = serde_json::json!(st.cursor_index);
     out["map_visible"] = serde_json::json!(st.map_visible);
     out["map_window"] = serde_json::json!(st.map_window);
     out["map_err"] = serde_json::json!(st.map_err);
@@ -3572,6 +3588,45 @@ fn main() {
                 }
             }
 
+            // Dock commands: the dock writes what should happen to a berth, this
+            // process acts only on the one addressed to it.
+            {
+                let (path, my_index) = {
+                    let s = st.lock().unwrap();
+                    (s.command_file.clone(), s.cursor_index)
+                };
+                if let Some(path) = path {
+                    let lim = std::time::SystemTime::now();
+                    let due = {
+                        let s = st.lock().unwrap();
+                        now.duration_since(s.last_activity).as_millis() > 0 || true
+                    };
+                    let _ = (lim, due);
+                    if let Ok(raw) = std::fs::read_to_string(&path) {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                            let idx = v.get("index").and_then(|x| x.as_u64()).unwrap_or(9999) as usize;
+                            let action = v.get("action").and_then(|x| x.as_str()).unwrap_or("");
+                            if idx == my_index && action == "rest" {
+                                let tx = v.get("x").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                                let ty = v.get("y").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                                let mut s = st.lock().unwrap();
+                                // stop first, then walk home
+                                s.prev_permission = s.permission.max(2);
+                                s.permission = 0;
+                                s.resting = true;
+                                s.target = (tx, ty);
+                                s.dur_ms = 0.0;
+                                s.drag_feedback = Some("已回站休整，AI 控制已停止。".to_string());
+                                s.dirty = true;
+                                s.panel_dirty = true;
+                                drop(s);
+                                let _ = std::fs::remove_file(&path);
+                                logline!("INFO", "rest command consumed -> walk to ({tx},{ty})");
+                            }
+                        }
+                    }
+                }
+            }
             if DOCK_MODE.load(std::sync::atomic::Ordering::Relaxed) {
                 let h = { st.lock().unwrap().hwnd };
                 let count = dock_berth_count();
