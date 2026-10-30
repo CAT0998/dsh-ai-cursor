@@ -2903,6 +2903,16 @@ unsafe extern "system" fn grab_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                 st.drag_grab = (p.x as f64 - st.cur.0, p.y as f64 - st.cur.1);
                 st.prev_permission = st.permission.max(2);
                 st.permission = 0;
+                logline!(
+                    "INFO",
+                    "grab press at ({},{}) cur=({:.0},{:.0}) grab=({:.0},{:.0})",
+                    p.x,
+                    p.y,
+                    st.cur.0,
+                    st.cur.1,
+                    st.drag_grab.0,
+                    st.drag_grab.1
+                );
                 st.drag_feedback =
                     Some("用户按住了 AI 光标，AI 控制已立即停止，正在拖动。".to_string());
                 st.dirty = true;
@@ -2913,11 +2923,13 @@ unsafe extern "system" fn grab_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
         }
         WM_MOUSEMOVE => {
             let dragging = { s.lock().unwrap().dragging };
+            logline!("INFO", "grab move dragging={dragging}");
             if dragging {
                 let mut p = POINT::default();
                 let _ = GetCursorPos(&mut p);
                 let mut st = s.lock().unwrap();
                 st.cur = (p.x as f64 - st.drag_grab.0, p.y as f64 - st.drag_grab.1);
+                logline!("INFO", "grab move cursor=({},{})", p.x, p.y);
                 st.target = st.cur;
                 st.dur_ms = 0.0;
                 st.last_activity = Instant::now();
