@@ -98,6 +98,25 @@ const MAP_Y: i32 = 64;
 static MAP_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static DOCK_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// What each berth currently holds. Pushed over stdin as one JSON line, so the
+/// dock stays a dumb renderer: all the knowledge (which subagent, which preset)
+/// lives in the plugin.
+#[derive(Clone, Default)]
+struct Berth {
+    agent: String,
+    preset: String,
+    color: u32,
+    occupied: bool,
+}
+
+static BERTHS: std::sync::OnceLock<std::sync::Mutex<Vec<Berth>>> = std::sync::OnceLock::new();
+/// Optional berth file, set with `--slots <path>`.
+static DOCK_FILE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn berths() -> &'static std::sync::Mutex<Vec<Berth>> {
+    BERTHS.get_or_init(|| std::sync::Mutex::new(vec![Berth::default(); DOCK_SLOTS]))
+}
+
 unsafe fn draw_dock_surface(cv: &Canvas) {
     let full = rect(0, 0, DOCK_W, DOCK_H);
     cv.fill_round(full, 12, 0x0B1016);
@@ -105,7 +124,28 @@ unsafe fn draw_dock_surface(cv: &Canvas) {
     cv.text_at(cv.fonts.title, 14, 10, "停靠站", 0x9FB2C6);
     cv.text_at(cv.fonts.label, DOCK_W - 118, 13, "鼠标停靠处", 0x5F7186);
 
-    // slots: an empty berth is a dashed-looking dim box, a taken one is filled
+    let mut held: Vec<Berth> = berths().lock().map(|b| b.clone()).unwrap_or_default();
+    if let Some(path) = DOCK_FILE.get() {
+        if let Ok(raw) = std::fs::read_to_string(path) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                if let Some(list) = v.as_array() {
+                    for (i, b) in held.iter_mut().enumerate().take(DOCK_SLOTS) {
+                        match list.get(i) {
+                            Some(slot) => {
+                                *b = Berth {
+                                    agent: slot.get("agent").and_then(|a| a.as_str()).unwrap_or("").to_string(),
+                                    preset: slot.get("preset").and_then(|a| a.as_str()).unwrap_or("").to_string(),
+                                    color: slot.get("color").and_then(|a| a.as_str()).and_then(parse_hex).unwrap_or(0x4FC3F7),
+                                    occupied: slot.get("occupied").and_then(|o| o.as_bool()).unwrap_or(true),
+                                };
+                            }
+                            None => *b = Berth::default(),
+                        }
+                    }
+                }
+            }
+        }
+    }
     let pad = 12;
     let gap = 8;
     let w = (DOCK_W - pad * 2 - gap * (DOCK_SLOTS as i32 - 1)) / DOCK_SLOTS as i32;
@@ -113,33 +153,36 @@ unsafe fn draw_dock_surface(cv: &Canvas) {
         let x = pad + i as i32 * (w + gap);
         let y = 40;
         let berth = rect(x, y, x + w, y + 64);
-        cv.fill_round(berth, 10, 0x141C26);
-        cv.stroke_round(berth, 10, 0x2F4152, 1);
-        // the number plate under the berth
+        let b = held.get(i).cloned().unwrap_or_default();
+        if b.occupied {
+            cv.fill_round(berth, 10, 0x1B2A38);
+            cv.stroke_round(berth, 10, b.color & 0xFFFFFF, 2);
+            // the cursor's own colour as a dot inside its berth
+            cv.fill_circle(x + w / 2, y + 26, 11, b.color & 0xFFFFFF);
+            cv.ring_circle(x + w / 2, y + 26, 14, 1, 0xFFFFFF);
+        } else {
+            cv.fill_round(berth, 10, 0x141C26);
+            cv.stroke_round(berth, 10, 0x2F4152, 1);
+        }
+        // number plate: left-aligned, so no centring maths can push it off-screen
         let plate = rect(x, y + 68, x + w, y + 92);
         cv.fill_round(plate, 6, 0x18222E);
         let title = format!("{}号位", i + 1);
-        let tw = cv.text_w(cv.fonts.label, &title);
-        cv.text_at(
-            cv.fonts.label,
-            x + (w - tw) / 2,
-            y + 72,
-            &title,
-            0x6E8199,
-        );
-        cv.text_at(
-            cv.fonts.label,
-            x + 6,
-            y + 94,
-            "空闲",
-            0x46586B,
-        );
+        cv.text_at(cv.fonts.label, x + 5, y + 72, &title, 0x6E8199);
+        if b.occupied {
+            let short: String = b.agent.chars().take(4).collect();
+            cv.text_at(cv.fonts.label, x + 5, y + 96, &short, 0xBFD2E5);
+            let pshort: String = b.preset.chars().take(4).collect();
+            cv.text_at(cv.fonts.label, x + 5, y + 114, &pshort, 0x5F7186);
+        } else {
+            cv.text_at(cv.fonts.label, x + 5, y + 96, "空闲", 0x46586B);
+        }
     }
     cv.text_at(
         cv.fonts.label,
         14,
-        DOCK_H - 24,
-        "子代理 / 预设 / 颜色 会显示在站牌上",
+        DOCK_H - 22,
+        "站牌：子代理 / 预设",
         0x4C5E72,
     );
 }
@@ -2532,6 +2575,43 @@ fn handle_line(line: &str) {
                 }
             }
         }
+        "dock_slots" => {
+            if let Some(list) = v.get("slots").and_then(|x| x.as_array()) {
+                if let Ok(mut berths) = berths().lock() {
+                    for (i, b) in berths.iter_mut().enumerate().take(DOCK_SLOTS) {
+                        match list.get(i) {
+                            Some(slot) => {
+                                let agent = slot
+                                    .get("agent")
+                                    .and_then(|a| a.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let preset = slot
+                                    .get("preset")
+                                    .and_then(|a| a.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let color = slot
+                                    .get("color")
+                                    .and_then(|a| a.as_str())
+                                    .and_then(parse_hex)
+                                    .unwrap_or(0x4FC3F7);
+                                *b = Berth {
+                                    occupied: slot
+                                        .get("occupied")
+                                        .and_then(|o| o.as_bool())
+                                        .unwrap_or(!agent.is_empty()),
+                                    agent,
+                                    preset,
+                                    color,
+                                };
+                            }
+                            None => *b = Berth::default(),
+                        }
+                    }
+                }
+            }
+        }
         "layer_probe" => {
             let x = v.get("x").and_then(|n| n.as_f64()).unwrap_or(st.cur.0) as i32;
             let y = v.get("y").and_then(|n| n.as_f64()).unwrap_or(st.cur.1) as i32;
@@ -2757,6 +2837,14 @@ fn main() {
     }
     if std::env::args().any(|a| a == "--dock") {
         DOCK_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if let Some(i) = args.iter().position(|a| a == "--slots") {
+            if let Some(path) = args.get(i + 1) {
+                let _ = DOCK_FILE.set(path.clone());
+            }
+        }
     }
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
