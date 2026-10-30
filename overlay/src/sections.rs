@@ -183,19 +183,31 @@ fn build_design(v: &PanelView, mut y: i32, out: &mut Vec<Hit>) -> i32 {
     if !v.columns.is_empty() {
         let n = v.columns.len() as i32;
         let gap = 6;
-        let w = (content_right() - PAD - gap * (n - 1)) / n.max(1);
+        // the fold chip takes a slot at the right end of the strip
+        let fold_w = 26;
+        let w = (content_right() - PAD - gap * (n - 1) - fold_w - gap) / n.max(1);
         for (i, (name, color)) in v.columns.iter().enumerate() {
             let x = PAD + i as i32 * (w + gap);
             out.push(
-                Hit::new(rect(x, y - 4, x + w, y + 20), Kind::LabelRight, "l_col_name")
-                    .text(name.clone()),
+                Hit::new(rect(x, y - 4, x + w, y + 20), Kind::Button, "col_head")
+                    .text(name.clone())
+                    .data(i as i32),
             );
             out.push(
                 Hit::new(rect(x, y + 22, x + w, y + 25), Kind::Sep, "sep_col")
                     .data((*color & 0xFFFFFF) as i32),
             );
         }
+        let fx = PAD + n * (w + gap);
+        out.push(
+            Hit::new(rect(fx, y - 4, fx + fold_w, y + 20), Kind::Button, "col_fold")
+                .text(if v.columns_collapsed { "▸" } else { "▾" }),
+        );
         y += 30;
+        if v.columns_collapsed {
+            // folded: nothing but the headers
+            return y;
+        }
     }
     for sec in SECTIONS {
         let collapsed = is_collapsed(v, sec.key);

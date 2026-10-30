@@ -577,6 +577,8 @@ struct St {
     last_cmd_epoch: u64,
     /// One entry per selected cursor: the menu bar shows a column header for each.
     columns: Vec<(String, u32)>,
+    /// Menu bar folded down to just the column headers.
+    columns_collapsed: bool,
     /// Process start time, so a command file left over from an earlier run is
     /// ignored instead of being replayed on startup.
     started_ms: u64,
@@ -682,6 +684,7 @@ impl St {
             command_file: None,
             last_cmd_epoch: 0,
             columns: Vec::new(),
+            columns_collapsed: false,
             started_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -1735,6 +1738,7 @@ fn view_of(st: &St) -> PanelView {
         art_sel: st.art_sel,
         zoom: st.panel_zoom,
         columns: st.columns.clone(),
+        columns_collapsed: st.columns_collapsed,
         map_zoom: st.map_zoom,
         map_opacity: st.map_opacity,
         map_visible: st.map_visible,
@@ -1878,7 +1882,11 @@ fn on_toggle(st: &mut St, id: &str) {
             st.dirty = true;
         }
         _ => {
-            if id == "stop_all" {
+            if id == "col_fold" {
+                st.columns_collapsed = !st.columns_collapsed;
+                st.panel_dirty = true;
+                st.want_panel_resize = true;
+            } else if id == "stop_all" {
                 // broadcast through the same file the dock uses; every cursor process
                 // stops itself once per epoch
                 match dock_command_path().map(|p| p.display().to_string()) {
@@ -3121,6 +3129,12 @@ fn handle_line(line: &str) {
                     }
                 }
             }
+        }
+        "fold_columns" => {
+            st.columns_collapsed = !st.columns_collapsed;
+            st.panel_dirty = true;
+            st.want_panel_resize = true;
+            logline!("INFO", "columns collapsed={}", st.columns_collapsed);
         }
         "panel_columns" => {
             let mut cols = Vec::new();
