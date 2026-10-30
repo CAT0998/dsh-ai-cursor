@@ -17,6 +17,7 @@
 //! the panel is WS_EX_NOACTIVATE, so clicking a button never steals the foreground.
 
 mod custom;
+mod log;
 mod sections;
 mod wheel;
 mod sprite;
@@ -1352,6 +1353,7 @@ unsafe fn draw_panel(cv: &Canvas, v: &PanelView, hits: &[Hit], h: i32) {
     let z = v.zoom.clamp(0.6, 2.0);
     let lw = ((PW as f64) * z).round() as i32;
     let lh = ((h as f64) * z).round() as i32;
+    logline!("TRACE", "draw_panel h_in={h} zoom={z:.3} -> lw={lw} lh={lh}");
     cv.compose(lw, lh, 0.98);
     draw_previews(cv, v, hits, h);
     cv.blit(state().lock().unwrap().panel_hwnd, lw, lh, None);
@@ -2659,6 +2661,21 @@ fn handle_line(line: &str) {
             st.panel_dirty = true;
             st.want_panel_resize = true;
         }
+        "log_export" => {
+            let dst = v.get("path").and_then(|p| p.as_str()).unwrap_or("");
+            if dst.is_empty() {
+                out["ok"] = serde_json::json!(false);
+                out["error"] = serde_json::json!("log_export needs a path");
+            } else {
+                match log::export(std::path::Path::new(dst)) {
+                    Ok(p) => out["log_path"] = serde_json::json!(p.display().to_string()),
+                    Err(e) => {
+                        out["ok"] = serde_json::json!(false);
+                        out["error"] = serde_json::json!(e);
+                    }
+                }
+            }
+        }
         "dock_slots" => {
             if let Some(list) = v.get("slots").and_then(|x| x.as_array()) {
                 if let Ok(mut berths) = berths().lock() {
@@ -2848,6 +2865,7 @@ fn handle_line(line: &str) {
     out["layer_title"] = serde_json::json!(st.layer_title);
     out["map_zoom"] = serde_json::json!(st.map_zoom);
     out["map_opacity"] = serde_json::json!(st.map_opacity);
+    out["log_path"] = serde_json::json!(log::path().map(|p| p.display().to_string()).unwrap_or_default());
     out["map_visible"] = serde_json::json!(st.map_visible);
     out["map_window"] = serde_json::json!(st.map_window);
     out["map_err"] = serde_json::json!(st.map_err);
@@ -2916,6 +2934,14 @@ fn handle_line(line: &str) {
 // -------------------------------------------------------------------- main ---
 
 fn main() {
+    {
+        let dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("logs")))
+            .unwrap_or_else(|| std::path::PathBuf::from("logs"));
+        let path = log::init(&dir);
+        logline!("INFO", "args={:?} log={}", std::env::args().collect::<Vec<_>>(), path.display());
+    }
     if std::env::args().any(|a| a == "--map") {
         MAP_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
     }
@@ -3293,6 +3319,7 @@ fn main() {
                 let z = st.lock().unwrap().panel_zoom;
                 let w = if p_full { ((PW as f64) * z).round() as i32 } else { CHIP_W };
                 let h = if p_full { p_h } else { CHIP_H };
+                logline!("TRACE", "resize w={w} h={h} zoom={z:.3} p_h={p_h}");
                 // Opening a section grows the panel downward; keep it on screen by
                 // sliding it up rather than letting it run off the bottom edge.
                 let screen_h = GetSystemMetrics(SYSTEM_METRICS_INDEX(SM_CYSCREEN.0));

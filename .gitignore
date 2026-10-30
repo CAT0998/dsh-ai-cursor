@@ -17,3 +17,5 @@ frame-*.png
 *-capture-*.png
 verify-*.png
 ai-mouse-*.png
+bin/logs/
+logs/
