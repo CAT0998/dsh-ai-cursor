@@ -2519,6 +2519,15 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                 }
                 return LRESULT(0);
             }
+            WM_MOUSEWHEEL => {
+                // a wheel over the dock zooms it: no grip to hunt for
+                let delta = ((wparam.0 >> 16) & 0xFFFF) as i16 as f64 / 120.0;
+                let cur = DOCK_ZOOM.load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0;
+                let next = (cur + delta * 0.1).clamp(0.6, 2.0);
+                DOCK_ZOOM.store((next * 100.0).round() as i32, std::sync::atomic::Ordering::Relaxed);
+                logline!("INFO", "dock zoom {cur:.2} -> {next:.2} (wheel)");
+                return LRESULT(0);
+            }
             WM_LBUTTONUP => {
                 let was_dragging = DRAG_ORIGIN.load(std::sync::atomic::Ordering::Relaxed) != 0;
                 DRAG_ORIGIN.store(0, std::sync::atomic::Ordering::Relaxed);
