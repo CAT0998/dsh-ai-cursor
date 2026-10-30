@@ -828,12 +828,13 @@ export function apply(ctx: Context, config: ConfigShape): void {
       parameters: {
         action: {
           type: 'string',
-          description: 'save | load | global | list | show | delete (global applies the preset to every cursor)',
+          description: 'save | load | global | list | show | delete | export | import (global applies the preset to every cursor; export/import move presets.json to and from a file)',
         },
         name: { type: 'string', description: 'Preset name (case-insensitive).' },
+        path: { type: 'string', description: 'File path, for export / import.' },
       },
       output: TEXT_OUTPUT,
-      async execute(args: { action?: string; name?: string }) {
+      async execute(args: { action?: string; name?: string; path?: string }) {
         const dir = (config.assetDir || '').replace(/[\/]+$/, '')
         if (!dir) return '素材目录未配置，无法读写预设。'
         const file = `${dir}/presets.json`
@@ -847,6 +848,34 @@ export function apply(ctx: Context, config: ConfigShape): void {
           }
           return `共 ${list.length} 个预设：` + list.map((p) => describePreset(p)).join('  |  ')
         }
+        if (action === 'export') {
+          // export is a file action, so it takes a path instead of a preset name
+          const refused = await gate(2, 'ai_mouse_preset')
+          if (refused) return refused
+          const dst = (args.path ?? '').trim()
+          if (!dst) return 'export 需要 path（预设文件的目标路径）。'
+          if (list.length === 0) return '还没有预设可导出。'
+          const { mkdir } = await import('node:fs/promises')
+          const { dirname } = await import('node:path')
+          await mkdir(dirname(dst), { recursive: true })
+          await savePresets(dst, list)
+          return `已导出 ${list.length} 个预设到 ${dst}`
+        }
+
+        if (action === 'import') {
+          const refused = await gate(2, 'ai_mouse_preset')
+          if (refused) return refused
+          const src = (args.path ?? '').trim()
+          if (!src) return 'import 需要 path（预设文件的来源路径）。'
+          const incoming = await loadPresets(src)
+          if (incoming.length === 0) return `${src} 里没有可用的预设（或文件不存在）。`
+          // 同名覆盖、异名追加
+          let next = list
+          for (const p2 of incoming) next = upsertPreset(next, p2)
+          await savePresets(file, next)
+          return `已从 ${src} 载入 ${incoming.length} 个预设，现在共 ${next.length} 个（同名覆盖、异名追加）。`
+        }
+
         if (action === 'show') {
           const p = findPreset(list, name)
           return p ? describePreset(p) : `没有名为「${name}」的预设。`
