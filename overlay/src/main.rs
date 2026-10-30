@@ -2362,13 +2362,13 @@ unsafe fn slider_value(st: &mut St, id: &str, x: i32, hits: &[Hit]) {
             let i = st.art_sel.min(2);
             st.slots[i].opacity = t;
         }
+        "art_rot_slider" => {
+            let i = st.art_sel.min(2);
+            st.slots[i].rot = (-180.0 + t * 360.0).round();
+        }
         "art_size" => {
             let i = st.art_sel.min(2);
             st.slots[i].size = (8.0 + t * 248.0).round();
-        }
-        "art_rot" => {
-            let i = st.art_sel.min(2);
-            st.slots[i].rot = (-180.0 + t * 360.0).round();
         }
         "art_offx" => {
             let i = st.art_sel.min(2);
@@ -3516,6 +3516,18 @@ fn handle_line(line: &str) {
             st.prev_permission = st.permission.max(2);
             st.permission = 0;
             st.dirty = true;
+        }
+        "art_rot" => {
+            let i = v
+                .get("slot")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0)
+                .min(2) as usize;
+            let deg = v.get("value").and_then(|x| x.as_f64()).unwrap_or(0.0);
+            st.slots[i].rot = deg.clamp(-180.0, 180.0);
+            logline!("INFO", "art_rot slot{i} -> {deg:.1} deg");
+            st.dirty = true;
+            st.panel_dirty = true;
         }
         "dock_topmost" => {
             let on = v.get("on").and_then(|b| b.as_bool()).unwrap_or(true);

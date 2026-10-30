@@ -576,7 +576,7 @@ fn body_artwork(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
             format!("{:.0}", slot.offset.1),
         ),
         (
-            "art_rot",
+            "art_rot_slider",
             "旋转",
             ((slot.rot + 180.0) / 360.0).clamp(0.0, 1.0),
             format!("{:.0}°", slot.rot),
