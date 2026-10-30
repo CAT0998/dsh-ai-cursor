@@ -30,6 +30,16 @@ export {
   matchesTool,
   normalizeMode,
 } from './intercept'
+import {
+  capturePreset,
+  describePreset,
+  findPreset,
+  loadPresets,
+  presetCommands,
+  removePreset,
+  savePresets,
+  upsertPreset,
+} from './presets'
 export type { InterceptMode } from './intercept'
 export type { OverlayStatus } from './overlay'
 
@@ -610,6 +620,69 @@ export function apply(ctx: Context, config: ConfigShape): void {
   )
 
   // --------------------------------------------------------------- layers ---
+
+  ctx.tools.register(
+    defineTool({
+      name: 'ai_mouse_preset',
+      description:
+        'Save or load a named configuration preset for the cursor (theme, label, colour, opacity, size, badge, capture visibility). Saves capture the LIVE state; loading replays it as ordinary commands, so a preset can never do anything a single tool call could not. Presets are stored as JSON next to the assets and are the building block for giving each subagent its own look.',
+      parameters: {
+        action: {
+          type: 'string',
+          description: 'save | load | list | show | delete',
+        },
+        name: { type: 'string', description: 'Preset name (case-insensitive).' },
+      },
+      output: TEXT_OUTPUT,
+      async execute(args: { action?: string; name?: string }) {
+        const dir = (config.assetDir || '').replace(/[\/]+$/, '')
+        if (!dir) return '素材目录未配置，无法读写预设。'
+        const file = `${dir}/presets.json`
+        const list = await loadPresets(file)
+        const action = (args.action ?? 'list').toLowerCase()
+        const name = (args.name ?? '').trim()
+
+        if (action === 'list') {
+          if (list.length === 0) {
+            return '还没有预设。用 ai_mouse_preset { action: "save", name: "..." } 保存当前外观。'
+          }
+          return `共 ${list.length} 个预设：` + list.map((p) => describePreset(p)).join('  |  ')
+        }
+        if (action === 'show') {
+          const p = findPreset(list, name)
+          return p ? describePreset(p) : `没有名为「${name}」的预设。`
+        }
+        if (!name) return `${action} 需要 name。`
+
+        if (action === 'save') {
+          const refused = await gate(2, 'ai_mouse_preset')
+          if (refused) return refused
+          const st = await send('status')
+          const preset = capturePreset(name, st as never)
+          await savePresets(file, upsertPreset(list, preset))
+          return `已保存预设「${name}」：${describePreset(preset).slice(name.length + 2)}`
+        }
+        if (action === 'load') {
+          const refused = await gate(2, 'ai_mouse_preset')
+          if (refused) return refused
+          const p = findPreset(list, name)
+          if (!p) return `没有名为「${name}」的预设。可用：${list.map((x) => x.name).join(', ') || '空'}`
+          const cmds = presetCommands(p)
+          if (cmds.length === 0) return `预设「${p.name}」是空的，没有可应用的项。`
+          for (const [cmd, payload] of cmds) await send(cmd, payload)
+          return `已应用预设「${p.name}」（${cmds.length} 项）。`
+        }
+        if (action === 'delete') {
+          const refused = await gate(2, 'ai_mouse_preset')
+          if (refused) return refused
+          if (!findPreset(list, name)) return `没有名为「${name}」的预设。`
+          await savePresets(file, removePreset(list, name))
+          return `已删除预设「${name}」。`
+        }
+        return `未知 action：${action}（可用 save / load / list / show / delete）`
+      },
+    }),
+  )
 
   ctx.tools.register(
     defineTool({
