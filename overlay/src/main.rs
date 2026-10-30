@@ -117,6 +117,31 @@ static DOCK_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool:
 /// Initial panel zoom x1000, from `--panel-zoom`.
 static INIT_ZOOM: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1000);
 /// `--panel` shows the panel at startup, for development and screenshots.
+/// Frame interval for the dock, taken from the display's own refresh rate and
+/// capped: repainting faster than the monitor can show is wasted work, and a
+/// 144Hz panel does not need 144 redraws of a static strip.
+fn dock_frame_interval() -> std::time::Duration {
+    let mut dm = windows::Win32::Graphics::Gdi::DEVMODEW::default();
+    dm.dmSize = std::mem::size_of::<windows::Win32::Graphics::Gdi::DEVMODEW>() as u16;
+    let mut hz = 60i32;
+    unsafe {
+        if windows::Win32::Graphics::Gdi::EnumDisplaySettingsW(
+            PCWSTR::null(),
+            windows::Win32::Graphics::Gdi::ENUM_CURRENT_SETTINGS,
+            &mut dm,
+        )
+        .as_bool()
+        {
+            if dm.dmDisplayFrequency > 1 {
+                hz = dm.dmDisplayFrequency as i32;
+            }
+        }
+    }
+    let fps = hz.clamp(30, 120);
+    logline!("INFO", "dock refresh: display {hz}Hz -> {fps}fps");
+    std::time::Duration::from_micros(1_000_000 / fps as u64)
+}
+
 static DOCK_TOPMOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static DOCK_ZOOM: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(100);
 static INIT_PANEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -3296,6 +3321,11 @@ fn main() {
 
         let cursor_cv = Canvas::new(W, H, SS);
         let map_cv = Canvas::new(MAP_W, MAP_H, SS);
+        let frame_interval = if DOCK_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+            dock_frame_interval()
+        } else {
+            std::time::Duration::from_millis(16)
+        };
         let mut dock_cv = Canvas::new(DOCK_W, DOCK_H, SS);
         let mut dock_cv_w = DOCK_W;
         let mut dock_cv_h = DOCK_H;
@@ -3398,9 +3428,7 @@ fn main() {
                     draw_dock_surface(&dock_cv, count, z);
                     dock_cv.present(h, want_w, want_h, None, 1.0);
                 }
-                // ~60 Hz while the strip is alive; the drag felt laggy at 400ms because
-                // the content visibly caught up only a few times a second
-                std::thread::sleep(std::time::Duration::from_millis(16));
+                std::thread::sleep(frame_interval);
                 continue;
             }
             if MAP_MODE.load(std::sync::atomic::Ordering::Relaxed) {
