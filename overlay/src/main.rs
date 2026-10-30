@@ -84,7 +84,7 @@ const SS_PANEL: i32 = 2; // supersample factor for the panel
 const GRAB: i32 = 40; // side of the clickable grab hotspot at the cursor tip
 /// The minimap runs as a second instance of this binary (`--map`), drawn into the
 /// same window class that already works instead of a new one.
-const DOCK_W: i32 = 352;
+const DOCK_W: i32 = 430;
 const DOCK_H: i32 = 208;
 const DOCK_SLOTS: usize = 5;
 const DOCK_X: i32 = 1068;
@@ -170,9 +170,9 @@ unsafe fn draw_dock_surface(cv: &Canvas) {
         let title = format!("{}号位", i + 1);
         cv.text_at(cv.fonts.label, x + 5, y + 72, &title, 0x6E8199);
         if b.occupied {
-            let short: String = b.agent.chars().take(4).collect();
+            let short: String = b.agent.chars().take(9).collect();
             cv.text_at(cv.fonts.label, x + 5, y + 96, &short, 0xBFD2E5);
-            let pshort: String = b.preset.chars().take(4).collect();
+            let pshort: String = b.preset.chars().take(7).collect();
             cv.text_at(cv.fonts.label, x + 5, y + 114, &pshort, 0x5F7186);
         } else {
             cv.text_at(cv.fonts.label, x + 5, y + 96, "空闲", 0x46586B);
