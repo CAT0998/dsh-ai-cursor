@@ -93,6 +93,50 @@ pub fn is_collapsed(v: &PanelView, key: &str) -> bool {
     v.collapsed.iter().any(|k| k == key)
 }
 
+/// Everything the layout needs, derived from one number.
+///
+/// Rectangles must never be written as bare constants again: they come from here,
+/// so changing `zoom` moves and resizes every dependent widget together, and the
+/// hit test (which uses the same values) always matches what is drawn.
+#[derive(Clone, Copy, Debug)]
+pub struct Layout {
+    pub zoom: f64,
+    pub width: i32,
+}
+
+impl Layout {
+    pub fn new(zoom: f64) -> Layout {
+        let z = zoom.clamp(0.6, 2.0);
+        Layout {
+            zoom: z,
+            width: (crate::PW as f64 * z).round() as i32,
+        }
+    }
+    fn sc(&self, v: i32) -> i32 {
+        (v as f64 * self.zoom).round() as i32
+    }
+    pub fn pad(&self) -> i32 {
+        self.sc(14)
+    }
+    pub fn gap(&self) -> i32 {
+        self.sc(8)
+    }
+    pub fn row(&self) -> i32 {
+        self.sc(22)
+    }
+    pub fn btn_h(&self) -> i32 {
+        self.sc(34)
+    }
+    pub fn content_right(&self) -> i32 {
+        self.width - self.pad()
+    }
+    pub fn button_row(&self, y: i32, n: i32) -> (i32, i32) {
+        let total = self.content_right() - self.pad();
+        let w = (total - self.gap() * (n - 1)) / n.max(1);
+        (w, y)
+    }
+}
+
 fn hov(v: &PanelView, id: &str) -> bool {
     v.hover == id
 }
@@ -141,35 +185,52 @@ pub fn build(v: &PanelView, mut y: i32, out: &mut Vec<Hit>) -> i32 {
 // ------------------------------------------------------------------ bodies ---
 
 fn body_actions(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
-    let w = col_w();
+    let l = Layout::new(v.zoom);
     let acts: [(&'static str, &str, bool); 4] = [
         ("show", "显示", v.visible),
         ("hide", "隐藏", !v.visible),
         ("stop", "停止", v.permission == 0),
-        ("start", "启用", v.permission > 0),
+        ("resume", "启用", v.permission > 0),
     ];
+    let (w, by) = l.button_row(y, 4);
     for (i, (id, text, on)) in acts.iter().enumerate() {
-        let bx = x + i as i32 * (w + 8);
+        let bx = l.pad() + i as i32 * (w + l.gap());
         out.push(
-            Hit::new(rect(bx, y, bx + w, y + 34), Kind::Button, id)
+            Hit::new(rect(bx, by, bx + w, by + l.btn_h()), Kind::Button, id)
                 .text(*text)
                 .active(*on)
                 .hover(hov(v, id)),
         );
     }
-    y += 38;
-    out.push(Hit::new(rect(x, y, x + 34, y + 16), Kind::Label, "l_drag").text("拖拽"));
+    y = by + l.btn_h() + l.sc(4);
+    // the drag switch sits on its own line, also laid out from the model
     out.push(
-        Hit::new(rect(x + 38, y - 2, x + 130, y + 22), Kind::Button, "drag_toggle")
-            .text(if v.drag_enabled { "可用" } else { "禁用" })
-            .active(v.drag_enabled)
-            .hover(hov(v, "drag_toggle")),
+        Hit::new(rect(l.pad(), y, l.pad() + l.sc(34), y + l.sc(16)), Kind::Label, "l_drag")
+            .text("拖拽"),
     );
     out.push(
-        Hit::new(rect(x + 140, y, content_right(), y + 18), Kind::Label, "l_drag_hint")
-            .text(if v.dragging { "正在被用户拖动…" } else { "按住光标即可用真实鼠标拖动它" }),
+        Hit::new(
+            rect(l.pad() + l.sc(38), y - l.sc(2), l.pad() + l.sc(130), y + l.sc(22)),
+            Kind::Button,
+            "drag_toggle",
+        )
+        .text(if v.drag_enabled { "可用" } else { "禁用" })
+        .active(v.drag_enabled)
+        .hover(hov(v, "drag_toggle")),
     );
-    y + 28
+    out.push(
+        Hit::new(
+            rect(l.pad() + l.sc(140), y, l.content_right(), y + l.sc(18)),
+            Kind::Label,
+            "l_drag_hint",
+        )
+        .text(if v.dragging {
+            "正在被用户拖动…"
+        } else {
+            "按住光标即可用真实鼠标拖动它"
+        }),
+    );
+    y + l.sc(28)
 }
 
 fn body_appearance(v: &PanelView, x: i32, y: i32, out: &mut Vec<Hit>) -> i32 {

@@ -100,6 +100,8 @@ pub struct PanelView {
     pub epoch_ms: u64,
     /// Which artwork slot the editor block below the rows is editing.
     pub art_sel: usize,
+    /// Panel zoom: every rect and font is derived from it.
+    pub zoom: f64,
     /// The human may drag the cursor with their own pointer.
     pub drag_enabled: bool,
     pub dragging: bool,

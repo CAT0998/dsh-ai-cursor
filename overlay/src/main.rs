@@ -1338,15 +1338,15 @@ unsafe fn draw_panel(cv: &Canvas, v: &PanelView, hits: &[Hit], h: i32) {
         }
     }
 
-    cv.compose(PW, h, 0.98);
+    // The canvas is sized to the zoomed width, so composing at that same width is
+    // the only shape compose can handle: it samples by index and writes with a
+    // stride fixed to the canvas width.
+    let z = v.zoom.clamp(0.6, 2.0);
+    let lw = ((PW as f64) * z).round() as i32;
+    let lh = ((h as f64) * z).round() as i32;
+    cv.compose(lw, lh, 0.98);
     draw_previews(cv, v, hits, h);
-    {
-        let (ph, z) = {
-            let s = state().lock().unwrap();
-            (s.panel_hwnd, s.panel_zoom)
-        };
-        cv.present_scaled(ph, PW, h, z, None, 1.0);
-    }
+    cv.blit(state().lock().unwrap().panel_hwnd, lw, lh, None);
 }
 
 // ---------------------------------------------------------------- windows ----
@@ -1486,6 +1486,7 @@ fn view_of(st: &St) -> PanelView {
         custom: custom_view(st),
         epoch_ms: Instant::now().duration_since(st.sprite_epoch).as_millis() as u64,
         art_sel: st.art_sel,
+        zoom: st.panel_zoom,
         map_zoom: st.map_zoom,
         map_opacity: st.map_opacity,
         map_visible: st.map_visible,
@@ -3019,7 +3020,8 @@ fn main() {
         let cursor_cv = Canvas::new(W, H, SS);
         let map_cv = Canvas::new(MAP_W, MAP_H, SS);
         let dock_cv = Canvas::new(DOCK_W, DOCK_H, SS);
-        let panel_cv = Canvas::new(PW, PH_MAX, SS_PANEL);
+        let mut panel_cv = Canvas::new(PW, PH_MAX, SS_PANEL);
+        let mut panel_cv_w = PW;
 
         loop {
             let mut msg = MSG::default();
@@ -3454,6 +3456,15 @@ fn main() {
                 }
             };
             if draw_panel_now {
+                let want_w = ((PW as f64) * pv.zoom.clamp(0.6, 2.0)).round() as i32;
+                if want_w != panel_cv_w {
+                    panel_cv = Canvas::new(
+                        want_w,
+                        ((PH_MAX as f64) * pv.zoom.clamp(0.6, 2.0)).round() as i32,
+                        SS_PANEL,
+                    );
+                    panel_cv_w = want_w;
+                }
                 let hits = panel_layout(&pv);
                 let h = if pv.full { panel_height(&pv) } else { CHIP_H };
                 draw_panel(&panel_cv, &pv, &hits, h);
