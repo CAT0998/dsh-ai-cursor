@@ -2948,9 +2948,16 @@ unsafe extern "system" fn grab_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             ));
             // 拖动期间暂停 AI 控制是对的，但松手就该恢复，否则用户会以为
             // "拖一下把东西弄坏了"，还得回去点「启用」
-            let back = st.prev_permission.clamp(1, 3);
+            // 与轮询路径共享同一份 prev_permission，被消费后是 0，
+            // 这时不能 clamp 成 1（会把管理员降成只读）
+            let back = if st.prev_permission > 0 {
+                let b = st.prev_permission;
+                st.prev_permission = 0;
+                b
+            } else {
+                st.permission
+            };
             st.permission = back;
-            st.prev_permission = 0;
             st.drag_feedback = Some(format!(
                 "用户把 AI 光标放到了 ({:.0}, {:.0})，AI 控制已恢复。",
                 st.cur.0, st.cur.1
@@ -4493,6 +4500,7 @@ fn main() {
                         s.panel_dirty = true;
                     } else if s.dragging {
                         if now_down {
+                            logline!("INFO", "poll drag move ({},{}) grab=({:.0},{:.0})", p.x, p.y, s.drag_grab.0, s.drag_grab.1);
                             s.cur = (p.x as f64 - s.drag_grab.0, p.y as f64 - s.drag_grab.1);
                             s.target = s.cur;
                             s.dur_ms = 0.0;
@@ -4500,10 +4508,23 @@ fn main() {
                             s.dirty = true;
                         } else {
                             s.dragging = false;
+                            // 这条轮询路径和热区窗口那条都会处理拖动，松手后的行为必须一致：
+                            // 不恢复权限的话，用户会看到"拖一次就停了"
+                            // 两条拖动路径都会走到这里；prev_permission 被前一条消费掉后
+                            // 是 0，此时绝不能 clamp 成 1 —— 那会把管理员降成只读
+                            let back = if s.prev_permission > 0 {
+                                let b = s.prev_permission;
+                                s.prev_permission = 0;
+                                b
+                            } else {
+                                s.permission
+                            };
+                            s.permission = back;
                             s.drag_feedback = Some(format!(
-                                "用户把 AI 光标放到了 ({:.0}, {:.0})。AI 控制仍是停止状态，需在面板上点「启用」恢复。",
+                                "用户把 AI 光标放到了 ({:.0}, {:.0})，AI 控制已恢复。",
                                 s.cur.0, s.cur.1
                             ));
+                            logline!("INFO", "poll drag end at ({:.0},{:.0}) perm={back}", s.cur.0, s.cur.1);
                             s.dirty = true;
                             s.panel_dirty = true;
                         }

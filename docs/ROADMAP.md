@@ -374,6 +374,13 @@ grab move cursor=(1026,703) → (1050,720)
 **已改**：松手时用 `prev_permission` **自动恢复权限**，拖完不用再点「启用」。
 实测 `ai_mouse_status` → `permission=管理员(3)`，note「AI 控制已恢复」。
 
+**权限恢复本身也有 bug（未修完）**：
+两条拖动路径共享 `prev_permission`，谁先消费谁是 0，另一条再 `clamp(1,3)`
+就会把权限降级。已把两处 `clamp` 都改成"只在 >0 时恢复"，但实测仍出现
+`管理员(3) → 操作(2)`：说明其中一条路径在 `permission` 已被清零后才执行
+`prev_permission = permission.max(2)`，于是记下的是 2。
+**下一版改法**：`prev_permission` 只在当前 `permission > 0` 时才写入。
+
 **仍不稳定**：这一次拖动（(800,560) → (1100,740)）光标**没有跟到位**，
 停在按下时的位置；而上一轮同一条路径是成功的（拖到 1050,720）。
 两次唯一差别是上一次结束后 `want_hide_grab=true` 隐藏了热区。
