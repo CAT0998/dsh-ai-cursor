@@ -191,7 +191,11 @@ unsafe fn draw_dock_surface(cv: &Canvas, count: usize, zoom: f64) {
     let dock_h = sc(DOCK_H);
     let full = rect(0, 0, dock_w, dock_h);
     cv.fill_round(full, sc(12), 0x0B1016);
-    cv.stroke_round(full, sc(12), 0x2A3542, 1);
+    // The 1px border used to be drawn exactly on the antialiased rounded edge and
+    // left a black fringe at the corners; the body colour already separates the
+    // strip from the desktop, so the outline is drawn one pixel inside instead.
+    let inset = rect(1, 1, dock_w - 1, dock_h - 1);
+    cv.stroke_round(inset, sc(12), 0x2A3542, 1);
     cv.text_at(cv.fonts.title, sc(14), sc(10), "停靠站", 0x9FB2C6);
     cv.text_at(cv.fonts.label, dock_w - sc(118), sc(13), "鼠标停靠处", 0x5F7186);
 
