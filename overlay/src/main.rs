@@ -2418,6 +2418,65 @@ unsafe extern "system" fn grab_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
 static DRAG_ORIGIN: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 static DRAG_CORNER: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
+/// Snap the dock flush to a screen edge, or to one of the panel's edges.
+///
+/// Only the DOCK moves. The panel's rect is read, never written: snapping must not
+/// disturb the window we are docking against.
+unsafe fn snap_dock(hwnd: HWND) {
+    let mut r = RECT::default();
+    if GetWindowRect(hwnd, &mut r).is_err() {
+        return;
+    }
+    let w = r.right - r.left;
+    let h = r.bottom - r.top;
+    let sw = GetSystemMetrics(SYSTEM_METRICS_INDEX(SM_CXSCREEN.0));
+    let sh = GetSystemMetrics(SYSTEM_METRICS_INDEX(SM_CYSCREEN.0));
+    const NEAR: i32 = 28;
+
+    let mut xs = vec![8, sw - w - 8];
+    let mut ys = vec![8, sh - h - 8];
+    // the panel is a different process; FindWindow only reads its rect
+    let panel = windows::Win32::UI::WindowsAndMessaging::FindWindowW(w!("AiMousePanel"), PCWSTR::null())
+        .unwrap_or_default();
+    let mut panel_rect = RECT::default();
+    if !panel.0.is_null() && GetWindowRect(panel, &mut panel_rect).is_ok() {
+        xs.push(panel_rect.left - w - 8);
+        xs.push(panel_rect.right + 8);
+        xs.push(panel_rect.left);
+        ys.push(panel_rect.top);
+        ys.push(panel_rect.bottom + 8);
+    }
+
+    let pick = |value: i32, cands: &[i32]| -> i32 {
+        let mut best = value;
+        let mut best_d = NEAR + 1;
+        for c in cands {
+            let d = (value - c).abs();
+            if d <= NEAR && d < best_d {
+                best_d = d;
+                best = *c;
+            }
+        }
+        best
+    };
+    // snap when near an edge, and never leave the window off-screen: a drag can
+    // otherwise park the strip past the bottom edge where it cannot be grabbed again
+    let nx = pick(r.left, &xs).clamp(8, (sw - w - 8).max(8));
+    let ny = pick(r.top, &ys).clamp(8, (sh - h - 8).max(8));
+    if nx != r.left || ny != r.top {
+        let _ = SetWindowPos(
+            hwnd,
+            windows::Win32::UI::WindowsAndMessaging::HWND_TOP,
+            nx,
+            ny,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOACTIVATE | SET_WINDOW_POS_FLAGS(0x0040),
+        );
+        logline!("INFO", "dock snapped ({},{}) -> ({nx},{ny})", r.left, r.top);
+    }
+}
+
 unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     // The dock moves itself; nothing else in this process is draggable.
     if DOCK_MODE.load(std::sync::atomic::Ordering::Relaxed) {
@@ -2461,9 +2520,13 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                 return LRESULT(0);
             }
             WM_LBUTTONUP => {
+                let was_dragging = DRAG_ORIGIN.load(std::sync::atomic::Ordering::Relaxed) != 0;
                 DRAG_ORIGIN.store(0, std::sync::atomic::Ordering::Relaxed);
                 DRAG_CORNER.store(0, std::sync::atomic::Ordering::Relaxed);
                 let _ = ReleaseCapture();
+                if was_dragging {
+                    snap_dock(hwnd);
+                }
                 return LRESULT(0);
             }
             _ => {}
