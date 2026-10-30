@@ -1383,14 +1383,17 @@ unsafe fn make_window(class: PCWSTR, title: PCWSTR, ex: u32, w: i32, h: i32) -> 
 }
 
 unsafe fn make_overlay() -> HWND {
+    let dock = DOCK_MODE.load(std::sync::atomic::Ordering::Relaxed);
+    let mut ex = WS_EX_LAYERED.0 | WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0 | WS_EX_TOPMOST.0;
+    if !dock {
+        // click-through for the cursor; the dock must be draggable, so it takes input
+        ex |= WS_EX_TRANSPARENT.0;
+    }
+    logline!("INFO", "make_overlay dock={dock} ex=0x{ex:X}");
     let hwnd = make_window(
         w!("AiMouseOverlay"),
         w!("AI Mouse Overlay"),
-        WS_EX_LAYERED.0
-            | WS_EX_TRANSPARENT.0
-            | WS_EX_TOOLWINDOW.0
-            | WS_EX_NOACTIVATE.0
-            | WS_EX_TOPMOST.0,
+        ex,
         W,
         H,
     );
@@ -2378,7 +2381,60 @@ unsafe extern "system" fn grab_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }
 
+static DRAG_ORIGIN: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+static DRAG_CORNER: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
 unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // The dock moves itself; nothing else in this process is draggable.
+    if DOCK_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+        match msg {
+            WM_LBUTTONDOWN => {
+                let mut p = POINT::default();
+                let _ = GetCursorPos(&mut p);
+                let mut r = RECT::default();
+                let _ = GetWindowRect(hwnd, &mut r);
+                // both axes: packing only x left the vertical drag dead
+                DRAG_ORIGIN.store(((p.x as i64) << 32) | (p.y as i64 & 0xFFFF_FFFF), std::sync::atomic::Ordering::Relaxed);
+                DRAG_CORNER.store(((r.left as i64) << 32) | (r.top as i64 & 0xFFFF_FFFF), std::sync::atomic::Ordering::Relaxed);
+                let mut r2 = RECT::default();
+                let _ = GetWindowRect(hwnd, &mut r2);
+                let _ = SetCapture(hwnd);
+                logline!("INFO", "dock drag start at ({},{}) win=({},{})", p.x, p.y, r2.left, r2.top);
+                return LRESULT(0);
+            }
+            WM_MOUSEMOVE => {
+                if wparam.0 & 0x0001 != 0 {
+                    let packed = DRAG_ORIGIN.load(std::sync::atomic::Ordering::Relaxed);
+                    let corner = DRAG_CORNER.load(std::sync::atomic::Ordering::Relaxed);
+                    if packed != 0 && corner != 0 {
+                        let sx = (packed >> 32) as i32;
+                        let sy = (packed as u32 as i64) as i32;
+                        let wx = (corner >> 32) as i32;
+                        let wy = (corner as u32 as i64) as i32;
+                        let mut p = POINT::default();
+                        let _ = GetCursorPos(&mut p);
+                        let _ = SetWindowPos(
+                            hwnd,
+                            windows::Win32::UI::WindowsAndMessaging::HWND_TOP,
+                            wx + (p.x - sx),
+                            wy + (p.y - sy),
+                            0,
+                            0,
+                            SWP_NOSIZE | SWP_NOACTIVATE | SET_WINDOW_POS_FLAGS(0x0040),
+                        );
+                    }
+                }
+                return LRESULT(0);
+            }
+            WM_LBUTTONUP => {
+                DRAG_ORIGIN.store(0, std::sync::atomic::Ordering::Relaxed);
+                DRAG_CORNER.store(0, std::sync::atomic::Ordering::Relaxed);
+                let _ = ReleaseCapture();
+                return LRESULT(0);
+            }
+            _ => {}
+        }
+    }
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }
 
@@ -3152,13 +3208,7 @@ fn main() {
                 let h = { st.lock().unwrap().hwnd };
                 unsafe {
                     draw_dock_surface(&dock_cv);
-                    dock_cv.present(
-                        h,
-                        DOCK_W,
-                        DOCK_H,
-                        Some(POINT { x: DOCK_X, y: DOCK_Y }),
-                        1.0,
-                    );
+                    dock_cv.present(h, DOCK_W, DOCK_H, None, 1.0);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(400));
                 continue;
