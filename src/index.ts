@@ -773,7 +773,7 @@ export function apply(ctx: Context, config: ConfigShape): void {
       parameters: {
         action: {
           type: 'string',
-          description: 'save | load | list | show | delete',
+          description: 'save | load | global | list | show | delete (global applies the preset to every cursor)',
         },
         name: { type: 'string', description: 'Preset name (case-insensitive).' },
       },
@@ -820,6 +820,27 @@ export function apply(ctx: Context, config: ConfigShape): void {
           void refreshDock()
           return `已应用预设「${p.name}」（${cmds.length} 项）。`
         }
+        if (action === 'global') {
+          // one look for every cursor: the "global preset" switch
+          const refused = await gate(2, 'ai_mouse_preset')
+          if (refused) return refused
+          const p = findPreset(list, name)
+          if (!p) return `没有名为「${name}」的预设。可用：${list.map((x) => x.name).join(', ') || '空'}`
+          const cmds = presetCommands(p)
+          if (cmds.length === 0) return `预设「${p.name}」是空的，没有可应用的项。`
+          const prev = active
+          let applied = 0
+          for (const [cursorName, ov] of cursors) {
+            active = ov
+            for (const [cmd, payload] of cmds) await send(cmd, payload)
+            meta.set(cursorName, { ...meta.get(cursorName), preset: p.name, color: p.color })
+            applied += 1
+          }
+          active = prev
+          void refreshDock()
+          return `已把预设「${p.name}」应用到 ${applied} 只光标（全局）。`
+        }
+
         if (action === 'delete') {
           const refused = await gate(2, 'ai_mouse_preset')
           if (refused) return refused
