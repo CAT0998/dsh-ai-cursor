@@ -702,14 +702,14 @@ export function apply(ctx: Context, config: ConfigShape): void {
           }))
           let sel = ''
           if (dir) {
-            const stateDir = `${dirname(config.exePath)}/logs`
+            const stateDir = `${dirname(overlay.executable)}/logs`
             const chosen = selectedNames(
               await readBerths(`${dir}/berths.json`),
               await readSelection(`${stateDir}/dock-selection.json`),
             )
             sel = chosen.length
               ? ` | 停靠站里选中：${chosen.join(', ')}`
-              : ' | 停靠站里未选中任何光标'
+              : ` | 停靠站里未选中任何光标（读 ${stateDir}）`
           }
           return `停靠站：开（${dir ? describeBerths(berthsFrom(list)) : '素材目录未配置'}）${sel}`
         }
