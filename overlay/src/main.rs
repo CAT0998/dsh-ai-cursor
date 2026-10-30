@@ -3837,6 +3837,20 @@ fn main() {
             if let Some(cap) = affinity {
                 let current = { st.lock().unwrap().capture_visible };
                 if cap != current {
+                    if !p_full {
+                        // Without recreation the flag still has to be recorded, and the
+                        // existing windows still get the affinity applied - otherwise a
+                        // request made while the panel is a chip is silently dropped.
+                        let flag = if cap { WDA_NONE } else { WDA_EXCLUDEFROMCAPTURE };
+                        let _ = SetWindowDisplayAffinity(hwnd_of(ohwnd), flag);
+                        let _ = SetWindowDisplayAffinity(hwnd_of(phwnd), flag);
+                        let mut s = st.lock().unwrap();
+                        s.capture_visible = cap;
+                        s.dirty = true;
+                        s.panel_dirty = true;
+                        drop(s);
+                        logline!("INFO", "affinity {cap} applied in place (panel not full)");
+                    }
                     if p_full {
                         // recreate both windows: Windows only honours the capture
                         // opt-out once per window.
