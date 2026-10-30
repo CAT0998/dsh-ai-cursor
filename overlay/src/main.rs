@@ -1323,6 +1323,8 @@ struct Slot {
     hotspot: (f64, f64),
     opacity: f64,
     flip_x: bool,
+    /// Rotation in degrees applied to the artwork before pasting.
+    rot: f64,
     last_frame: usize,
 }
 
@@ -1345,6 +1347,7 @@ impl Slot {
             hotspot,
             opacity: 1.0,
             flip_x: false,
+            rot: 0.0,
             last_frame: usize::MAX,
         }
     }
@@ -1537,15 +1540,25 @@ unsafe fn draw_cursor(cv: &Canvas, v: &CursorView) {
             let frame = &spr.frames[spr.frame_at(v.epoch_ms).min(spr.frames.len() - 1)];
             let dx = (TIP_X + slot.offset.0 - slot.hotspot.0 * tw as f64).round() as i32;
             let dy = (TIP_Y + slot.offset.1 - slot.hotspot.1 * th as f64).round() as i32;
+            // 旋转先生成新的帧，再走原来的贴图路径
+            let rotated = if slot.rot.abs() > 0.01 {
+                Some(sprite::rotate_rgba(frame.as_slice(), spr.w, spr.h, slot.rot))
+            } else {
+                None
+            };
+            let (px, pw, ph) = match &rotated {
+                Some((buf, w2, h2)) => (buf.as_slice(), *w2, *h2),
+                None => (frame.as_slice(), spr.w, spr.h),
+            };
             sprite::composite(
                 cv.small_mut(),
                 W,
                 H,
                 dx,
                 dy,
-                frame,
-                spr.w,
-                spr.h,
+                px,
+                pw,
+                ph,
                 tw,
                 th,
                 slot.opacity * alpha,
@@ -1974,6 +1987,7 @@ fn slot_view(slot: &Slot, name: &str) -> SlotView {
         frames: 1,
         error: None,
         offset: slot.offset,
+        rot: slot.rot,
     };
     if slot.is_image() {
         let mut cache = sprites().lock().unwrap();
@@ -2351,6 +2365,10 @@ unsafe fn slider_value(st: &mut St, id: &str, x: i32, hits: &[Hit]) {
         "art_size" => {
             let i = st.art_sel.min(2);
             st.slots[i].size = (8.0 + t * 248.0).round();
+        }
+        "art_rot" => {
+            let i = st.art_sel.min(2);
+            st.slots[i].rot = (-180.0 + t * 360.0).round();
         }
         "art_offx" => {
             let i = st.art_sel.min(2);

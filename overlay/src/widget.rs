@@ -156,6 +156,7 @@ pub struct SlotView {
     pub frames: usize,
     pub error: Option<String>,
     pub offset: (f64, f64),
+    pub rot: f64,
 }
 
 pub const SWATCHES: [u32; 8] = [

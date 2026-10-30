@@ -283,3 +283,39 @@ pub fn composite(
         }
     }
 }
+
+/// Rotate an RGBA frame by `deg` degrees about its centre, returning a new
+/// buffer sized to the rotated bounding box.
+///
+/// Deliberately separate from `composite`: rotating the source once and letting the
+/// existing scaler paste it keeps the tested path untouched, and these frames are
+/// small enough that the extra copy does not matter.
+pub fn rotate_rgba(src: &[u8], sw: u32, sh: u32, deg: f64) -> (Vec<u8>, u32, u32) {
+    if deg.abs() < 0.01 || sw == 0 || sh == 0 {
+        return (src.to_vec(), sw, sh);
+    }
+    let rad = deg.to_radians();
+    let (sin, cos) = (rad.sin(), rad.cos());
+    let (fw, fh) = (sw as f64, sh as f64);
+    let nw = (fw * cos.abs() + fh * sin.abs()).ceil().max(1.0) as u32;
+    let nh = (fw * sin.abs() + fh * cos.abs()).ceil().max(1.0) as u32;
+    let mut out = vec![0u8; (nw * nh * 4) as usize];
+    let (cx, cy) = (fw / 2.0, fh / 2.0);
+    let (ncx, ncy) = (nw as f64 / 2.0, nh as f64 / 2.0);
+    for y in 0..nh {
+        for x in 0..nw {
+            // inverse-rotate the destination pixel back into the source
+            let dx = x as f64 + 0.5 - ncx;
+            let dy = y as f64 + 0.5 - ncy;
+            let sx = dx * cos + dy * sin + cx;
+            let sy = -dx * sin + dy * cos + cy;
+            if sx < 0.0 || sy < 0.0 || sx >= fw || sy >= fh {
+                continue;
+            }
+            let si = ((sy as u32 * sw + sx as u32) * 4) as usize;
+            let di = ((y * nw + x) * 4) as usize;
+            out[di..di + 4].copy_from_slice(&src[si..si + 4]);
+        }
+    }
+    (out, nw, nh)
+}

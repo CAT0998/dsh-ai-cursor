@@ -556,7 +556,7 @@ fn body_artwork(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
     );
     y += 20;
 
-    let rows2: [(&'static str, &str, f64, String); 4] = [
+    let rows2: [(&'static str, &str, f64, String); 5] = [
         (
             "art_size",
             "大小",
@@ -574,6 +574,12 @@ fn body_artwork(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
             "纵向",
             ((slot.offset.1 + 200.0) / 400.0).clamp(0.0, 1.0),
             format!("{:.0}", slot.offset.1),
+        ),
+        (
+            "art_rot",
+            "旋转",
+            ((slot.rot + 180.0) / 360.0).clamp(0.0, 1.0),
+            format!("{:.0}°", slot.rot),
         ),
         (
             "art_opacity",
