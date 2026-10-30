@@ -2049,7 +2049,11 @@ fn on_toggle(st: &mut St, id: &str) {
             st.dirty = true;
         }
         "stop" => {
-            st.prev_permission = st.permission.max(2);
+            // 只在当前还有权限时记录。另一条拖动路径可能已经把它清零，
+            // 此时 max(2) 会把"管理员"记成 2，松手后就降级了。
+            if st.permission > 0 {
+                st.prev_permission = st.permission.max(2);
+            }
             st.permission = 0;
             st.visible = false;
             st.want_hide = true;
@@ -2199,7 +2203,11 @@ fn on_toggle(st: &mut St, id: &str) {
                     }
                     None => logline!("ERROR", "stop_all: no command file configured"),
                 }
+                // 只在当前还有权限时记录。另一条拖动路径可能已经把它清零，
+            // 此时 max(2) 会把"管理员"记成 2，松手后就降级了。
+            if st.permission > 0 {
                 st.prev_permission = st.permission.max(2);
+            }
                 st.permission = 0;
                 st.dirty = true;
             } else if id == "map_window_toggle" {
@@ -2302,7 +2310,11 @@ fn on_toggle(st: &mut St, id: &str) {
             } else if let Some(rest) = id.strip_prefix("perm_") {
                 let lvl: u8 = rest.parse().unwrap_or(3).min(3);
                 if lvl == 0 {
-                    st.prev_permission = st.permission.max(2);
+                    // 只在当前还有权限时记录。另一条拖动路径可能已经把它清零，
+            // 此时 max(2) 会把"管理员"记成 2，松手后就降级了。
+            if st.permission > 0 {
+                st.prev_permission = st.permission.max(2);
+            }
                     st.permission = 0;
                     st.visible = false;
                     st.want_hide = true;
@@ -2901,7 +2913,11 @@ unsafe extern "system" fn grab_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                 st.grabbed = true;
                 st.dragging = true;
                 st.drag_grab = (p.x as f64 - st.cur.0, p.y as f64 - st.cur.1);
+                // 只在当前还有权限时记录。另一条拖动路径可能已经把它清零，
+            // 此时 max(2) 会把"管理员"记成 2，松手后就降级了。
+            if st.permission > 0 {
                 st.prev_permission = st.permission.max(2);
+            }
                 st.permission = 0;
                 logline!(
                     "INFO",
@@ -3542,7 +3558,11 @@ fn handle_line(line: &str) {
                     out["error"] = serde_json::json!("no command file configured");
                 }
             }
-            st.prev_permission = st.permission.max(2);
+            // 只在当前还有权限时记录。另一条拖动路径可能已经把它清零，
+            // 此时 max(2) 会把"管理员"记成 2，松手后就降级了。
+            if st.permission > 0 {
+                st.prev_permission = st.permission.max(2);
+            }
             st.permission = 0;
             st.dirty = true;
         }
@@ -3567,7 +3587,11 @@ fn handle_line(line: &str) {
             // back to the berth and stop driving: the agent is done for now
             let (tx, ty) = (v.get("x").and_then(|x| x.as_f64()), v.get("y").and_then(|x| x.as_f64()));
             st.resting = true;
-            st.prev_permission = st.permission.max(2);
+            // 只在当前还有权限时记录。另一条拖动路径可能已经把它清零，
+            // 此时 max(2) 会把"管理员"记成 2，松手后就降级了。
+            if st.permission > 0 {
+                st.prev_permission = st.permission.max(2);
+            }
             st.permission = 0;
             st.drag_feedback = Some("已回站休整，AI 控制已停止。".to_string());
             if let (Some(x), Some(y)) = (tx, ty) {
@@ -3700,7 +3724,11 @@ fn handle_line(line: &str) {
                 let lvl = (lvl.min(3)) as u8;
                 if lvl <= st.permission {
                     if lvl == 0 {
-                        st.prev_permission = st.permission.max(2);
+                        // 只在当前还有权限时记录。另一条拖动路径可能已经把它清零，
+            // 此时 max(2) 会把"管理员"记成 2，松手后就降级了。
+            if st.permission > 0 {
+                st.prev_permission = st.permission.max(2);
+            }
                         st.visible = false;
                         st.want_hide = true;
                     }
@@ -3717,7 +3745,11 @@ fn handle_line(line: &str) {
             }
         }
         "pause" => {
-            st.prev_permission = st.permission.max(2);
+            // 只在当前还有权限时记录。另一条拖动路径可能已经把它清零，
+            // 此时 max(2) 会把"管理员"记成 2，松手后就降级了。
+            if st.permission > 0 {
+                st.prev_permission = st.permission.max(2);
+            }
             st.permission = 0;
             st.visible = false;
             st.want_hide = true;
@@ -4499,7 +4531,11 @@ fn main() {
                         s.drag_feedback = Some("用户按住了 AI 光标，AI 控制已立即停止，正在拖动。".to_string());
                         s.panel_dirty = true;
                     } else if s.dragging {
-                        if now_down {
+                        // 热区那条路径已经接管了这次拖动时，轮询不能再动 st.cur：
+                        // 它的 drag_grab 是 (0,0)，每帧都会把位置覆盖回按下点
+                        if s.dragging {
+                            // 热区在管，这里什么都不做
+                        } else if now_down {
                             logline!("INFO", "poll drag move ({},{}) grab=({:.0},{:.0})", p.x, p.y, s.drag_grab.0, s.drag_grab.1);
                             s.cur = (p.x as f64 - s.drag_grab.0, p.y as f64 - s.drag_grab.1);
                             s.target = s.cur;
