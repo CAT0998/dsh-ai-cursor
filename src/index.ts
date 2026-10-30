@@ -83,7 +83,16 @@ export function apply(ctx: Context, config: ConfigShape): void {
   if (!config.enabled) return
 
   const overlay = new Overlay(config.exePath)
-  ctx.effect(() => () => overlay.dispose())
+  /**
+   * One cursor per entry. The first is the long-standing default; extra ones are
+   * separate processes, so each has its own window, state and configuration —
+   * that is what lets a subagent have a cursor of its own.
+   */
+  const cursors = new Map<string, Overlay>([['default', overlay]])
+  let active: Overlay = overlay
+  ctx.effect(() => () => {
+    for (const c of cursors.values()) c.dispose()
+  })
 
   /**
    * Last permission level the overlay reported. Every reply carries it, so this
@@ -101,7 +110,7 @@ export function apply(ctx: Context, config: ConfigShape): void {
     payload: Record<string, unknown> = {},
     timeoutMs?: number,
   ): Promise<OverlayStatus> => {
-    const reply = await overlay.request(cmd, payload, timeoutMs)
+    const reply = await active.request(cmd, payload, timeoutMs)
     if (typeof reply.permission === 'number') {
       state.permission = normalizeLevel(reply.permission, 3)
     }
@@ -148,7 +157,7 @@ export function apply(ctx: Context, config: ConfigShape): void {
 
   const refreshLevel = async (): Promise<number> => {
     try {
-      const reply = await overlay.request('status')
+      const reply = await active.request('status')
       if (typeof reply.permission === 'number') {
         state.permission = normalizeLevel(reply.permission, 3)
       }
@@ -173,8 +182,8 @@ export function apply(ctx: Context, config: ConfigShape): void {
   const prime = async (): Promise<void> => {
     // Re-apply whenever the child process is replaced: a fresh process starts
     // with defaults, so the old "primed" state must not short-circuit.
-    if (primedGeneration === overlay.generation) return
-    primedGeneration = overlay.generation
+    if (primedGeneration === active.generation) return
+    primedGeneration = active.generation
     await send('idle', { idle_ms: config.idleMs })
     await send('affinity', { capture_visible: config.captureVisible })
     await send('label', { text: config.label })
@@ -620,6 +629,80 @@ export function apply(ctx: Context, config: ConfigShape): void {
   )
 
   // --------------------------------------------------------------- layers ---
+
+  ctx.tools.register(
+    defineTool({
+      name: 'ai_mouse_cursor',
+      description:
+        'Manage AI cursors: each one is a separate process with its own window, position, look and configuration, so every subagent can have a cursor of its own. `create` makes one (optionally applying a saved preset to it) and switches to it; `use` switches which cursor the other ai_mouse_* tools act on; `list` shows them; `kill` closes one.',
+      parameters: {
+        action: { type: 'string', description: 'create | use | list | kill' },
+        name: { type: 'string', description: 'Cursor name (default "default").' },
+        preset: { type: 'string', description: 'Preset to apply when creating.' },
+      },
+      output: TEXT_OUTPUT,
+      async execute(args: { action?: string; name?: string; preset?: string }) {
+        const action = (args.action ?? 'list').toLowerCase()
+        const name = (args.name ?? 'default').trim() || 'default'
+
+        if (action === 'list') {
+          const names = [...cursors.keys()]
+          return `共 ${names.length} 只光标：${names
+            .map((k) => (k === name || cursors.get(k) === active ? `${k}（当前）` : k))
+            .join(', ')}`
+        }
+
+        if (action === 'use') {
+          const target = cursors.get(name)
+          if (!target) return `没有名为「${name}」的光标。现有：${[...cursors.keys()].join(', ')}`
+          active = target
+          primedGeneration = -1
+          await prime()
+          return describeStatus(await send('status'))
+        }
+
+        if (action === 'kill') {
+          if (name === 'default') return '默认光标不能删除。'
+          const target = cursors.get(name)
+          if (!target) return `没有名为「${name}」的光标。`
+          target.dispose()
+          cursors.delete(name)
+          if (active === target) {
+            active = overlay
+            primedGeneration = -1
+            await prime()
+          }
+          return `已关闭光标「${name}」。`
+        }
+
+        if (action === 'create') {
+          const refused = await gate(2, 'ai_mouse_cursor')
+          if (refused) return refused
+          if (cursors.has(name)) return `光标「${name}」已存在，用 ai_mouse_cursor { action: "use", name } 切换过去。`
+          const fresh = new Overlay(config.exePath)
+          cursors.set(name, fresh)
+          active = fresh
+          primedGeneration = -1
+          await prime()
+          let applied = ''
+          if (args.preset) {
+            const dir = (config.assetDir || '').replace(/[\/]+$/, '')
+            if (dir) {
+              const p = findPreset(await loadPresets(`${dir}/presets.json`), args.preset)
+              if (p) {
+                for (const [cmd, payload] of presetCommands(p)) await send(cmd, payload)
+                applied = `，已套用预设「${p.name}」`
+              } else {
+                applied = `，但没有预设「${args.preset}」`
+              }
+            }
+          }
+          return `已创建光标「${name}」${applied}。${describeStatus(await send('status'))}`
+        }
+        return `未知 action：${action}（可用 create / use / list / kill）`
+      },
+    }),
+  )
 
   ctx.tools.register(
     defineTool({
