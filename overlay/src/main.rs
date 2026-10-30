@@ -368,6 +368,7 @@ fn berths() -> &'static std::sync::Mutex<Vec<Berth>> {
 /// font scale, so the strip scales as a whole - the same rule as the panel: the
 /// geometry is authored once and multiplied, never stretched afterwards.
 unsafe fn draw_dock_surface(cv: &Canvas, count: usize, zoom: f64) {
+    cv.clear();
     let z = zoom.clamp(0.6, 2.0);
     let sc = |v: i32| (v as f64 * z).round() as i32;
     let dock_w = dock_width_z(count, z);
@@ -467,6 +468,7 @@ unsafe fn draw_dock_surface(cv: &Canvas, count: usize, zoom: f64) {
 }
 
 unsafe fn draw_map_surface(cv: &Canvas, cx: i32, cy: i32, accent: u32) {
+    cv.clear();
     let full = rect(0, 0, MAP_W, MAP_H);
     cv.fill_round(full, 10, 0x0B1016);
     cv.stroke_round(full, 10, 0x2A3542, 1);

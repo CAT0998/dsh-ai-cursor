@@ -265,7 +265,9 @@ struct Layout {
 | 预设编辑器（保存/删除/导出/载入） | `presets.ts` 已有 save/load/list/delete/group；缺「导出到文件」「从文件导入」两个动作和面板上的编辑 UI |
 | P8 DSH 侧边栏 | 未开始。属于 DSH client plugin，与本仓库的浮层是两套工程 |
 | P9 线程/渲染优化 | 未开始。**先量 CPU**（空闲/动图/拖动）再决定；解码与合成移出主循环是第一步 |
-| 停靠站圆角黑边 | 已排除文字背景、描边、机身、清屏色；下一步打印 canvas 尺寸 vs compose 尺寸对照 |
+| 停靠站圆角黑边 | ✅ **已修复**：`draw_dock_surface` 与 `draw_map_surface` 忘了先 `cv.clear()`，
+画布初始是全黑（alpha 0），圆角外侧的像素从未被刷成透明键色，`compose` 就当成不透明 →
+纯黑三角。补上 `cv.clear()` 后实测纯黑像素 8~10 → **0** |
 
 ### 本轮发现的三个"看不见的坑"（都已记进 LESSONS）
 1. **cargo 假成功**：源码 mtime 比产物旧 → 跳过编译 → 打印 `Finished in 0.1s`，实际跑的是旧代码
