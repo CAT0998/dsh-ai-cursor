@@ -246,6 +246,23 @@ fn body_actions(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
     );
     out.push(
         Hit::new(
+            rect(l.pad(), y + l.sc(30), l.pad() + l.sc(120), y + l.sc(56)),
+            Kind::Button,
+            "stop_all",
+        )
+        .text("停止全部")
+        .hover(hov(v, "stop_all")),
+    );
+    out.push(
+        Hit::new(
+            rect(l.pad() + l.sc(128), y + l.sc(35), l.content_right(), y + l.sc(53)),
+            Kind::Label,
+            "l_stop_all_hint",
+        )
+        .text("停掉所有 AI 鼠标"),
+    );
+    out.push(
+        Hit::new(
             rect(l.pad() + l.sc(140), y, l.content_right(), y + l.sc(18)),
             Kind::Label,
             "l_drag_hint",
@@ -256,7 +273,7 @@ fn body_actions(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
             "按住光标即可用真实鼠标拖动它"
         }),
     );
-    y + l.sc(28)
+    y + l.sc(62)
 }
 
 fn body_appearance(v: &PanelView, x: i32, y: i32, out: &mut Vec<Hit>) -> i32 {

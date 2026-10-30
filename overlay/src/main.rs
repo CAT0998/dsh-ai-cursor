@@ -555,6 +555,7 @@ struct St {
     /// Which berth this cursor belongs to, and where to watch for dock commands.
     cursor_index: usize,
     command_file: Option<String>,
+    last_cmd_epoch: u64,
     /// The human may grab the AI cursor with their own pointer.
     drag_enabled: bool,
     dragging: bool,
@@ -655,6 +656,7 @@ impl St {
             resting: false,
             cursor_index: 0,
             command_file: None,
+            last_cmd_epoch: 0,
             drag_enabled: true,
             dragging: false,
             drag_grab: (0.0, 0.0),
@@ -1846,7 +1848,30 @@ fn on_toggle(st: &mut St, id: &str) {
             st.dirty = true;
         }
         _ => {
-            if id == "map_window_toggle" {
+            if id == "stop_all" {
+                // broadcast through the same file the dock uses; every cursor process
+                // stops itself once per epoch
+                match st.command_file.clone() {
+                    Some(path) => {
+                        let epoch = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+                        let body = serde_json::json!({
+                            "action": "stop_all", "epoch": epoch
+                        })
+                        .to_string();
+                        match std::fs::write(&path, body) {
+                            Ok(_) => logline!("INFO", "stop_all broadcast epoch={epoch} -> {path}"),
+                            Err(e) => logline!("ERROR", "stop_all write failed: {e}"),
+                        }
+                    }
+                    None => logline!("ERROR", "stop_all: no command file configured"),
+                }
+                st.prev_permission = st.permission.max(2);
+                st.permission = 0;
+                st.dirty = true;
+            } else if id == "map_window_toggle" {
                 match st.map_proc.take() {
                     Some(c) => {
                         if let Ok(mut ch) = c.lock() {
@@ -3606,6 +3631,24 @@ fn main() {
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
                             let idx = v.get("index").and_then(|x| x.as_u64()).unwrap_or(9999) as usize;
                             let action = v.get("action").and_then(|x| x.as_str()).unwrap_or("");
+                            let epoch = v.get("epoch").and_then(|x| x.as_u64()).unwrap_or(0);
+                            if action == "stop_all" && epoch != 0 {
+                                let mut s = st.lock().unwrap();
+                                if s.last_cmd_epoch != epoch {
+                                    s.last_cmd_epoch = epoch;
+                                    // stop this cursor; the others stop themselves when
+                                    // they see the same epoch
+                                    s.prev_permission = s.permission.max(2);
+                                    s.permission = 0;
+                                    s.drag_feedback =
+                                        Some("用户从菜单栏停止了所有 AI 鼠标。".to_string());
+                                    s.dirty = true;
+                                    s.panel_dirty = true;
+                                    drop(s);
+                                    logline!("INFO", "stop_all epoch={epoch} applied");
+                                }
+                                continue;
+                            }
                             if idx == my_index && action == "rest" {
                                 let tx = v.get("x").and_then(|x| x.as_f64()).unwrap_or(0.0);
                                 let ty = v.get("y").and_then(|x| x.as_f64()).unwrap_or(0.0);
