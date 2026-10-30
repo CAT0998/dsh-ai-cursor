@@ -1551,8 +1551,12 @@ fn panel_height(v: &PanelView) -> i32 {
     if !v.full {
         return CHIP_H;
     }
+    // build() returns a SCALED bottom, but callers multiply by the zoom again when
+    // they size the canvas, so convert back to the design height here. Without
+    // this the panel got scaled twice and came out short.
+    let z = v.zoom.clamp(0.6, 2.0);
     let mut sink: Vec<Hit> = Vec::new();
-    let bottom = sections::build(v, 48, &mut sink);
+    let bottom = (sections::build(v, 48, &mut sink) as f64 / z).round() as i32;
     (bottom + 30).clamp(160, PH_MAX)
 }
 
