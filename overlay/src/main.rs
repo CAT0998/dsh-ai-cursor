@@ -216,8 +216,12 @@ fn dock_write_command(action: &str, index: usize, win_left: i32, win_top: i32, c
     let x = win_left + bx + bw / 2;
     let y = win_top + sc(40) + sc(32);
     if let Some(out) = dock_command_path() {
+        let epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
         let body = serde_json::json!({
-            "action": action, "index": index, "x": x, "y": y, "count": count
+            "action": action, "index": index, "x": x, "y": y, "count": count, "epoch": epoch
         })
         .to_string();
         match std::fs::write(&out, body) {
@@ -567,6 +571,9 @@ struct St {
     cursor_index: usize,
     command_file: Option<String>,
     last_cmd_epoch: u64,
+    /// Process start time, so a command file left over from an earlier run is
+    /// ignored instead of being replayed on startup.
+    started_ms: u64,
     /// The human may grab the AI cursor with their own pointer.
     drag_enabled: bool,
     dragging: bool,
@@ -668,6 +675,10 @@ impl St {
             cursor_index: 0,
             command_file: None,
             last_cmd_epoch: 0,
+            started_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
             drag_enabled: true,
             dragging: false,
             drag_grab: (0.0, 0.0),
@@ -3675,6 +3686,14 @@ fn main() {
                             let idx = v.get("index").and_then(|x| x.as_u64()).unwrap_or(9999) as usize;
                             let action = v.get("action").and_then(|x| x.as_str()).unwrap_or("");
                             let epoch = v.get("epoch").and_then(|x| x.as_u64()).unwrap_or(0);
+                            let fresh = {
+                                let s = st.lock().unwrap();
+                                epoch > s.started_ms
+                            };
+                            if !fresh {
+                                // stale command from an earlier run: ignore it
+                                continue;
+                            }
                             if action == "stop_all" && epoch != 0 {
                                 let mut s = st.lock().unwrap();
                                 if s.last_cmd_epoch != epoch {
