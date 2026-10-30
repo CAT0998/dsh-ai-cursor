@@ -40,7 +40,7 @@ import {
   savePresets,
   upsertPreset,
 } from './presets'
-import { berthsFrom, describeBerths, writeBerths } from './dock'
+import { berthsFrom, describeBerths, readBerths, readSelection, selectedNames, writeBerths } from './dock'
 export type { InterceptMode } from './intercept'
 export type { OverlayStatus } from './overlay'
 
@@ -699,7 +699,17 @@ export function apply(ctx: Context, config: ConfigShape): void {
             color: meta.get(name)?.color,
             preset: meta.get(name)?.preset,
           }))
-          return `停靠站：开（${dir ? describeBerths(berthsFrom(list)) : '素材目录未配置'}）`
+          let sel = ''
+          if (dir) {
+            const chosen = selectedNames(
+              await readBerths(`${dir}/berths.json`),
+              await readSelection(`${dir}/dock-selection.json`),
+            )
+            sel = chosen.length
+              ? ` | 停靠站里选中：${chosen.join(', ')}`
+              : ' | 停靠站里未选中任何光标'
+          }
+          return `停靠站：开（${dir ? describeBerths(berthsFrom(list)) : '素材目录未配置'}）${sel}`
         }
         const refused = await gate(2, 'ai_mouse_dock')
         if (refused) return refused

@@ -5,7 +5,7 @@
  * Writing a file instead of holding a pipe open is what makes this survive a
  * restart, a crash or a second plugin instance — nothing has to stay connected.
  */
-import { mkdir, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 
 export interface Berth {
@@ -76,4 +76,48 @@ export function describeBerths(berths: Berth[]): string {
         : `${i + 1}号位 空闲`,
     )
     .join('  |  ')
+}
+
+/** The dock publishes the berth indices the user selected. */
+export interface DockSelection {
+  selected: number[]
+}
+
+export async function readSelection(file: string): Promise<number[]> {
+  try {
+    const raw = await readFile(file, 'utf8')
+    const parsed = JSON.parse(raw) as DockSelection
+    const list = Array.isArray(parsed.selected) ? parsed.selected : []
+    return list
+      .map((x) => Number(x))
+      .filter((x) => Number.isInteger(x) && x >= 0)
+  } catch {
+    // no selection file yet, or a half-written one: an empty selection is correct
+    return []
+  }
+}
+
+export async function readBerths(file: string): Promise<Berth[]> {
+  try {
+    const raw = await readFile(file, 'utf8')
+    const parsed = JSON.parse(raw) as unknown
+    return Array.isArray(parsed) ? (parsed as Berth[]) : []
+  } catch {
+    return []
+  }
+}
+
+/**
+ * Map the dock's selected berth indices to the cursors behind them.
+ *
+ * The dock only knows positions, so the names come from the berth file — the same
+ * order it was published in.
+ */
+export function selectedNames(berths: Berth[], selected: number[]): string[] {
+  const names: string[] = []
+  for (const i of selected) {
+    const b = berths[i]
+    if (b && b.occupied && b.agent && !names.includes(b.agent)) names.push(b.agent)
+  }
+  return names
 }
