@@ -2521,7 +2521,13 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
             }
             WM_MOUSEWHEEL => {
                 // a wheel over the dock zooms it: no grip to hunt for
-                let delta = ((wparam.0 >> 16) & 0xFFFF) as i16 as f64 / 120.0;
+                // rule 1: log the RAW value first, derive afterwards
+                let raw = wparam.0;
+                let lo = (raw & 0xFFFF) as i32;
+                let hi = ((raw >> 16) & 0xFFFF) as i32;
+                let hi_signed = hi as i16 as i32;
+                logline!("INFO", "wheel raw=0x{raw:X} usize={raw} lo={lo} hi={hi} hi_signed={hi_signed}");
+                let delta = hi_signed as f64 / 120.0;
                 let cur = DOCK_ZOOM.load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0;
                 let next = (cur + delta * 0.1).clamp(0.6, 2.0);
                 DOCK_ZOOM.store((next * 100.0).round() as i32, std::sync::atomic::Ordering::Relaxed);
