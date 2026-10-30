@@ -86,8 +86,19 @@ const GRAB: i32 = 40; // side of the clickable grab hotspot at the cursor tip
 /// The minimap runs as a second instance of this binary (`--map`), drawn into the
 /// same window class that already works instead of a new one.
 const DOCK_W: i32 = 430;
-const DOCK_H: i32 = 208;
 const DOCK_SLOTS: usize = 5;
+/// Berth geometry, all derived from the count so the strip always fits.
+const BERTH_W: i32 = 76;
+const BERTH_GAP: i32 = 8;
+const DOCK_PAD: i32 = 12;
+const DOCK_MIN: usize = 3;
+const DOCK_MAX: usize = 12;
+const DOCK_H: i32 = 208;
+
+fn dock_width(n: usize) -> i32 {
+    let n = n.clamp(DOCK_MIN, DOCK_MAX) as i32;
+    DOCK_PAD * 2 + n * BERTH_W + (n - 1) * BERTH_GAP
+}
 const DOCK_X: i32 = 1068;
 const DOCK_Y: i32 = 700;
 
@@ -115,26 +126,41 @@ struct Berth {
 }
 
 static BERTHS: std::sync::OnceLock<std::sync::Mutex<Vec<Berth>>> = std::sync::OnceLock::new();
+
+/// Berth count from the published file; the dock sizes itself from this.
+fn dock_berth_count() -> usize {
+    let Some(path) = DOCK_FILE.get() else {
+        return DOCK_MIN;
+    };
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return DOCK_MIN;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return DOCK_MIN;
+    };
+    v.as_array().map(|a| a.len()).unwrap_or(DOCK_MIN).clamp(DOCK_MIN, DOCK_MAX)
+}
 /// Optional berth file, set with `--slots <path>`.
 static DOCK_FILE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 fn berths() -> &'static std::sync::Mutex<Vec<Berth>> {
-    BERTHS.get_or_init(|| std::sync::Mutex::new(vec![Berth::default(); DOCK_SLOTS]))
+    BERTHS.get_or_init(|| std::sync::Mutex::new(vec![Berth::default(); DOCK_MAX]))
 }
 
-unsafe fn draw_dock_surface(cv: &Canvas) {
-    let full = rect(0, 0, DOCK_W, DOCK_H);
+unsafe fn draw_dock_surface(cv: &Canvas, count: usize) {
+    let dock_w = dock_width(count);
+    let full = rect(0, 0, dock_w, DOCK_H);
     cv.fill_round(full, 12, 0x0B1016);
     cv.stroke_round(full, 12, 0x2A3542, 1);
     cv.text_at(cv.fonts.title, 14, 10, "停靠站", 0x9FB2C6);
-    cv.text_at(cv.fonts.label, DOCK_W - 118, 13, "鼠标停靠处", 0x5F7186);
+    cv.text_at(cv.fonts.label, dock_w - 118, 13, "鼠标停靠处", 0x5F7186);
 
     let mut held: Vec<Berth> = berths().lock().map(|b| b.clone()).unwrap_or_default();
     if let Some(path) = DOCK_FILE.get() {
         if let Ok(raw) = std::fs::read_to_string(path) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
                 if let Some(list) = v.as_array() {
-                    for (i, b) in held.iter_mut().enumerate().take(DOCK_SLOTS) {
+                    for (i, b) in held.iter_mut().enumerate().take(DOCK_MAX) {
                         match list.get(i) {
                             Some(slot) => {
                                 *b = Berth {
@@ -151,10 +177,10 @@ unsafe fn draw_dock_surface(cv: &Canvas) {
             }
         }
     }
-    let pad = 12;
-    let gap = 8;
-    let w = (DOCK_W - pad * 2 - gap * (DOCK_SLOTS as i32 - 1)) / DOCK_SLOTS as i32;
-    for i in 0..DOCK_SLOTS {
+    let pad = DOCK_PAD;
+    let gap = BERTH_GAP;
+    let w = BERTH_W;
+    for i in 0..count.clamp(DOCK_MIN, DOCK_MAX) {
         let x = pad + i as i32 * (w + gap);
         let y = 40;
         let berth = rect(x, y, x + w, y + 64);
@@ -2735,7 +2761,7 @@ fn handle_line(line: &str) {
         "dock_slots" => {
             if let Some(list) = v.get("slots").and_then(|x| x.as_array()) {
                 if let Ok(mut berths) = berths().lock() {
-                    for (i, b) in berths.iter_mut().enumerate().take(DOCK_SLOTS) {
+                    for (i, b) in berths.iter_mut().enumerate().take(DOCK_MAX) {
                         match list.get(i) {
                             Some(slot) => {
                                 let agent = slot
@@ -3134,7 +3160,8 @@ fn main() {
 
         let cursor_cv = Canvas::new(W, H, SS);
         let map_cv = Canvas::new(MAP_W, MAP_H, SS);
-        let dock_cv = Canvas::new(DOCK_W, DOCK_H, SS);
+        let mut dock_cv = Canvas::new(DOCK_W, DOCK_H, SS);
+        let mut dock_cv_w = DOCK_W;
         let mut panel_cv = Canvas::new_scaled(
             PW,
             PH_MAX,
@@ -3206,9 +3233,29 @@ fn main() {
 
             if DOCK_MODE.load(std::sync::atomic::Ordering::Relaxed) {
                 let h = { st.lock().unwrap().hwnd };
+                let count = dock_berth_count();
+                let want_w = dock_width(count);
                 unsafe {
-                    draw_dock_surface(&dock_cv);
-                    dock_cv.present(h, DOCK_W, DOCK_H, None, 1.0);
+                    if want_w != dock_cv_w {
+                        // canvas and window both follow the berth count, so adding
+                        // cursors grows the strip instead of overflowing it
+                        dock_cv = Canvas::new(want_w, DOCK_H, SS);
+                        dock_cv_w = want_w;
+                        let mut r = RECT::default();
+                        let _ = GetWindowRect(hwnd_of(h), &mut r);
+                        let _ = SetWindowPos(
+                            hwnd_of(h),
+                            windows::Win32::UI::WindowsAndMessaging::HWND_TOP,
+                            r.left,
+                            r.top,
+                            want_w,
+                            DOCK_H,
+                            SWP_NOACTIVATE | SET_WINDOW_POS_FLAGS(0x0040),
+                        );
+                        logline!("INFO", "dock resize to {want_w}x{DOCK_H} for {count} berths");
+                    }
+                    draw_dock_surface(&dock_cv, count);
+                    dock_cv.present(h, want_w, DOCK_H, None, 1.0);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(400));
                 continue;
