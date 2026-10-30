@@ -62,6 +62,17 @@ tray icon added: false err=5 hwnd=HWND(0xd0716) hicon=HICON(0x1002b) cbsize=976
 2. 放弃托盘，改用停靠站/小地图表示"正在运行"（已具备）
 3. 继续查：确认窗口是否与 explorer 在同一 window station/desktop
 
+### 3f. 小地图三条（2026-10-30 修）
+1. **不可拖动**：重画循环每 200ms 调 `present(..., Some(POINT{MAP_X, MAP_Y}))`，
+   把窗口拽回常量位置——拖动其实是生效的，只是立刻被弹回。改用 `MAP_POS` 原子量。
+2. **不可交互**：`if !dock { WS_EX_TRANSPARENT }` 把光标和小地图一起设成点击穿透。
+   改成 `dock || MAP_MODE` 时才可交互。
+3. **看不见内容**：桌面框 `0x2A3542`、窗口块 `0x1D2733` 压在 `0x0B1016` 上几乎无色差。
+   改为填 `0x141C26` + 描边 `0x4A637D`，窗口块 `0x2E4159` + 描边 `0x3F5672`。
+
+**遗留**：`--map` 进程有自己的 St，没人给它喂光标位置，所以蓝点永远在左上角。
+要么让插件周期性 `move`，要么在小地图里读全局光标（`GetCursorPos` 更简单）。
+
 ### 4. `compose()` 只能产出画布自己的宽度
 ```rust
 let stride_big = self.w * self.ss;   // 绑死画布尺寸

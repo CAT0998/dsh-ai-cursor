@@ -115,6 +115,9 @@ const MAP_H: i32 = 260;
 const MAP_X: i32 = 64;
 const MAP_Y: i32 = 64;
 
+/// Where the minimap currently sits. The redraw loop used to pin it to the constants
+/// every 200ms, which is why dragging it looked like nothing happened.
+static MAP_POS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 static MAP_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static DOCK_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// 托盘模式：只放一个通知区图标表示"AI 鼠标正在运行"，不做别的。
@@ -565,7 +568,10 @@ unsafe fn draw_map_surface(cv: &Canvas, cx: i32, cy: i32, accent: u32) {
     let mx = |x: i32| ox + (x as f64 * k) as i32;
     let my = |y: i32| oy + (y as f64 * k) as i32;
 
-    cv.stroke_round(rect(ox, oy, mx(sw as i32), my(sh as i32)), 3, 0x2A3542, 1);
+    // 桌面范围：填一层比背景亮的底，再描一圈，否则 0x2A3542 压在 0x0B1016 上等于看不见
+    let screen_rect = rect(ox, oy, mx(sw as i32), my(sh as i32));
+    cv.fill_round(screen_rect, 3, 0x141C26);
+    cv.stroke_round(screen_rect, 3, 0x4A637D, 1);
     for (wx, wy, ww, wh) in top_window_rects(10) {
         cv.fill_round(
             rect(
@@ -575,7 +581,18 @@ unsafe fn draw_map_surface(cv: &Canvas, cx: i32, cy: i32, accent: u32) {
                 my(wy + wh).max(my(wy) + 1),
             ),
             2,
-            0x1D2733,
+            0x2E4159,
+        );
+        cv.stroke_round(
+            rect(
+                mx(wx),
+                my(wy),
+                mx(wx + ww).max(mx(wx) + 1),
+                my(wy + wh).max(my(wy) + 1),
+            ),
+            2,
+            0x3F5672,
+            1,
         );
     }
     let (px, py) = (mx(cx), my(cy));
@@ -1794,8 +1811,10 @@ unsafe fn make_overlay() -> HWND {
     if !dock || DOCK_TOPMOST.load(std::sync::atomic::Ordering::Relaxed) {
         ex |= WS_EX_TOPMOST.0;
     }
-    if !dock {
-        // click-through for the cursor; the dock must be draggable, so it takes input
+    // click-through is right for the cursor itself; the dock and the minimap are
+    // things a person is meant to grab, so they must not swallow input
+    let interactive = dock || MAP_MODE.load(std::sync::atomic::Ordering::Relaxed);
+    if !interactive {
         ex |= WS_EX_TRANSPARENT.0;
     }
     logline!("INFO", "make_overlay dock={dock} ex=0x{ex:X}");
@@ -2968,14 +2987,18 @@ static MSG_COUNT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::n
 unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     // Rule 1: what actually arrives, logged as an id, before any assumption about
     // which message it is. Capped so a busy window cannot flood the log.
-    if DOCK_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+    if DOCK_MODE.load(std::sync::atomic::Ordering::Relaxed)
+        || MAP_MODE.load(std::sync::atomic::Ordering::Relaxed)
+    {
         let n = MSG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if n < 80 {
             logline!("MSG", "msg=0x{msg:04X} wparam=0x{:X} lparam=0x{:X}", wparam.0, lparam.0);
         }
     }
     // The dock moves itself; nothing else in this process is draggable.
-    if DOCK_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+    if DOCK_MODE.load(std::sync::atomic::Ordering::Relaxed)
+        || MAP_MODE.load(std::sync::atomic::Ordering::Relaxed)
+    {
         match msg {
             WM_LBUTTONDOWN => {
                 let mut p = POINT::default();
@@ -3036,15 +3059,23 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                         let wy = (corner as u32 as i64) as i32;
                         let mut p = POINT::default();
                         let _ = GetCursorPos(&mut p);
+                        let nx = wx + (p.x - sx);
+                        let ny = wy + (p.y - sy);
                         let _ = SetWindowPos(
                             hwnd,
                             dock_insert(),
-                            wx + (p.x - sx),
-                            wy + (p.y - sy),
+                            nx,
+                            ny,
                             0,
                             0,
                             SWP_NOSIZE | SWP_NOACTIVATE | SET_WINDOW_POS_FLAGS(0x0040),
                         );
+                        if MAP_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+                            MAP_POS.store(
+                                ((nx as i64) << 32) | (ny as i64 & 0xFFFF_FFFF),
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                        }
                     }
                 }
                 return LRESULT(0);
@@ -4100,17 +4131,20 @@ fn main() {
             if MAP_MODE.load(std::sync::atomic::Ordering::Relaxed) {
                 let (h, acc, cx, cy) = {
                     let s = st.lock().unwrap();
-                    (s.hwnd, s.accent, s.cur.0 as i32, s.cur.1 as i32)
+                    let mut p = POINT::default();
+                    let _ = GetCursorPos(&mut p);
+                    // 用系统光标位置：这个进程从来没有收到过 move 命令
+                    (s.hwnd, s.accent, p.x, p.y)
                 };
                 unsafe {
                     draw_map_surface(&map_cv, cx, cy, acc);
-                    map_cv.present(
-                        h,
-                        MAP_W,
-                        MAP_H,
-                        Some(POINT { x: MAP_X, y: MAP_Y }),
-                        1.0,
-                    );
+                    let packed = MAP_POS.load(std::sync::atomic::Ordering::Relaxed);
+                    let (mx, my) = if packed == 0 {
+                        (MAP_X, MAP_Y)
+                    } else {
+                        ((packed >> 32) as i32, (packed as u32 as i64) as i32)
+                    };
+                    map_cv.present(h, MAP_W, MAP_H, Some(POINT { x: mx, y: my }), 1.0);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(200));
                 continue;

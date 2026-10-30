@@ -63,7 +63,8 @@ pub const SECTIONS: &[SecDef] = &[
         key: "artwork",
         header: "sec_artwork",
         title: "图案（自定义鼠标 / 提示 / 附属）",
-        default_collapsed: true,
+        // 展开：大小 / 横向 / 纵向 / 透明度都在这里面，收起来用户找不到
+        default_collapsed: false,
         render: body_artwork,
     },
     SecDef {
