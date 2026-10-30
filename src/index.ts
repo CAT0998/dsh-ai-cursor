@@ -745,6 +745,29 @@ export function apply(ctx: Context, config: ConfigShape): void {
 
   ctx.tools.register(
     defineTool({
+      name: 'ai_mouse_sidebar',
+      description:
+        'Generate a self-contained HTML sidebar showing the docked cursors (with their state) and the preset list. It embeds the data, so it opens straight from file:// - no server, no extra process. Regenerate to refresh.',
+      parameters: {
+        path: { type: 'string', description: 'Where to write the HTML. Defaults to <assetDir>/sidebar.html.' },
+      },
+      output: TEXT_OUTPUT,
+      async execute(args: { path?: string }) {
+        const refused = await gate(1, 'ai_mouse_sidebar')
+        if (refused) return refused
+        const dir = (config.assetDir || '').replace(/[\/]+$/, '')
+        if (!dir) return '素材目录未配置，无法生成侧边栏。'
+        const target = (args.path ?? '').trim() || `${dir}/sidebar.html`
+        const { writeSidebar } = await import('./sidebar')
+        const r = await writeSidebar(target, `${dir}/berths.json`, `${dir}/presets.json`)
+        return `侧边栏已生成：${target}
+光标 ${r.berths} 只 · 预设 ${r.presets} 个`
+      },
+    }),
+  )
+
+  ctx.tools.register(
+    defineTool({
       name: 'ai_mouse_cursor',
       description:
         'Manage AI cursors: each one is a separate process with its own window, position, look and configuration, so every subagent can have a cursor of its own. `create` makes one (optionally applying a saved preset to it) and switches to it; `use` switches which cursor the other ai_mouse_* tools act on; `list` shows them; `kill` closes one.',
