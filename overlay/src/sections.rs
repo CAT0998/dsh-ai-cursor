@@ -323,6 +323,24 @@ fn body_actions(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
     );
     out.push(
         Hit::new(
+            rect(l.pad(), y + l.sc(62), l.pad() + l.sc(120), y + l.sc(88)),
+            Kind::Button,
+            "dock_toggle",
+        )
+        .text("停靠站")
+        .hover(hov(v, "dock_toggle")),
+    );
+    out.push(
+        Hit::new(
+            rect(l.pad() + l.sc(128), y + l.sc(62), l.pad() + l.sc(248), y + l.sc(88)),
+            Kind::Button,
+            "map_toggle",
+        )
+        .text("小地图")
+        .hover(hov(v, "map_toggle")),
+    );
+    out.push(
+        Hit::new(
             rect(l.pad() + l.sc(140), y, l.content_right(), y + l.sc(18)),
             Kind::Label,
             "l_drag_hint",
@@ -333,7 +351,7 @@ fn body_actions(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
             "按住光标即可用真实鼠标拖动它"
         }),
     );
-    y + l.sc(92)
+    y + l.sc(122)
 }
 
 fn body_appearance(v: &PanelView, x: i32, y: i32, out: &mut Vec<Hit>) -> i32 {

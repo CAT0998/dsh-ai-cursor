@@ -277,6 +277,31 @@ fn export_presets(dir: &str) -> Result<std::path::PathBuf, String> {
     Ok(dst)
 }
 
+fn pid_alive(pid: u32) -> bool {
+    use windows::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    unsafe {
+        let Ok(h) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            return false;
+        };
+        let mut code = 0u32;
+        let ok = GetExitCodeProcess(h, &mut code).is_ok();
+        let _ = windows::Win32::Foundation::CloseHandle(h);
+        ok && code == 259
+    }
+}
+
+fn kill_pid(pid: u32) {
+    use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+    unsafe {
+        if let Ok(h) = OpenProcess(PROCESS_TERMINATE, false, pid) {
+            let _ = TerminateProcess(h, 0);
+            let _ = windows::Win32::Foundation::CloseHandle(h);
+        }
+    }
+}
+
 fn cursor_state(st: &St) -> &'static str {
     // resting wins over 已停用: a rest also drops the permission to 0, but the state
     // the user asked for is 休整中 until the cursor is put to work again
@@ -710,6 +735,9 @@ struct St {
     columns: Vec<(String, u32)>,
     /// Menu bar folded down to just the column headers.
     columns_collapsed: bool,
+    /// The dock / minimap this panel started, so a second click can stop it again.
+    dock_pid: Option<u32>,
+    map_pid: Option<u32>,
     /// Preset names read from presets.json, and which one is highlighted.
     presets: Vec<String>,
     preset_sel: usize,
@@ -819,6 +847,8 @@ impl St {
             last_cmd_epoch: 0,
             columns: Vec::new(),
             columns_collapsed: false,
+            dock_pid: None,
+            map_pid: None,
             presets: Vec::new(),
             preset_sel: usize::MAX,
             started_ms: std::time::SystemTime::now()
@@ -2073,6 +2103,29 @@ fn on_toggle(st: &mut St, id: &str) {
                         Err(e) => logline!("ERROR", "toggle_column write {path:?}: {e}"),
                     }
                 }
+            } else if id == "dock_toggle" || id == "map_toggle" {
+                let is_dock = id == "dock_toggle";
+                let slot = if is_dock { &mut st.dock_pid } else { &mut st.map_pid };
+                // 已经在跑 -> 关掉；没跑 -> 拉起。存 PID 是因为 St 要 Clone，
+                // 而 std::process::Child 不实现 Clone。
+                let alive = slot.map(pid_alive).unwrap_or(false);
+                if alive {
+                    if let Some(pid) = slot.take() {
+                        kill_pid(pid);
+                        logline!("INFO", "{id}: stopped pid={pid}");
+                    }
+                } else {
+                    let exe = std::env::current_exe().unwrap_or_default();
+                    let flag = if is_dock { "--dock" } else { "--map" };
+                    match std::process::Command::new(&exe).arg(flag).spawn() {
+                        Ok(c) => {
+                            *slot = Some(c.id());
+                            logline!("INFO", "{id}: started {flag} pid={}", c.id());
+                        }
+                        Err(e) => logline!("ERROR", "{id}: spawn {flag} failed: {e}"),
+                    }
+                }
+                st.panel_dirty = true;
             } else if id == "col_fold" {
                 st.columns_collapsed = !st.columns_collapsed;
                 st.panel_dirty = true;
