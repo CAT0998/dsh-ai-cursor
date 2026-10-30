@@ -93,7 +93,7 @@ const BERTH_GAP: i32 = 8;
 const DOCK_PAD: i32 = 12;
 const DOCK_MIN: usize = 3;
 const DOCK_MAX: usize = 12;
-const DOCK_H: i32 = 252;
+const DOCK_H: i32 = 258;
 
 fn dock_width(n: usize) -> i32 {
     dock_width_z(n, 1.0)
@@ -171,7 +171,7 @@ fn dock_plate_rects(x: i32, top: i32, berth_h: i32, w: i32, zoom: f64) -> (RECT,
     let sc = |v: i32| (v as f64 * zoom).round() as i32;
     let plate = rect(x, top + berth_h + sc(4), x + w, top + berth_h + sc(28));
     // sits below the three text lines, so nothing overlaps
-    let rest = rect(x, top + berth_h + sc(76), x + w, top + berth_h + sc(100));
+    let rest = rect(x, top + berth_h + sc(88), x + w, top + berth_h + sc(112));
     (plate, (rest, plate))
 }
 
@@ -3111,6 +3111,7 @@ fn handle_line(line: &str) {
                                     agent,
                                     preset,
                                     color,
+                                    state: String::new(),
                                 };
                             }
                             None => *b = Berth::default(),
