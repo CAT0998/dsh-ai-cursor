@@ -99,6 +99,8 @@ static MAP_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::
 static DOCK_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Initial panel zoom x1000, from `--panel-zoom`.
 static INIT_ZOOM: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1000);
+/// `--panel` shows the panel at startup, for development and screenshots.
+static INIT_PANEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// What each berth currently holds. Pushed over stdin as one JSON line, so the
 /// dock stays a dumb renderer: all the knowledge (which subagent, which preset)
@@ -414,7 +416,7 @@ impl St {
             capture_visible: false,
             want_affinity: None,
             panel_hwnd: 0,
-            panel_shown: false,
+            panel_shown: INIT_PANEL.load(std::sync::atomic::Ordering::Relaxed),
             panel_full: true,
             panel_pos: (0, 0),
             panel_dirty: true,
@@ -794,6 +796,12 @@ impl Canvas {
     /// The layout is always computed at its design size, so nothing has to know
     /// about the zoom; only the finished image is stretched. That is what makes
     /// the controls and the text scale together and re-flow as one piece.
+    /// Present the panel at a zoom factor.
+    ///
+    /// The layout is always computed at its design size, so nothing has to know
+    /// about the zoom. `compose` already resamples the supersampled surface to an
+    /// arbitrary target size, so asking it for the zoomed size IS the scale — no
+    /// separate stretch surface, which had no alpha channel and came out empty.
     unsafe fn present_scaled(
         &self,
         hwnd: isize,
@@ -805,52 +813,8 @@ impl Canvas {
     ) {
         let tw = ((dw as f64) * zoom).round().max(1.0) as i32;
         let th = ((dh as f64) * zoom).round().max(1.0) as i32;
-        self.compose(dw, dh, alpha);
-        if (zoom - 1.0).abs() < 0.001 {
-            self.blit(hwnd, dw, dh, dst);
-            return;
-        }
-        // A scratch surface for the stretched frame. Creating it per present is
-        // acceptable: the panel only repaints when something changed.
-        // Must be a 32bpp DIB section: a compatible bitmap has no alpha channel,
-        // so UpdateLayeredWindow would come out empty.
-        let mem = CreateCompatibleDC(self.hdc_screen);
-        let mut bmi = BITMAPINFO::default();
-        bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
-        bmi.bmiHeader.biWidth = tw;
-        bmi.bmiHeader.biHeight = -th;
-        bmi.bmiHeader.biPlanes = 1;
-        bmi.bmiHeader.biBitCount = 32;
-        bmi.bmiHeader.biCompression = BI_RGB.0;
-        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
-        let bmp = CreateDIBSection(mem, &bmi, DIB_USAGE(0), &mut bits, HANDLE::default(), 0)
-            .unwrap_or_default();
-        let prev = SelectObject(mem, HGDIOBJ(bmp.0));
-        let _ = SetStretchBltMode(mem, HALFTONE);
-        let _ = StretchBlt(mem, 0, 0, tw, th, self.hdc_small, 0, 0, dw, dh, SRCCOPY);
-
-        let size = SIZE { cx: tw, cy: th };
-        let src = POINT { x: 0, y: 0 };
-        let blend = BLENDFUNCTION {
-            BlendOp: AC_SRC_OVER as u8,
-            BlendFlags: 0,
-            SourceConstantAlpha: 255,
-            AlphaFormat: AC_SRC_ALPHA as u8,
-        };
-        let _ = UpdateLayeredWindow(
-            hwnd_of(hwnd),
-            self.hdc_screen,
-            dst.as_ref().map(|p| p as *const POINT),
-            Some(&size),
-            mem,
-            Some(&src),
-            COLORREF(0),
-            Some(&blend),
-            ULW_ALPHA,
-        );
-        SelectObject(mem, prev);
-        let _ = DeleteObject(HGDIOBJ(bmp.0));
-        let _ = DeleteDC(mem);
+        self.compose(tw, th, alpha);
+        self.blit(hwnd, tw, th, dst);
     }
 
     unsafe fn present(&self, hwnd: isize, w: i32, h: i32, dst: Option<POINT>, alpha: f64) {
@@ -2926,6 +2890,9 @@ fn main() {
                 INIT_ZOOM.store((v.clamp(0.6, 2.0) * 1000.0) as i32, std::sync::atomic::Ordering::Relaxed);
             }
         }
+        if args.iter().any(|a| a == "--panel") {
+            INIT_PANEL.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         if let Some(i) = args.iter().position(|a| a == "--slots") {
             if let Some(path) = args.get(i + 1) {
                 let _ = DOCK_FILE.set(path.clone());
@@ -2984,6 +2951,9 @@ fn main() {
 
         let hwnd = make_overlay();
         let panel = make_panel(px, py);
+        if INIT_PANEL.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = ShowWindow(panel, SW_SHOWNOACTIVATE);
+        }
         let grab = make_grab();
         {
             let mut s = st.lock().unwrap();
