@@ -142,6 +142,26 @@ fn dock_frame_interval() -> std::time::Duration {
     std::time::Duration::from_micros(1_000_000 / fps as u64)
 }
 
+/// One of 运行中 / 待机中 / 已停用 / 休整中.
+///
+/// - 已停用: the human stopped it from the menu bar (permission 0)
+/// - 运行中: it moved or was given a target within the last moment
+/// - 休整中: it finished and was parked back at the station
+/// - 待机中: everything else - alive, idle, still away from the station
+fn cursor_state(st: &St) -> &'static str {
+    if st.permission == 0 {
+        return "已停用";
+    }
+    if st.resting {
+        return "休整中";
+    }
+    let moving = (st.target.0 - st.cur.0).abs() > 0.5 || (st.target.1 - st.cur.1).abs() > 0.5;
+    if moving || st.last_activity.elapsed().as_millis() < 400 {
+        return "运行中";
+    }
+    "待机中"
+}
+
 /// Which berths the user has selected. Written to a file the plugin reads, so the
 /// dock and the menu bar stay in step without a second communication channel.
 static DOCK_SELECTED: std::sync::Mutex<Vec<bool>> = std::sync::Mutex::new(Vec::new());
@@ -477,6 +497,8 @@ struct St {
     map_window: bool,
     map_proc: Option<std::sync::Arc<std::sync::Mutex<std::process::Child>>>,
     map_err: i32,
+    /// True while the cursor is parked at its berth rather than in use.
+    resting: bool,
     /// The human may grab the AI cursor with their own pointer.
     drag_enabled: bool,
     dragging: bool,
@@ -574,6 +596,7 @@ impl St {
             map_window: false,
             map_proc: None,
             map_err: -1,
+            resting: false,
             drag_enabled: true,
             dragging: false,
             drag_grab: (0.0, 0.0),
@@ -2975,6 +2998,19 @@ fn handle_line(line: &str) {
             DOCK_TOPMOST.store(on, std::sync::atomic::Ordering::Relaxed);
             logline!("INFO", "dock topmost -> {on}");
         }
+        "rest" => {
+            // back to the berth and stop driving: the agent is done for now
+            let (tx, ty) = (v.get("x").and_then(|x| x.as_f64()), v.get("y").and_then(|x| x.as_f64()));
+            st.resting = true;
+            st.prev_permission = st.permission.max(2);
+            st.permission = 0;
+            st.drag_feedback = Some("已回站休整，AI 控制已停止。".to_string());
+            if let (Some(x), Some(y)) = (tx, ty) {
+                st.target = (x, y);
+                st.dur_ms = 0.0;
+            }
+            st.panel_dirty = true;
+        }
         "dock_zoom" => {
             let v = v.get("value").and_then(|x| x.as_f64()).unwrap_or(1.0);
             DOCK_ZOOM.store((v.clamp(0.6, 2.0) * 100.0) as i32, std::sync::atomic::Ordering::Relaxed);
@@ -3169,6 +3205,8 @@ fn handle_line(line: &str) {
     out["map_zoom"] = serde_json::json!(st.map_zoom);
     out["map_opacity"] = serde_json::json!(st.map_opacity);
     out["log_path"] = serde_json::json!(log::path().map(|p| p.display().to_string()).unwrap_or_default());
+    out["cursor_state"] = serde_json::json!(cursor_state(&st));
+    out["resting"] = serde_json::json!(st.resting);
     out["map_visible"] = serde_json::json!(st.map_visible);
     out["map_window"] = serde_json::json!(st.map_window);
     out["map_err"] = serde_json::json!(st.map_err);

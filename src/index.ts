@@ -945,11 +945,29 @@ export function apply(ctx: Context, config: ConfigShape): void {
       name: 'ai_mouse_stop',
       description:
         'Stop the AI cursor: hides it and drops the permission level to 0, so this agent can neither drive nor restart it. Shows the floating panel afterwards so the user can click 启用 to hand control back.',
-      parameters: {},
+      parameters: {
+        scope: {
+          type: 'string',
+          description: '"this" (default) stops the current cursor, "all" stops every cursor',
+        },
+      },
       output: TEXT_OUTPUT,
-      async execute() {
+      async execute(args: { scope?: string }) {
         const refused = await gate(3, 'ai_mouse_stop')
         if (refused) return refused
+        if ((args.scope ?? 'this').toLowerCase() === 'all') {
+          // stop every cursor, not just the one this agent was driving
+          const prev = active
+          let count = 0
+          for (const ov of cursors.values()) {
+            active = ov
+            await send('pause')
+            count += 1
+          }
+          active = prev
+          await send('panel', { visible: true })
+          return `已停止全部 ${count} 只 AI 鼠标。面板已显示，恢复只能由人操作。`
+        }
         await send('pause')
         await send('panel', { visible: true })
         const reply = await send('status')
