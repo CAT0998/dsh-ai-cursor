@@ -201,16 +201,12 @@ fn build_design(v: &PanelView, mut y: i32, out: &mut Vec<Hit>) -> i32 {
         let fx = PAD + n * (w + gap);
         out.push(
             Hit::new(rect(fx, y - 4, fx + fold_w, y + 20), Kind::Button, "col_fold")
-                .text(if v.columns_collapsed { "▸" } else { "▾" }),
+                .text(if v.columns_collapsed { ">" } else { "v" }),
         );
         y += 30;
-        if v.columns_collapsed {
-            // folded: nothing but the headers
-            return y;
-        }
     }
     for sec in SECTIONS {
-        let collapsed = is_collapsed(v, sec.key);
+        let collapsed = is_collapsed(v, sec.key) || v.columns_collapsed;
         // header row: chevron + title, click toggles
         let title = if sec.key == "custom" {
             v.custom.title.clone().unwrap_or_else(|| sec.title.to_string())
