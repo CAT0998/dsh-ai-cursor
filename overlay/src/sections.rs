@@ -196,9 +196,19 @@ fn build_design(v: &PanelView, mut y: i32, out: &mut Vec<Hit>) -> i32 {
         for (i, (name, color)) in v.columns.iter().enumerate() {
             let x = PAD + i as i32 * (w + gap);
             out.push(
-                Hit::new(rect(x, y - 4, x + w, y + 20), Kind::Button, "col_head")
+                Hit::new(rect(x, y - 4, x + w - 22, y + 20), Kind::Button, "col_head")
                     .text(name.clone())
                     .data(i as i32),
+            );
+            // 新建 / 关闭该栏的入口；索引进 id，因为 on_toggle 拿不到 Hit.data
+            let add_id = format!("col_add_{i}");
+            out.push(
+                Hit::new(
+                    rect(x + w - 20, y - 4, x + w, y + 20),
+                    Kind::Button,
+                    Box::leak(add_id.into_boxed_str()),
+                )
+                .text("+"),
             );
             out.push(
                 Hit::new(rect(x, y + 22, x + w, y + 25), Kind::Sep, "sep_col")

@@ -41,6 +41,7 @@ import {
   upsertPreset,
 } from './presets'
 import { dirname } from 'node:path'
+import { readFile, writeFile, rm } from 'node:fs/promises'
 import { berthsFrom, describeBerths, readBerths, readSelection, selectedNames, writeBerths } from './dock'
 export type { InterceptMode } from './intercept'
 export type { OverlayStatus } from './overlay'
@@ -99,6 +100,39 @@ export function apply(ctx: Context, config: ConfigShape): void {
 
   const dockCommandFile = () =>
     `${(config.assetDir || '').replace(/[\/]+$/, '')}/dock-command.json`
+
+  /**
+   * 消费面板写下的命令。
+   *
+   * 面板是独立进程，不能直接调用插件，所以它把意图写进 dock-command.json；
+   * 宿主在每次 ai_mouse_dock 时读一次并处理，处理完删掉，避免重复执行。
+   */
+  const consumeDockCommands = async (): Promise<string | null> => {
+    const stateDir = `${dirname(overlay.executable)}/logs`
+    const cmdFile = `${stateDir}/dock-command.json`
+    let cmd: { action?: string; index?: number } = {}
+    try {
+      const raw = await readFile(cmdFile, 'utf8')
+      cmd = JSON.parse(raw) as { action?: string; index?: number }
+    } catch {
+      return null
+    }
+    if (cmd.action !== 'toggle_column') return null
+    const idx = Number(cmd.index ?? -1)
+    await rm(cmdFile, { force: true })
+    if (!Number.isInteger(idx) || idx < 0) return '命令缺少有效的栏位下标'
+    // 该栏已打开 → 关闭它：把它从停靠站的选择里去掉
+    const selFile = `${stateDir}/dock-selection.json`
+    try {
+      const raw = await readFile(selFile, 'utf8')
+      const sel = JSON.parse(raw) as { selected?: unknown[] }
+      const kept = (sel.selected ?? []).map(Number).filter((x) => x !== idx)
+      await writeFile(selFile, JSON.stringify({ selected: kept.map(String) }), 'utf8')
+      return `已关闭第 ${idx + 1} 栏`
+    } catch {
+      return `第 ${idx + 1} 栏没有可关闭的状态`
+    }
+  }
 
   const dockFile = () =>
     `${(config.assetDir || '').replace(/[\/]+$/, '')}/berths.json`
@@ -693,6 +727,7 @@ export function apply(ctx: Context, config: ConfigShape): void {
       output: TEXT_OUTPUT,
       async execute(args: { visible?: boolean }) {
         if (args.visible === undefined) {
+          const handled = await consumeDockCommands()
           const dir = (config.assetDir || '').replace(/[\/]+$/, '')
           if (!overlay.dockRunning) return '停靠站：关'
           const list = [...cursors.keys()].map((name) => ({
@@ -731,7 +766,7 @@ export function apply(ctx: Context, config: ConfigShape): void {
               ? ` | 停靠站里选中：${chosen.join(', ')}`
               : ` | 停靠站里未选中任何光标（读 ${stateDir}）`
           }
-          return `停靠站：开（${dir ? describeBerths(berthsFrom(list)) : '素材目录未配置'}）${sel}`
+          return `${handled ? `${handled}。` : ''}停靠站：开（${dir ? describeBerths(berthsFrom(list)) : '素材目录未配置'}）${sel}`
         }
         const refused = await gate(2, 'ai_mouse_dock')
         if (refused) return refused

@@ -1981,6 +1981,19 @@ fn on_toggle(st: &mut St, id: &str) {
                     Err(e) => logline!("ERROR", "preset export: {e}"),
                 }
                 st.panel_dirty = true;
+            } else if let Some(num) = id.strip_prefix("col_add_") {
+                // "+" 的新建/关闭交给宿主：面板是独立进程，不能自己建光标
+                let idx = num.parse::<usize>().unwrap_or(0);
+                if let Some(path) = dock_command_path().map(|p| p.display().to_string()) {
+                    let body = serde_json::json!({
+                        "action": "toggle_column", "index": idx
+                    })
+                    .to_string();
+                    match std::fs::write(&path, body) {
+                        Ok(_) => logline!("INFO", "toggle_column {idx} -> {path}"),
+                        Err(e) => logline!("ERROR", "toggle_column write {path:?}: {e}"),
+                    }
+                }
             } else if id == "col_fold" {
                 st.columns_collapsed = !st.columns_collapsed;
                 st.panel_dirty = true;
