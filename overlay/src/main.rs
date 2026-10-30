@@ -1986,6 +1986,20 @@ fn on_toggle(st: &mut St, id: &str) {
                     Err(e) => logline!("ERROR", "preset export: {e}"),
                 }
                 st.panel_dirty = true;
+            } else if id == "quit_app" {
+                // 广播退出：所有浮层进程看到同一条命令后一起结束
+                if let Some(path) = dock_command_path().map(|p| p.display().to_string()) {
+                    let epoch = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let body = serde_json::json!({ "action": "shutdown", "epoch": epoch }).to_string();
+                    match std::fs::write(&path, body) {
+                        Ok(_) => logline!("INFO", "quit_app broadcast epoch={epoch}"),
+                        Err(e) => logline!("ERROR", "quit_app write {path:?}: {e}"),
+                    }
+                }
+                std::process::exit(0);
             } else if let Some(num) = id.strip_prefix("col_add_") {
                 // "+" 的新建/关闭交给宿主：面板是独立进程，不能自己建光标
                 let idx = num.parse::<usize>().unwrap_or(0);
@@ -3859,6 +3873,15 @@ fn main() {
                             if !fresh {
                                 // stale command from an earlier run: ignore it
                                 continue;
+                            }
+                            if action == "shutdown" && epoch != 0 {
+                                logline!("INFO", "shutdown command epoch={epoch}");
+                                // 所有光标进程收到同一条广播后一起退出
+                                std::process::exit(0);
+                            }
+                            if action == "shutdown" && epoch != 0 {
+                                logline!("INFO", "shutdown command epoch={epoch}");
+                                std::process::exit(0);
                             }
                             if action == "stop_all" && epoch != 0 {
                                 let mut s = st.lock().unwrap();

@@ -306,6 +306,23 @@ fn body_actions(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
     );
     out.push(
         Hit::new(
+            rect(l.pad(), y + l.sc(30), l.pad() + l.sc(120), y + l.sc(56)),
+            Kind::Button,
+            "quit_app",
+        )
+        .text("退出")
+        .hover(hov(v, "quit_app")),
+    );
+    out.push(
+        Hit::new(
+            rect(l.pad() + l.sc(128), y + l.sc(35), l.content_right(), y + l.sc(53)),
+            Kind::Label,
+            "l_quit_hint",
+        )
+        .text("关闭所有 AI 鼠标并退出"),
+    );
+    out.push(
+        Hit::new(
             rect(l.pad() + l.sc(140), y, l.content_right(), y + l.sc(18)),
             Kind::Label,
             "l_drag_hint",
@@ -316,7 +333,7 @@ fn body_actions(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
             "按住光标即可用真实鼠标拖动它"
         }),
     );
-    y + l.sc(62)
+    y + l.sc(92)
 }
 
 fn body_appearance(v: &PanelView, x: i32, y: i32, out: &mut Vec<Hit>) -> i32 {

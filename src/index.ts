@@ -1117,4 +1117,15 @@ export function apply(ctx: Context, config: ConfigShape): void {
       },
     }),
   )
+
+  // 插件加载即拉起浮层：以前只有第一次调用工具才 spawn，人想直接看到面板却没有入口。
+  // 不 await、失败只影响"是否自动打开"，工具本身照常可用。
+  void (async () => {
+    try {
+      await prime()
+      if (config.panel !== false) await send('panel', { visible: true })
+    } catch {
+      /* 自动打开失败不该阻止插件加载 */
+    }
+  })()
 }
