@@ -2926,6 +2926,7 @@ unsafe extern "system" fn grab_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             return LRESULT(0);
         }
         WM_LBUTTONUP => {
+            let _ = ReleaseCapture();
             let mut st = s.lock().unwrap();
             st.grabbed = false;
             st.dragging = false;
