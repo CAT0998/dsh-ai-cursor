@@ -272,3 +272,11 @@ struct Layout {
 2. **插件包加载顺序**：`pnpm build` 必须在重启**之前**，否则加载的是旧 bundle
 3. **进程写不了资产目录**：浮层/停靠站对 `~/.dsh/ai-mouse-assets` 写入返回 os error 5，
    跨进程文件一律放 `<exeDir>/logs/`
+
+### 预设分区（面板内）已实现并验证 —— 2026-10-30
+- 位置：`SECTIONS` 数组里排在「小地图」与「权限等级」之间（**按显示顺序插入**，不是追加）
+- 内容：列出 `presets.json` 里的预设（按钮，可点击**应用到本光标**）+「导出预设」按钮
+- 导出目标：`<exeDir>/logs/presets-export.json`（浮层进程能写的唯一位置）
+- 保存/删除/导入仍在插件工具里，面板上有提示文字说明
+- 实测：展开分区看到 `测试A`；点「导出预设」后
+  `bin/logs/presets-export.json` 生成，内容与 `presets.json` 一致
