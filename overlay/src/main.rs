@@ -1863,7 +1863,7 @@ fn on_toggle(st: &mut St, id: &str) {
                         .to_string();
                         match std::fs::write(&path, body) {
                             Ok(_) => logline!("INFO", "stop_all broadcast epoch={epoch} -> {path}"),
-                            Err(e) => logline!("ERROR", "stop_all write failed: {e}"),
+                            Err(e) => logline!("ERROR", "stop_all write failed for {path:?}: {e}"),
                         }
                     }
                     None => logline!("ERROR", "stop_all: no command file configured"),
