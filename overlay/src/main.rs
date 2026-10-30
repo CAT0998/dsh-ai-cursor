@@ -258,6 +258,10 @@ struct St {
     map_zoom: f64,
     map_opacity: f64,
     map_visible: bool,
+    /// Is the separate minimap process running?
+    map_window: bool,
+    map_proc: Option<std::sync::Arc<std::sync::Mutex<std::process::Child>>>,
+    map_err: i32,
     /// The human may grab the AI cursor with their own pointer.
     drag_enabled: bool,
     dragging: bool,
@@ -349,6 +353,9 @@ impl St {
             map_zoom: 1.0,
             map_opacity: 1.0,
             map_visible: true,
+            map_window: false,
+            map_proc: None,
+            map_err: -1,
             drag_enabled: true,
             dragging: false,
             drag_grab: (0.0, 0.0),
@@ -1342,6 +1349,7 @@ fn view_of(st: &St) -> PanelView {
         map_zoom: st.map_zoom,
         map_opacity: st.map_opacity,
         map_visible: st.map_visible,
+        map_window: st.map_window,
         drag_enabled: st.drag_enabled,
         dragging: st.dragging,
     }
@@ -1477,7 +1485,43 @@ fn on_toggle(st: &mut St, id: &str) {
             st.dirty = true;
         }
         _ => {
-            if id == "map_zoom_in" {
+            if id == "map_window_toggle" {
+                match st.map_proc.take() {
+                    Some(c) => {
+                        if let Ok(mut ch) = c.lock() {
+                            let _ = ch.kill();
+                            let _ = ch.wait();
+                        }
+                        st.map_window = false;
+                        st.map_err = 0;
+                    }
+                    None => {
+                        // stdout is discarded: the child's protocol chatter must
+                        // never reach our own stdout, which the plugin parses.
+                        match std::process::Command::new(
+                            std::env::current_exe().unwrap_or_default(),
+                        )
+                        .arg("--map")
+                        .stdin(std::process::Stdio::piped())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn()
+                        {
+                            Ok(c) => {
+                                st.map_proc =
+                                    Some(std::sync::Arc::new(std::sync::Mutex::new(c)));
+                                st.map_window = true;
+                                st.map_err = 0;
+                            }
+                            Err(e) => {
+                                st.map_window = false;
+                                st.map_err = e.raw_os_error().unwrap_or(-1);
+                            }
+                        }
+                    }
+                }
+                st.panel_dirty = true;
+            } else if id == "map_zoom_in" {
                 st.map_zoom = (st.map_zoom + 0.25).min(3.0);
                 st.panel_dirty = true;
             } else if id == "map_zoom_out" {
@@ -2588,6 +2632,8 @@ fn handle_line(line: &str) {
     out["map_zoom"] = serde_json::json!(st.map_zoom);
     out["map_opacity"] = serde_json::json!(st.map_opacity);
     out["map_visible"] = serde_json::json!(st.map_visible);
+    out["map_window"] = serde_json::json!(st.map_window);
+    out["map_err"] = serde_json::json!(st.map_err);
     out["layer_topmost"] = serde_json::json!(st.layer_topmost);
     if let Some((rx, ry, rw, rh)) = st.layer_rect {
         let cx = st.cur.0.round() as i32;

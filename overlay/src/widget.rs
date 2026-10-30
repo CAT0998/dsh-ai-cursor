@@ -107,6 +107,7 @@ pub struct PanelView {
     pub map_zoom: f64,
     pub map_opacity: f64,
     pub map_visible: bool,
+    pub map_window: bool,
 }
 
 #[allow(dead_code)]

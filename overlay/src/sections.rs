@@ -427,54 +427,17 @@ fn body_artwork(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
 }
 
 fn body_minimap(v: &PanelView, x: i32, y: i32, out: &mut Vec<Hit>) -> i32 {
-    let mut y = y;
-    if v.map_visible {
-        out.push(Hit::new(rect(x, y, content_right(), y + 104), Kind::Minimap, "map"));
-        y += 110;
-    } else {
-        out.push(
-            Hit::new(rect(x, y, content_right(), y + 18), Kind::Label, "l_map_hidden")
-                .text("小地图已隐藏"),
-        );
-        y += 22;
-    }
-    out.push(Hit::new(rect(x, y + 4, x + 34, y + 20), Kind::Label, "l_map_z").text("缩放"));
     out.push(
-        Hit::new(rect(x + 38, y, x + 78, y + 24), Kind::Button, "map_zoom_out")
-            .text("\u{2212}")
-            .hover(hov(v, "map_zoom_out")),
+        Hit::new(rect(x, y, x + 168, y + 30), Kind::Button, "map_window_toggle")
+            .text(if v.map_window { "小地图窗口：开" } else { "小地图窗口：关" })
+            .active(v.map_window)
+            .hover(hov(v, "map_window_toggle")),
     );
     out.push(
-        Hit::new(rect(x + 86, y, x + 126, y + 24), Kind::Button, "map_zoom_in")
-            .text("+")
-            .hover(hov(v, "map_zoom_in")),
+        Hit::new(rect(x + 176, y + 6, content_right(), y + 24), Kind::Label, "l_map_hint")
+            .text("独立进程 · 可拖动缩放最小化"),
     );
-    out.push(
-        Hit::new(rect(x + 134, y + 4, x + 190, y + 20), Kind::LabelRight, "l_map_zv")
-            .text(format!("{:.1}x", v.map_zoom)),
-    );
-    out.push(Hit::new(rect(x + 200, y + 4, x + 234, y + 20), Kind::Label, "l_map_o").text("透明"));
-    out.push(
-        Hit::new(rect(x + 238, y, x + 278, y + 24), Kind::Button, "map_op_down")
-            .text("\u{2212}")
-            .hover(hov(v, "map_op_down")),
-    );
-    out.push(
-        Hit::new(rect(x + 286, y, x + 326, y + 24), Kind::Button, "map_op_up")
-            .text("+")
-            .hover(hov(v, "map_op_up")),
-    );
-    out.push(
-        Hit::new(rect(x + 334, y + 4, content_right(), y + 20), Kind::LabelRight, "l_map_ov")
-            .text(format!("{:.0}%", v.map_opacity * 100.0)),
-    );
-    y += 30;
-    out.push(
-        Hit::new(rect(x, y, x + 120, y + 24), Kind::Button, "map_toggle")
-            .text(if v.map_visible { "隐藏" } else { "显示" })
-            .hover(hov(v, "map_toggle")),
-    );
-    y + 28
+    y + 34
 }
 
 fn body_permission(v: &PanelView, x: i32, y: i32, out: &mut Vec<Hit>) -> i32 {
