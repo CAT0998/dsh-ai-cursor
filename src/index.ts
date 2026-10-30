@@ -723,6 +723,8 @@ export function apply(ctx: Context, config: ConfigShape): void {
         'Start or stop the dock station: a strip of berths next to the menu bar, one per subagent cursor, each with a number plate showing the subagent and its preset. Berths are published through a JSON file, so the dock survives restarts without anyone staying connected.',
       parameters: {
         visible: { type: 'boolean', description: 'true = show, false = close. Omit to read.' },
+        zoom: { type: 'number', description: 'Minimap scale 0.5 - 2.5 (the mouse wheel over the window does the same).' },
+        opacity: { type: 'number', description: 'Minimap opacity 0.15 - 1.' },
       },
       output: TEXT_OUTPUT,
       async execute(args: { visible?: boolean }) {
@@ -1004,9 +1006,33 @@ export function apply(ctx: Context, config: ConfigShape): void {
         visible: { type: 'boolean', description: 'true = show, false = close. Omit to read.' },
       },
       output: TEXT_OUTPUT,
-      async execute(args: { visible?: boolean }) {
+      async execute(args: { visible?: boolean; zoom?: number; opacity?: number }) {
         if (args.visible !== undefined) {
-          const refused = await gate(2, 'ai_mouse_map')
+          if (args.zoom !== undefined) {
+          const prev = active
+          for (const ov of cursors.values()) {
+            active = ov
+            try {
+              await send('map_zoom', { value: args.zoom })
+            } catch {
+              /* 该光标的小地图可能没开 */
+            }
+          }
+          active = prev
+        }
+        if (args.opacity !== undefined) {
+          const prev = active
+          for (const ov of cursors.values()) {
+            active = ov
+            try {
+              await send('map_opacity', { value: args.opacity })
+            } catch {
+              /* 同上 */
+            }
+          }
+          active = prev
+        }
+        const refused = await gate(2, 'ai_mouse_map')
           if (refused) return refused
           await overlay.setMap(args.visible)
           return args.visible

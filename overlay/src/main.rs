@@ -117,6 +117,9 @@ const MAP_Y: i32 = 64;
 
 /// Where the minimap currently sits. The redraw loop used to pin it to the constants
 /// every 200ms, which is why dragging it looked like nothing happened.
+/// Minimap zoom (x100) and its layer alpha, both adjustable at runtime.
+static MAP_ZOOM: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(100);
+static MAP_ALPHA: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(100);
 static MAP_POS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 static MAP_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static DOCK_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -554,14 +557,15 @@ unsafe fn draw_dock_surface(cv: &Canvas, count: usize, zoom: f64) {
 
 unsafe fn draw_map_surface(cv: &Canvas, cx: i32, cy: i32, accent: u32) {
     cv.clear();
-    let full = rect(0, 0, MAP_W, MAP_H);
+    // 画布就是按 zoom 建出来的，所以尺寸从画布取，而不是常量
+    let full = rect(0, 0, cv.w, cv.h);
     cv.fill_round(full, 10, 0x0B1016);
     cv.stroke_round(full, 10, 0x2A3542, 1);
 
     let sw = GetSystemMetrics(SYSTEM_METRICS_INDEX(SM_CXSCREEN.0)).max(1) as f64;
     let sh = GetSystemMetrics(SYSTEM_METRICS_INDEX(SM_CYSCREEN.0)).max(1) as f64;
-    let bw = (MAP_W - 16) as f64;
-    let bh = (MAP_H - 16) as f64;
+    let bw = (full.right - 16) as f64;
+    let bh = (full.bottom - 16) as f64;
     let k = (bw / sw).min(bh / sh);
     let ox = 8 + ((bw - sw * k) / 2.0) as i32;
     let oy = 8 + ((bh - sh * k) / 2.0) as i32;
@@ -3089,10 +3093,18 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                 let hi_signed = hi as i16 as i32;
                 logline!("INFO", "wheel raw=0x{raw:X} usize={raw} lo={lo} hi={hi} hi_signed={hi_signed}");
                 let delta = hi_signed as f64 / 120.0;
-                let cur = DOCK_ZOOM.load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0;
-                let next = (cur + delta * 0.1).clamp(0.6, 2.0);
-                DOCK_ZOOM.store((next * 100.0).round() as i32, std::sync::atomic::Ordering::Relaxed);
-                logline!("INFO", "dock zoom {cur:.2} -> {next:.2} (wheel)");
+                if MAP_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+                    // 小地图用自己的缩放档，范围与停靠站不同（它要覆盖整屏）
+                    let cur = MAP_ZOOM.load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0;
+                    let next = (cur + delta * 0.1).clamp(0.5, 2.5);
+                    MAP_ZOOM.store((next * 100.0).round() as i32, std::sync::atomic::Ordering::Relaxed);
+                    logline!("INFO", "map zoom {cur:.2} -> {next:.2} (wheel)");
+                } else {
+                    let cur = DOCK_ZOOM.load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0;
+                    let next = (cur + delta * 0.1).clamp(0.6, 2.0);
+                    DOCK_ZOOM.store((next * 100.0).round() as i32, std::sync::atomic::Ordering::Relaxed);
+                    logline!("INFO", "dock zoom {cur:.2} -> {next:.2} (wheel)");
+                }
                 return LRESULT(0);
             }
             WM_LBUTTONUP => {
@@ -3100,7 +3112,7 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                 DRAG_ORIGIN.store(0, std::sync::atomic::Ordering::Relaxed);
                 DRAG_CORNER.store(0, std::sync::atomic::Ordering::Relaxed);
                 let _ = ReleaseCapture();
-                if was_dragging {
+                if was_dragging && !MAP_MODE.load(std::sync::atomic::Ordering::Relaxed) {
                     snap_dock(hwnd);
                 }
                 return LRESULT(0);
@@ -3492,6 +3504,16 @@ fn handle_line(line: &str) {
                 st.dur_ms = 0.0;
             }
             st.panel_dirty = true;
+        }
+        "map_zoom" => {
+            let v = v.get("value").and_then(|x| x.as_f64()).unwrap_or(1.0);
+            MAP_ZOOM.store((v.clamp(0.5, 2.5) * 100.0) as i32, std::sync::atomic::Ordering::Relaxed);
+            logline!("INFO", "map zoom -> {v:.2}");
+        }
+        "map_opacity" => {
+            let v = v.get("value").and_then(|x| x.as_f64()).unwrap_or(1.0);
+            MAP_ALPHA.store((v.clamp(0.15, 1.0) * 100.0) as i32, std::sync::atomic::Ordering::Relaxed);
+            logline!("INFO", "map opacity -> {v:.2}");
         }
         "dock_zoom" => {
             let v = v.get("value").and_then(|x| x.as_f64()).unwrap_or(1.0);
@@ -3940,7 +3962,7 @@ fn main() {
         };
 
         let cursor_cv = Canvas::new(W, H, SS);
-        let map_cv = Canvas::new(MAP_W, MAP_H, SS);
+        let mut map_cv = Canvas::new(MAP_W, MAP_H, SS);
         let frame_interval = if DOCK_MODE.load(std::sync::atomic::Ordering::Relaxed) {
             dock_frame_interval()
         } else {
@@ -4129,6 +4151,15 @@ fn main() {
                 continue;
             }
             if MAP_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+                // 缩放/透明度每帧读一次，改动立刻生效
+                let zoom = MAP_ZOOM.load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0;
+                let alpha = MAP_ALPHA.load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0;
+                let mw = (MAP_W as f64 * zoom).round() as i32;
+                let mh = (MAP_H as f64 * zoom).round() as i32;
+                if mw != map_cv.w || mh != map_cv.h {
+                    map_cv = Canvas::new(mw, mh, SS);
+                    logline!("INFO", "map canvas {mw}x{mh} zoom={zoom:.2}");
+                }
                 let (h, acc, cx, cy) = {
                     let s = st.lock().unwrap();
                     let mut p = POINT::default();
@@ -4144,7 +4175,7 @@ fn main() {
                     } else {
                         ((packed >> 32) as i32, (packed as u32 as i64) as i32)
                     };
-                    map_cv.present(h, MAP_W, MAP_H, Some(POINT { x: mx, y: my }), 1.0);
+                    map_cv.present(h, mw, mh, Some(POINT { x: mx, y: my }), alpha);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(200));
                 continue;
