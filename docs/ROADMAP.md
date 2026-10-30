@@ -290,3 +290,13 @@ struct Layout {
   `预设（1）测试A · arrow · #FF0044 · 100%`
 - 说明：这是"浏览器虚拟界面"路线；要真正嵌进 DSH 界面内部，需要 DSH client plugin，
   属于另一套工程，可后续再做
+
+### 栏顶 `＋` 已打通 —— 2026-10-30
+- 面板：每个栏头右侧一个 `+` 小片，点击写 `<exeDir>/logs/dock-command.json`
+  的 `{"action":"toggle_column","index":N}`
+- 宿主：`consumeDockCommands()` 在每次 `ai_mouse_dock` 时读一次、把该栏从
+  `dock-selection.json` 移除、删除命令文件防重复
+- 实测（手工写入同样的命令模拟点击后调用工具）：
+  `{"action":"toggle_column","index":0}` → 返回「已关闭第 1 栏」，
+  选择从 `agent-b, agent-c` 变为 `agent-c`
+- 面板侧与宿主侧用的是同一个 JSON 形状，所以 `+` 点击走的是同一条路径
