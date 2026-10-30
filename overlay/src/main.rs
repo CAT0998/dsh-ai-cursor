@@ -96,8 +96,13 @@ const DOCK_MAX: usize = 12;
 const DOCK_H: i32 = 208;
 
 fn dock_width(n: usize) -> i32 {
+    dock_width_z(n, 1.0)
+}
+
+fn dock_width_z(n: usize, zoom: f64) -> i32 {
     let n = n.clamp(DOCK_MIN, DOCK_MAX) as i32;
-    DOCK_PAD * 2 + n * BERTH_W + (n - 1) * BERTH_GAP
+    let base = DOCK_PAD * 2 + n * BERTH_W + (n - 1) * BERTH_GAP;
+    (base as f64 * zoom.clamp(0.6, 2.0)).round() as i32
 }
 const DOCK_X: i32 = 1068;
 const DOCK_Y: i32 = 700;
@@ -112,6 +117,7 @@ static DOCK_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool:
 /// Initial panel zoom x1000, from `--panel-zoom`.
 static INIT_ZOOM: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1000);
 /// `--panel` shows the panel at startup, for development and screenshots.
+static DOCK_ZOOM: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(100);
 static INIT_PANEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// What each berth currently holds. Pushed over stdin as one JSON line, so the
@@ -147,13 +153,21 @@ fn berths() -> &'static std::sync::Mutex<Vec<Berth>> {
     BERTHS.get_or_init(|| std::sync::Mutex::new(vec![Berth::default(); DOCK_MAX]))
 }
 
-unsafe fn draw_dock_surface(cv: &Canvas, count: usize) {
-    let dock_w = dock_width(count);
-    let full = rect(0, 0, dock_w, DOCK_H);
-    cv.fill_round(full, 12, 0x0B1016);
-    cv.stroke_round(full, 12, 0x2A3542, 1);
-    cv.text_at(cv.fonts.title, 14, 10, "停靠站", 0x9FB2C6);
-    cv.text_at(cv.fonts.label, dock_w - 118, 13, "鼠标停靠处", 0x5F7186);
+/// Draw the dock at a zoom factor.
+///
+/// Every coordinate goes through `sc`, and the canvas is created with a matching
+/// font scale, so the strip scales as a whole - the same rule as the panel: the
+/// geometry is authored once and multiplied, never stretched afterwards.
+unsafe fn draw_dock_surface(cv: &Canvas, count: usize, zoom: f64) {
+    let z = zoom.clamp(0.6, 2.0);
+    let sc = |v: i32| (v as f64 * z).round() as i32;
+    let dock_w = dock_width_z(count, z);
+    let dock_h = sc(DOCK_H);
+    let full = rect(0, 0, dock_w, dock_h);
+    cv.fill_round(full, sc(12), 0x0B1016);
+    cv.stroke_round(full, sc(12), 0x2A3542, 1);
+    cv.text_at(cv.fonts.title, sc(14), sc(10), "停靠站", 0x9FB2C6);
+    cv.text_at(cv.fonts.label, dock_w - sc(118), sc(13), "鼠标停靠处", 0x5F7186);
 
     let mut held: Vec<Berth> = berths().lock().map(|b| b.clone()).unwrap_or_default();
     if let Some(path) = DOCK_FILE.get() {
@@ -177,45 +191,39 @@ unsafe fn draw_dock_surface(cv: &Canvas, count: usize) {
             }
         }
     }
-    let pad = DOCK_PAD;
-    let gap = BERTH_GAP;
-    let w = BERTH_W;
+
+    let pad = sc(DOCK_PAD);
+    let gap = sc(BERTH_GAP);
+    let w = sc(BERTH_W);
+    let top = sc(40);
+    let berth_h = sc(64);
     for i in 0..count.clamp(DOCK_MIN, DOCK_MAX) {
         let x = pad + i as i32 * (w + gap);
-        let y = 40;
-        let berth = rect(x, y, x + w, y + 64);
         let b = held.get(i).cloned().unwrap_or_default();
+        let berth = rect(x, top, x + w, top + berth_h);
         if b.occupied {
-            cv.fill_round(berth, 10, 0x1B2A38);
-            cv.stroke_round(berth, 10, b.color & 0xFFFFFF, 2);
-            // the cursor's own colour as a dot inside its berth
-            cv.fill_circle(x + w / 2, y + 26, 11, b.color & 0xFFFFFF);
-            cv.ring_circle(x + w / 2, y + 26, 14, 1, 0xFFFFFF);
+            cv.fill_round(berth, sc(10), 0x1B2A38);
+            cv.stroke_round(berth, sc(10), b.color & 0xFFFFFF, (2.0 * z).round().max(1.0) as i32);
+            cv.fill_circle(x + w / 2, top + sc(26), sc(11), b.color & 0xFFFFFF);
+            cv.ring_circle(x + w / 2, top + sc(26), sc(14), 1, 0xFFFFFF);
         } else {
-            cv.fill_round(berth, 10, 0x141C26);
-            cv.stroke_round(berth, 10, 0x2F4152, 1);
+            cv.fill_round(berth, sc(10), 0x141C26);
+            cv.stroke_round(berth, sc(10), 0x2F4152, 1);
         }
-        // number plate: left-aligned, so no centring maths can push it off-screen
-        let plate = rect(x, y + 68, x + w, y + 92);
-        cv.fill_round(plate, 6, 0x18222E);
+        let plate = rect(x, top + berth_h + sc(4), x + w, top + berth_h + sc(28));
+        cv.fill_round(plate, sc(6), 0x18222E);
         let title = format!("{}号位", i + 1);
-        cv.text_at(cv.fonts.label, x + 5, y + 72, &title, 0x6E8199);
+        cv.text_at(cv.fonts.label, x + sc(5), top + berth_h + sc(8), &title, 0x6E8199);
         if b.occupied {
             let short: String = b.agent.chars().take(9).collect();
-            cv.text_at(cv.fonts.label, x + 5, y + 96, &short, 0xBFD2E5);
+            cv.text_at(cv.fonts.label, x + sc(5), top + berth_h + sc(32), &short, 0xBFD2E5);
             let pshort: String = b.preset.chars().take(7).collect();
-            cv.text_at(cv.fonts.label, x + 5, y + 114, &pshort, 0x5F7186);
+            cv.text_at(cv.fonts.label, x + sc(5), top + berth_h + sc(50), &pshort, 0x5F7186);
         } else {
-            cv.text_at(cv.fonts.label, x + 5, y + 96, "空闲", 0x46586B);
+            cv.text_at(cv.fonts.label, x + sc(5), top + berth_h + sc(32), "空闲", 0x46586B);
         }
     }
-    cv.text_at(
-        cv.fonts.label,
-        14,
-        DOCK_H - 22,
-        "站牌：子代理 / 预设",
-        0x4C5E72,
-    );
+    cv.text_at(cv.fonts.label, sc(14), dock_h - sc(22), "站牌：子代理 / 预设", 0x4C5E72);
 }
 
 unsafe fn draw_map_surface(cv: &Canvas, cx: i32, cy: i32, accent: u32) {
@@ -2758,6 +2766,10 @@ fn handle_line(line: &str) {
                 }
             }
         }
+        "dock_zoom" => {
+            let v = v.get("value").and_then(|x| x.as_f64()).unwrap_or(1.0);
+            DOCK_ZOOM.store((v.clamp(0.6, 2.0) * 100.0) as i32, std::sync::atomic::Ordering::Relaxed);
+        }
         "dock_slots" => {
             if let Some(list) = v.get("slots").and_then(|x| x.as_array()) {
                 if let Ok(mut berths) = berths().lock() {
@@ -3037,6 +3049,11 @@ fn main() {
                 INIT_ZOOM.store((v.clamp(0.6, 2.0) * 1000.0) as i32, std::sync::atomic::Ordering::Relaxed);
             }
         }
+        if let Some(i) = args.iter().position(|a| a == "--dock-zoom") {
+            if let Some(v) = args.get(i + 1).and_then(|x| x.parse::<f64>().ok()) {
+                DOCK_ZOOM.store((v.clamp(0.6, 2.0) * 100.0) as i32, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         if args.iter().any(|a| a == "--panel") {
             INIT_PANEL.store(true, std::sync::atomic::Ordering::Relaxed);
         }
@@ -3162,6 +3179,7 @@ fn main() {
         let map_cv = Canvas::new(MAP_W, MAP_H, SS);
         let mut dock_cv = Canvas::new(DOCK_W, DOCK_H, SS);
         let mut dock_cv_w = DOCK_W;
+        let mut dock_cv_h = DOCK_H;
         let mut panel_cv = Canvas::new_scaled(
             PW,
             PH_MAX,
@@ -3234,13 +3252,17 @@ fn main() {
             if DOCK_MODE.load(std::sync::atomic::Ordering::Relaxed) {
                 let h = { st.lock().unwrap().hwnd };
                 let count = dock_berth_count();
-                let want_w = dock_width(count);
+                let z = DOCK_ZOOM.load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0;
+                let want_w = dock_width_z(count, z);
+                let want_h = (DOCK_H as f64 * z).round() as i32;
                 unsafe {
-                    if want_w != dock_cv_w {
-                        // canvas and window both follow the berth count, so adding
-                        // cursors grows the strip instead of overflowing it
-                        dock_cv = Canvas::new(want_w, DOCK_H, SS);
+                    if want_w != dock_cv_w || want_h != dock_cv_h {
+                        // canvas and window both follow the berth count and zoom, so
+                        // they can never disagree - a mismatch is exactly what made
+                        // compose() produce nothing at the panel's first attempt
+                        dock_cv = Canvas::new_scaled(want_w, want_h, SS, z);
                         dock_cv_w = want_w;
+                        dock_cv_h = want_h;
                         let mut r = RECT::default();
                         let _ = GetWindowRect(hwnd_of(h), &mut r);
                         let _ = SetWindowPos(
@@ -3249,13 +3271,13 @@ fn main() {
                             r.left,
                             r.top,
                             want_w,
-                            DOCK_H,
+                            want_h,
                             SWP_NOACTIVATE | SET_WINDOW_POS_FLAGS(0x0040),
                         );
-                        logline!("INFO", "dock resize to {want_w}x{DOCK_H} for {count} berths");
+                        logline!("INFO", "dock resize to {want_w}x{want_h} for {count} berths zoom={z:.2}");
                     }
-                    draw_dock_surface(&dock_cv, count);
-                    dock_cv.present(h, want_w, DOCK_H, None, 1.0);
+                    draw_dock_surface(&dock_cv, count, z);
+                    dock_cv.present(h, want_w, want_h, None, 1.0);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(400));
                 continue;
