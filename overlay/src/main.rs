@@ -73,7 +73,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 const W: i32 = 360; // cursor window width  (device px)
 const H: i32 = 240; // cursor window height (device px)
-const SS: i32 = 4; // supersample factor for the cursor artwork
+// Measured: SS=4 means 82.9M samples/second at 60Hz, which was the entire 23.4% CPU
+// cost of the moving path (idle and animation were already ~0.3%). The cursor artwork
+// is small, so 2x still antialiases cleanly at a quarter of the work.
+const SS: i32 = 2; // supersample factor for the cursor artwork
 const TIP_X: f64 = 200.0; // where the cursor tip sits inside its window
 const TIP_Y: f64 = 44.0;
 
