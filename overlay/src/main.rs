@@ -148,6 +148,78 @@ fn dock_frame_interval() -> std::time::Duration {
 /// - 运行中: it moved or was given a target within the last moment
 /// - 休整中: it finished and was parked back at the station
 /// - 待机中: everything else - alive, idle, still away from the station
+/// Preset names from `<assetDir>/presets.json`. Read-only: the overlay process is
+/// refused write access to the asset directory, which is why saving stays in the plugin.
+fn read_preset_names(dir: &str) -> Vec<String> {
+    if dir.is_empty() {
+        return Vec::new();
+    }
+    let path = std::path::Path::new(dir).join("presets.json");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return Vec::new();
+    };
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|p| p.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Apply one preset to this cursor. Same fields the plugin's preset tool touches.
+fn apply_preset(dir: &str, name: &str, st: &mut St) -> Result<(), String> {
+    let path = std::path::Path::new(dir).join("presets.json");
+    let raw = std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let v: serde_json::Value = serde_json::from_str(&raw).map_err(|e| format!("parse: {e}"))?;
+    let found = v
+        .as_array()
+        .and_then(|a| a.iter().find(|p| p.get("name").and_then(|n| n.as_str()) == Some(name)))
+        .cloned()
+        .ok_or_else(|| format!("no preset named {name}"))?;
+    if let Some(t) = found.get("theme").and_then(|x| x.as_str()) {
+        if matches!(t, "whale" | "dot" | "arrow") {
+            st.theme = t.to_string();
+        }
+    }
+    if let Some(l) = found.get("label").and_then(|x| x.as_str()) {
+        st.label = l.to_string();
+        st.label_wanted = !l.is_empty();
+    }
+    if let Some(hex) = found.get("color").and_then(|x| x.as_str()) {
+        if let Some(rgb) = parse_hex(hex) {
+            st.accent = rgb;
+        }
+    }
+    if let Some(o) = found.get("opacity").and_then(|x| x.as_f64()) {
+        st.opacity = o;
+    }
+    if let Some(sc) = found.get("scale").and_then(|x| x.as_f64()) {
+        st.scale = sc;
+    }
+    if let Some(b) = found.get("badge").and_then(|x| x.as_bool()) {
+        st.badge = b;
+    }
+    Ok(())
+}
+
+/// Copy presets.json next to the executable, the one place this process may write.
+fn export_presets(dir: &str) -> Result<std::path::PathBuf, String> {
+    if dir.is_empty() {
+        return Err("asset directory not set".to_string());
+    }
+    let src = std::path::Path::new(dir).join("presets.json");
+    let dst = dock_command_path()
+        .and_then(|p| p.parent().map(|d| d.join("presets-export.json")))
+        .ok_or_else(|| "cannot resolve the exe directory".to_string())?;
+    std::fs::copy(&src, &dst)
+        .map_err(|e| format!("copy {} -> {}: {e}", src.display(), dst.display()))?;
+    Ok(dst)
+}
+
 fn cursor_state(st: &St) -> &'static str {
     // resting wins over 已停用: a rest also drops the permission to 0, but the state
     // the user asked for is 休整中 until the cursor is put to work again
@@ -579,6 +651,9 @@ struct St {
     columns: Vec<(String, u32)>,
     /// Menu bar folded down to just the column headers.
     columns_collapsed: bool,
+    /// Preset names read from presets.json, and which one is highlighted.
+    presets: Vec<String>,
+    preset_sel: usize,
     /// Process start time, so a command file left over from an earlier run is
     /// ignored instead of being replayed on startup.
     started_ms: u64,
@@ -685,6 +760,8 @@ impl St {
             last_cmd_epoch: 0,
             columns: Vec::new(),
             columns_collapsed: false,
+            presets: Vec::new(),
+            preset_sel: usize::MAX,
             started_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -1739,6 +1816,8 @@ fn view_of(st: &St) -> PanelView {
         zoom: st.panel_zoom,
         columns: st.columns.clone(),
         columns_collapsed: st.columns_collapsed,
+        presets: st.presets.clone(),
+        preset_sel: st.preset_sel,
         map_zoom: st.map_zoom,
         map_opacity: st.map_opacity,
         map_visible: st.map_visible,
@@ -1882,7 +1961,27 @@ fn on_toggle(st: &mut St, id: &str) {
             st.dirty = true;
         }
         _ => {
-            if id == "col_fold" {
+            if let Some(num) = id.strip_prefix("preset_apply_") {
+                let idx = num.parse::<usize>().unwrap_or(0);
+                if let Some(name) = st.presets.get(idx).cloned() {
+                    let dir = st.asset_dir.clone();
+                    match apply_preset(&dir, &name, st) {
+                        Ok(()) => {
+                            st.preset_sel = idx;
+                            logline!("INFO", "preset applied from panel: {name}");
+                        }
+                        Err(e) => logline!("ERROR", "preset apply {name}: {e}"),
+                    }
+                }
+                st.dirty = true;
+                st.panel_dirty = true;
+            } else if id == "preset_export" {
+                match export_presets(&st.asset_dir) {
+                    Ok(p) => logline!("INFO", "presets exported to {p:?}"),
+                    Err(e) => logline!("ERROR", "preset export: {e}"),
+                }
+                st.panel_dirty = true;
+            } else if id == "col_fold" {
                 st.columns_collapsed = !st.columns_collapsed;
                 st.panel_dirty = true;
                 st.want_panel_resize = true;
@@ -3042,6 +3141,8 @@ fn handle_line(line: &str) {
             found.sort();
             st.assets = found.clone();
             st.asset_dir = dir.clone();
+            st.presets = read_preset_names(&dir);
+            logline!("INFO", "presets loaded: {}", st.presets.len());
             st.custom = custom::load(&dir);
             st.panel_dirty = true;
             out["assets"] = serde_json::json!(found);
@@ -3129,6 +3230,10 @@ fn handle_line(line: &str) {
                     }
                 }
             }
+        }
+        "presets_reload" => {
+            st.presets = read_preset_names(&st.asset_dir);
+            st.panel_dirty = true;
         }
         "fold_columns" => {
             st.columns_collapsed = !st.columns_collapsed;

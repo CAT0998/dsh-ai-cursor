@@ -74,6 +74,13 @@ pub const SECTIONS: &[SecDef] = &[
         render: body_minimap,
     },
     SecDef {
+        key: "presets",
+        header: "sec_presets",
+        title: "预设",
+        default_collapsed: true,
+        render: body_presets,
+    },
+    SecDef {
         key: "permission",
         header: "sec_permission",
         title: "权限等级",
@@ -568,6 +575,40 @@ fn body_minimap(v: &PanelView, x: i32, y: i32, out: &mut Vec<Hit>) -> i32 {
             .text("独立进程 · 可拖动缩放最小化"),
     );
     y + 34
+}
+
+fn body_presets(v: &PanelView, x: i32, y: i32, out: &mut Vec<Hit>) -> i32 {
+    let mut y = y;
+    if v.presets.is_empty() {
+        out.push(
+            Hit::new(rect(x, y, content_right(), y + 18), Kind::Label, "l_no_presets")
+                .text("还没有预设：在插件里 ai_mouse_preset save 一个"),
+        );
+        return y + 24;
+    }
+    for (i, name) in v.presets.iter().enumerate().take(8) {
+        let active = v.preset_sel == i;
+        let row = rect(x, y, content_right(), y + 22);
+        // 索引编进 id：on_toggle 只有 (St, &str)，拿不到 Hit 的 data
+        let id = format!("preset_apply_{i}");
+        out.push(
+            Hit::new(row, Kind::Button, Box::leak(id.into_boxed_str()))
+                .text(name.clone())
+                .active(active)
+                .hover(hov(v, "preset_apply")),
+        );
+        y += 26;
+    }
+    out.push(
+        Hit::new(rect(x, y + 2, x + 110, y + 26), Kind::Button, "preset_export")
+            .text("导出预设")
+            .hover(hov(v, "preset_export")),
+    );
+    out.push(
+        Hit::new(rect(x + 118, y + 6, content_right(), y + 24), Kind::Label, "l_preset_hint")
+            .text("导出到 exe 目录的 logs/，保存与删除请用工具"),
+    );
+    y + 30
 }
 
 fn body_permission(v: &PanelView, x: i32, y: i32, out: &mut Vec<Hit>) -> i32 {

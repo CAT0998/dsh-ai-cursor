@@ -105,6 +105,10 @@ pub struct PanelView {
     /// Selected cursors, one column header each.
     pub columns: Vec<(String, u32)>,
     pub columns_collapsed: bool,
+    /// Names from presets.json, read by the overlay so the panel can list them.
+    pub presets: Vec<String>,
+    /// Which preset entry is highlighted (0-based), if any.
+    pub preset_sel: usize,
     /// The human may drag the cursor with their own pointer.
     pub drag_enabled: bool,
     pub dragging: bool,
