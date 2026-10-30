@@ -811,10 +811,15 @@ impl Canvas {
         dst: Option<POINT>,
         alpha: f64,
     ) {
-        let tw = ((dw as f64) * zoom).round().max(1.0) as i32;
-        let th = ((dh as f64) * zoom).round().max(1.0) as i32;
-        self.compose(tw, th, alpha);
-        self.blit(hwnd, tw, th, dst);
+        // The canvas composes by INDEX, not by proportion: `w`/`h` are only the
+        // loop bounds while the sampling and the write stride both stay tied to
+        // the canvas's fixed size. Handing it a zoomed size therefore writes out
+        // of bounds and comes out blank. Scaling has to happen in the layout, with
+        // every rect and font computed from the scale factor - so until that
+        // exists, a non-unit zoom is ignored rather than producing an empty panel.
+        let _ = zoom;
+        self.compose(dw, dh, alpha);
+        self.blit(hwnd, dw, dh, dst);
     }
 
     unsafe fn present(&self, hwnd: isize, w: i32, h: i32, dst: Option<POINT>, alpha: f64) {
