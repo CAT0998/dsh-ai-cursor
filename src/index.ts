@@ -707,6 +707,25 @@ export function apply(ctx: Context, config: ConfigShape): void {
               await readBerths(`${dir}/berths.json`),
               await readSelection(`${stateDir}/dock-selection.json`),
             )
+            {
+              // one column header per selected cursor, in the order the dock shows them
+              const cols = chosen.map((n2) => ({
+                name: n2,
+                color: meta.get(n2)?.color ?? '#4FC3F7',
+              }))
+              for (const [cn, ov] of cursors) {
+                if (!chosen.includes(cn)) continue
+                const prevActive = active
+                active = ov
+                try {
+                  await send('panel_columns', { columns: cols })
+                } catch {
+                  /* the panel may not be up yet */
+                }
+                active = prevActive
+                break
+              }
+            }
             sel = chosen.length
               ? ` | 停靠站里选中：${chosen.join(', ')}`
               : ` | 停靠站里未选中任何光标（读 ${stateDir}）`

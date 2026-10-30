@@ -575,6 +575,8 @@ struct St {
     cursor_index: usize,
     command_file: Option<String>,
     last_cmd_epoch: u64,
+    /// One entry per selected cursor: the menu bar shows a column header for each.
+    columns: Vec<(String, u32)>,
     /// Process start time, so a command file left over from an earlier run is
     /// ignored instead of being replayed on startup.
     started_ms: u64,
@@ -679,6 +681,7 @@ impl St {
             cursor_index: 0,
             command_file: None,
             last_cmd_epoch: 0,
+            columns: Vec::new(),
             started_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -1731,6 +1734,7 @@ fn view_of(st: &St) -> PanelView {
         epoch_ms: Instant::now().duration_since(st.sprite_epoch).as_millis() as u64,
         art_sel: st.art_sel,
         zoom: st.panel_zoom,
+        columns: st.columns.clone(),
         map_zoom: st.map_zoom,
         map_opacity: st.map_opacity,
         map_visible: st.map_visible,
@@ -3117,6 +3121,27 @@ fn handle_line(line: &str) {
                     }
                 }
             }
+        }
+        "panel_columns" => {
+            let mut cols = Vec::new();
+            if let Some(list) = v.get("columns").and_then(|c| c.as_array()) {
+                for c in list.iter().take(6) {
+                    let name = c.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                    if name.is_empty() {
+                        continue;
+                    }
+                    let color = c
+                        .get("color")
+                        .and_then(|x| x.as_str())
+                        .and_then(parse_hex)
+                        .unwrap_or(0x4FC3F7);
+                    cols.push((name, color));
+                }
+            }
+            logline!("INFO", "panel columns: {}", cols.len());
+            st.columns = cols;
+            st.panel_dirty = true;
+            st.want_panel_resize = true;
         }
         "cursor_index" => {
             st.cursor_index = v.get("index").and_then(|x| x.as_u64()).unwrap_or(0) as usize;

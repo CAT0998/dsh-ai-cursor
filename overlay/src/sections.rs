@@ -179,6 +179,24 @@ pub fn build(v: &PanelView, mut y: i32, out: &mut Vec<Hit>) -> i32 {
 }
 
 fn build_design(v: &PanelView, mut y: i32, out: &mut Vec<Hit>) -> i32 {
+    // Selected cursors get one header each across the top of the menu bar.
+    if !v.columns.is_empty() {
+        let n = v.columns.len() as i32;
+        let gap = 6;
+        let w = (content_right() - PAD - gap * (n - 1)) / n.max(1);
+        for (i, (name, color)) in v.columns.iter().enumerate() {
+            let x = PAD + i as i32 * (w + gap);
+            out.push(
+                Hit::new(rect(x, y - 4, x + w, y + 20), Kind::LabelRight, "l_col_name")
+                    .text(name.clone()),
+            );
+            out.push(
+                Hit::new(rect(x, y + 22, x + w, y + 25), Kind::Sep, "sep_col")
+                    .data((*color & 0xFFFFFF) as i32),
+            );
+        }
+        y += 30;
+    }
     for sec in SECTIONS {
         let collapsed = is_collapsed(v, sec.key);
         // header row: chevron + title, click toggles

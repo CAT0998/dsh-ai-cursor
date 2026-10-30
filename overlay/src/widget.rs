@@ -102,6 +102,8 @@ pub struct PanelView {
     pub art_sel: usize,
     /// Panel zoom: every rect and font is derived from it.
     pub zoom: f64,
+    /// Selected cursors, one column header each.
+    pub columns: Vec<(String, u32)>,
     /// The human may drag the cursor with their own pointer.
     pub drag_enabled: bool,
     pub dragging: bool,
