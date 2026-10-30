@@ -2943,7 +2943,16 @@ unsafe extern "system" fn grab_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             st.grabbed = false;
             st.dragging = false;
             st.drag_feedback = Some(format!(
-                "用户把 AI 光标放到了 ({:.0}, {:.0})。AI 控制仍是停止状态，需在面板上点「启用」恢复。",
+                "用户把 AI 光标放到了 ({:.0}, {:.0})。",
+                st.cur.0, st.cur.1
+            ));
+            // 拖动期间暂停 AI 控制是对的，但松手就该恢复，否则用户会以为
+            // "拖一下把东西弄坏了"，还得回去点「启用」
+            let back = st.prev_permission.clamp(1, 3);
+            st.permission = back;
+            st.prev_permission = 0;
+            st.drag_feedback = Some(format!(
+                "用户把 AI 光标放到了 ({:.0}, {:.0})，AI 控制已恢复。",
                 st.cur.0, st.cur.1
             ));
             st.want_hide_grab = true;
