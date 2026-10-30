@@ -10,7 +10,7 @@
 //! antialiases the edges for free.
 
 use windows::Win32::Graphics::Gdi::{
-    BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject, BITMAPINFO,
+    BitBlt, StretchBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject, BITMAPINFO,
     BITMAPINFOHEADER, BI_RGB, DIB_USAGE, HBITMAP, HDC, HGDIOBJ, SRCCOPY,
 };
 use windows::Win32::Foundation::HANDLE;
@@ -183,6 +183,25 @@ impl Wheel {
     pub unsafe fn blit(&self, dst: HDC, x_ss: i32, y_ss: i32) {
         let n = D * self.ss;
         let _ = BitBlt(dst, x_ss, y_ss, n, n, self.hdc, 0, 0, SRCCOPY);
+    }
+
+    /// Blit scaled to `side_ss` device pixels. The wheel is rendered once at D and
+    /// stretched, so the panel's zoom does not need a second cached surface.
+    pub unsafe fn blit_scaled(&self, dst: HDC, x_ss: i32, y_ss: i32, side_ss: i32) {
+        let n = D * self.ss;
+        let _ = StretchBlt(
+            dst,
+            x_ss,
+            y_ss,
+            side_ss,
+            side_ss,
+            self.hdc,
+            0,
+            0,
+            n,
+            n,
+            SRCCOPY,
+        );
     }
 
     /// Map a click inside the wheel box to a colour. Returns true when it landed

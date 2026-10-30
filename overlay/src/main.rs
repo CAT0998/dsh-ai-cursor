@@ -1656,22 +1656,28 @@ unsafe fn draw_panel(cv: &Canvas, v: &PanelView, hits: &[Hit], h: i32) {
                     wh.set_from_rgb(v.accent);
                 }
                 wh.ensure();
-                wh.blit(cv.hdc_big, h.r.left * cv.ss, h.r.top * cv.ss);
-                let cx = h.r.left + wheel::D / 2;
-                let cy = h.r.top + wheel::D / 2;
+                // The hit box is scaled with the panel, so the artwork and both
+                // markers have to follow the same factor - otherwise the wheel stays
+                // at its design size while the box around it grows.
+                let side = (h.r.right - h.r.left).max(1);
+                let k = side as f64 / wheel::D as f64;
+                wh.blit_scaled(cv.hdc_big, h.r.left * cv.ss, h.r.top * cv.ss, side * cv.ss);
+                let cx = h.r.left + side / 2;
+                let cy = h.r.top + side / 2;
                 // hue marker on the ring
                 let angle_hue = (1.0 - wh.hue).rem_euclid(1.0);
                 let ang = angle_hue * std::f64::consts::TAU;
-                let rr = (wheel::R_IN + wheel::R_OUT) / 2.0;
+                let rr = (wheel::R_IN + wheel::R_OUT) / 2.0 * k;
                 let mx = cx + (rr * ang.cos()) as i32;
                 let my = cy + (rr * ang.sin()) as i32;
-                cv.ring_circle(mx, my, 6, 2, 0xFFFFFF);
-                cv.ring_circle(mx, my, 7, 1, 0x101820);
+                let mw = (6.0 * k).max(2.0) as i32;
+                cv.ring_circle(mx, my, mw, 2, 0xFFFFFF);
+                cv.ring_circle(mx, my, mw + 1, 1, 0x101820);
                 // saturation/value marker inside the square
-                let sx = cx + ((wh.sat - 0.5) * wheel::SQ) as i32;
-                let sy = cy + ((0.5 - wh.val) * wheel::SQ) as i32;
-                cv.ring_circle(sx, sy, 5, 2, 0xFFFFFF);
-                cv.ring_circle(sx, sy, 6, 1, 0x101820);
+                let sx = cx + ((wh.sat - 0.5) * wheel::SQ * k) as i32;
+                let sy = cy + ((0.5 - wh.val) * wheel::SQ * k) as i32;
+                cv.ring_circle(sx, sy, (5.0 * k).max(2.0) as i32, 2, 0xFFFFFF);
+                cv.ring_circle(sx, sy, (6.0 * k).max(2.0) as i32, 1, 0x101820);
             }
             Kind::Preview => {}
             Kind::Minimap => {
