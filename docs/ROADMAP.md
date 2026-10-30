@@ -226,7 +226,10 @@ struct Layout {
 - 载入：读入并合并（同名覆盖，不同的追加）
 
 ### 实施顺序（每步真机验证）
-1. 停靠站**点选**（高亮 + 写 `dock-selection.json`）
+1. 停靠站**点选**（高亮 + 写 `dock-selection.json`）—— ✅ 已完成并验证
+   - 站位下标发布在 `<exeDir>/logs/dock-selection.json`（停靠站进程写不了资产目录）
+   - 插件用 `dirname(overlay.executable)` 解析路径读取（`config.exePath` 不等于实际 exe）
+   - 实测：点 1 号 → `agent-b`；点 2 号 → `agent-b, agent-c`；再点 1 号 → `agent-c`
 2. 插件读选择 → 菜单栏分栏（先只做"两个就分两栏"）
 3. 折叠方向改横向
 4. 栏顶名称 + `＋` 的新建/关闭
