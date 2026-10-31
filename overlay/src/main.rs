@@ -37,7 +37,7 @@ use windows::Win32::Foundation::{
     WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    BitBlt, CreateCompatibleDC, CreateCompatibleBitmap, HALFTONE, SetStretchBltMode, StretchBlt, CreateDIBSection, CreateFontW, CreatePen, CreateSolidBrush, DeleteDC,
+    BitBlt, CreateCompatibleDC, CreateDCW, DeleteDC as _DeleteDC, CreateCompatibleBitmap, HALFTONE, SetStretchBltMode, StretchBlt, CreateDIBSection, CreateFontW, CreatePen, CreateSolidBrush, DeleteDC,
     DeleteObject, Ellipse, FillRect, GetDC, GetStockObject, GetTextExtentPoint32W, LineTo, MoveToEx,
     Polygon, ReleaseDC, RoundRect, SelectObject, SetBkMode, SetTextColor, TextOutW, AC_SRC_ALPHA,
     AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_USAGE, HDC, HGDIOBJ,
@@ -183,6 +183,21 @@ static INIT_ZOOM: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::n
 /// Frame interval for the dock, taken from the display's own refresh rate and
 /// capped: repainting faster than the monitor can show is wasted work, and a
 /// 144Hz panel does not need 144 redraws of a static strip.
+/// Virtual desktop bounds: every monitor's union. A single monitor reports
+/// (0, 0, width, height), two monitors a wider or taller box.
+fn virtual_screen() -> (i32, i32, i32, i32) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    };
+    unsafe {
+        let x = GetSystemMetrics(SYSTEM_METRICS_INDEX(SM_XVIRTUALSCREEN.0));
+        let y = GetSystemMetrics(SYSTEM_METRICS_INDEX(SM_YVIRTUALSCREEN.0));
+        let w = GetSystemMetrics(SYSTEM_METRICS_INDEX(SM_CXVIRTUALSCREEN.0)).max(1);
+        let h = GetSystemMetrics(SYSTEM_METRICS_INDEX(SM_CYVIRTUALSCREEN.0)).max(1);
+        (x, y, w, h)
+    }
+}
+
 fn dock_frame_interval() -> std::time::Duration {
     let mut dm = windows::Win32::Graphics::Gdi::DEVMODEW::default();
     dm.dmSize = std::mem::size_of::<windows::Win32::Graphics::Gdi::DEVMODEW>() as u16;
@@ -555,6 +570,72 @@ unsafe fn draw_dock_surface(cv: &Canvas, count: usize, zoom: f64) {
     cv.text_at(cv.fonts.label, sc(14), dock_h - sc(22), "站牌：子代理 / 预设", 0x4C5E72);
 }
 
+
+/// Downscale the desktop into the minimap.
+///
+/// The expensive part is the 1920x1080 -> thumbnail stretch, so the *scaled* result is
+/// cached and reused: per frame this is a small BitBlt of an already-small bitmap, and
+/// the full capture + HALFTONE stretch only happens when the cache is stale.
+unsafe fn resample_desktop(dst_ss: HDC, ss: i32, dst: RECT) {
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    struct Thumb {
+        dc: isize,
+        bmp: isize,
+        w: i32, // device size of the cached thumbnail
+        h: i32,
+        at: Instant,
+    }
+    // SAFETY: only the map process's draw path touches this.
+    static THUMB: Mutex<Option<Thumb>> = Mutex::new(None);
+
+    // 虚拟桌面 = 所有显示器的并集，双屏时会包含第二块屏
+    let (vx, vy, sw, sh) = virtual_screen();
+    let tw = ((dst.right - dst.left) * ss).max(1);
+    let th = ((dst.bottom - dst.top) * ss).max(1);
+
+    let mut guard = THUMB.lock().unwrap();
+    let stale = match guard.as_ref() {
+        Some(t) => t.at.elapsed().as_millis() > 120 || t.w != tw || t.h != th,
+        None => true,
+    };
+    if stale {
+        if guard.is_none() {
+            let screen = GetDC(None);
+            let dc = CreateCompatibleDC(screen);
+            let bmp = CreateCompatibleBitmap(screen, tw, th);
+            SelectObject(dc, bmp);
+            let _ = ReleaseDC(None, screen);
+            *guard = Some(Thumb { dc: dc.0 as isize, bmp: bmp.0 as isize, w: tw, h: th, at: Instant::now() });
+        }
+        if let Some(t) = guard.as_mut() {
+            // GetDC(None) 只覆盖主屏；用 DISPLAY 设备上下文才能抓到多屏
+            let screen = CreateDCW(w!("DISPLAY"), PCWSTR::null(), PCWSTR::null(), None);
+            let _ = SetStretchBltMode(HDC(t.dc as *mut _), HALFTONE);
+            let _ = StretchBlt(
+                HDC(t.dc as *mut _), 0, 0, tw, th,
+                screen, vx, vy, sw, sh, SRCCOPY,
+            );
+            let _ = ReleaseDC(None, screen);
+            t.at = Instant::now();
+        }
+    }
+    if let Some(t) = guard.as_ref() {
+        let _ = BitBlt(
+            dst_ss,
+            dst.left * ss,
+            dst.top * ss,
+            tw,
+            th,
+            HDC(t.dc as *mut _),
+            0,
+            0,
+            SRCCOPY,
+        );
+    }
+}
+
 unsafe fn draw_map_surface(cv: &Canvas, cx: i32, cy: i32, accent: u32) {
     cv.clear();
     // 画布就是按 zoom 建出来的，所以尺寸从画布取，而不是常量
@@ -562,15 +643,16 @@ unsafe fn draw_map_surface(cv: &Canvas, cx: i32, cy: i32, accent: u32) {
     cv.fill_round(full, 10, 0x0B1016);
     cv.stroke_round(full, 10, 0x2A3542, 1);
 
-    let sw = GetSystemMetrics(SYSTEM_METRICS_INDEX(SM_CXSCREEN.0)).max(1) as f64;
-    let sh = GetSystemMetrics(SYSTEM_METRICS_INDEX(SM_CYSCREEN.0)).max(1) as f64;
+    let (vx, vy, vsw, vsh) = virtual_screen();
+    let sw = vsw as f64;
+    let sh = vsh as f64;
     let bw = (full.right - 16) as f64;
     let bh = (full.bottom - 16) as f64;
     let k = (bw / sw).min(bh / sh);
     let ox = 8 + ((bw - sw * k) / 2.0) as i32;
     let oy = 8 + ((bh - sh * k) / 2.0) as i32;
-    let mx = |x: i32| ox + (x as f64 * k) as i32;
-    let my = |y: i32| oy + (y as f64 * k) as i32;
+    let mx = |x: i32| ox + ((x - vx) as f64 * k) as i32;
+    let my = |y: i32| oy + ((y - vy) as f64 * k) as i32;
 
     // 桌面范围：填一层比背景亮的底，再描一圈，否则 0x2A3542 压在 0x0B1016 上等于看不见
     let screen_rect = rect(ox, oy, mx(sw as i32), my(sh as i32));
@@ -582,41 +664,14 @@ unsafe fn draw_map_surface(cv: &Canvas, cx: i32, cy: i32, accent: u32) {
         2,
         0x0E1620,
     );
-    for (wx, wy, ww, wh) in cached_window_rects() {
-        cv.fill_round(
-            rect(
-                mx(wx),
-                my(wy),
-                mx(wx + ww).max(mx(wx) + 1),
-                my(wy + wh).max(my(wy) + 1),
-            ),
-            2,
-            0x354A63,
-        );
-        cv.stroke_round(
-            rect(
-                mx(wx),
-                my(wy),
-                mx(wx + ww).max(mx(wx) + 1),
-                my(wy + wh).max(my(wy) + 1),
-            ),
-            2,
-            0x6B87A8,
-            1,
-        );
-        // 标题条：让每个窗口一眼能认出来，而不是一片同色方块
-        let bar_h = ((wh as f64 * k) * 0.12).clamp(1.0, 4.0);
-        cv.fill_round(
-            rect(
-                mx(wx),
-                my(wy),
-                mx(wx + ww).max(mx(wx) + 1),
-                my(wy) + bar_h as i32,
-            ),
-            1,
-            0x8FB0D4,
-        );
-    }
+    // 直接把桌面重采样下来，而不是用矩形"画"一个示意图。
+    // 抓屏 + 缩放对 GPU 来说是最省事的，画矩形反而只是人工近似。
+    resample_desktop(
+        cv.hdc_big,
+        cv.ss,
+        rect(screen_rect.left + 1, screen_rect.top + 1, screen_rect.right - 1, screen_rect.bottom - 1),
+    );
+
     let (px, py) = (mx(cx), my(cy));
     cv.fill_circle(px, py, 4, accent);
     cv.ring_circle(px, py, 6, 1, 0xFFFFFF);
