@@ -576,7 +576,13 @@ unsafe fn draw_map_surface(cv: &Canvas, cx: i32, cy: i32, accent: u32) {
     let screen_rect = rect(ox, oy, mx(sw as i32), my(sh as i32));
     cv.fill_round(screen_rect, 3, 0x141C26);
     cv.stroke_round(screen_rect, 3, 0x4A637D, 1);
-    for (wx, wy, ww, wh) in top_window_rects(10) {
+    // 桌面底色，让窗口块有对比
+    cv.fill_round(
+        rect(screen_rect.left + 1, screen_rect.top + 1, screen_rect.right - 1, screen_rect.bottom - 1),
+        2,
+        0x0E1620,
+    );
+    for (wx, wy, ww, wh) in cached_window_rects() {
         cv.fill_round(
             rect(
                 mx(wx),
@@ -585,7 +591,7 @@ unsafe fn draw_map_surface(cv: &Canvas, cx: i32, cy: i32, accent: u32) {
                 my(wy + wh).max(my(wy) + 1),
             ),
             2,
-            0x2E4159,
+            0x354A63,
         );
         cv.stroke_round(
             rect(
@@ -595,8 +601,20 @@ unsafe fn draw_map_surface(cv: &Canvas, cx: i32, cy: i32, accent: u32) {
                 my(wy + wh).max(my(wy) + 1),
             ),
             2,
-            0x3F5672,
+            0x6B87A8,
             1,
+        );
+        // 标题条：让每个窗口一眼能认出来，而不是一片同色方块
+        let bar_h = ((wh as f64 * k) * 0.12).clamp(1.0, 4.0);
+        cv.fill_round(
+            rect(
+                mx(wx),
+                my(wy),
+                mx(wx + ww).max(mx(wx) + 1),
+                my(wy) + bar_h as i32,
+            ),
+            1,
+            0x8FB0D4,
         );
     }
     let (px, py) = (mx(cx), my(cy));
@@ -2634,6 +2652,27 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
 
 /// Top-level visible windows, front to back, as rects. Read-only: used to draw
 /// the minimap and never to change anything.
+/// Window rectangles for the minimap, refreshed at most every 250ms.
+///
+/// The minimap now draws at the display rate, and EnumWindows on every frame at 120fps
+/// would cost far more than the drawing itself. The cursor dot still updates every frame.
+fn cached_window_rects() -> Vec<(i32, i32, i32, i32)> {
+    use std::sync::Mutex;
+    use std::time::Instant;
+    static CACHE: Mutex<Option<(Instant, Vec<(i32, i32, i32, i32)>)>> = Mutex::new(None);
+    let mut guard = CACHE.lock().unwrap();
+    let stale = guard
+        .as_ref()
+        .map(|(t, _)| t.elapsed().as_millis() > 250)
+        .unwrap_or(true);
+    if stale {
+        let fresh = unsafe { top_window_rects(12) };
+        *guard = Some((Instant::now(), fresh.clone()));
+        return fresh;
+    }
+    guard.as_ref().map(|(_, v)| v.clone()).unwrap_or_default()
+}
+
 unsafe fn top_window_rects(limit: usize) -> Vec<(i32, i32, i32, i32)> {
     struct Acc {
         limit: usize,
@@ -4066,7 +4105,11 @@ fn main() {
 
         let cursor_cv = Canvas::new(W, H, SS);
         let mut map_cv = Canvas::new(MAP_W, MAP_H, SS);
-        let frame_interval = if DOCK_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+        // 停靠站和小地图都跟着桌面刷新率走（上限 120fps）；
+        // 小地图原来固定 200ms(5fps)，光标点和窗口块看起来就是一顿一顿的
+        let frame_interval = if DOCK_MODE.load(std::sync::atomic::Ordering::Relaxed)
+            || MAP_MODE.load(std::sync::atomic::Ordering::Relaxed)
+        {
             dock_frame_interval()
         } else {
             std::time::Duration::from_millis(16)
@@ -4280,7 +4323,7 @@ fn main() {
                     };
                     map_cv.present(h, mw, mh, Some(POINT { x: mx, y: my }), alpha);
                 }
-                std::thread::sleep(std::time::Duration::from_millis(200));
+                std::thread::sleep(frame_interval);
                 continue;
             }
             let p_layer = {
