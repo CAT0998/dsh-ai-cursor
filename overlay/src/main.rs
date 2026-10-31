@@ -17,6 +17,7 @@
 //! the panel is WS_EX_NOACTIVATE, so clicking a button never steals the foreground.
 
 mod custom;
+mod gpucap;
 mod log;
 mod sections;
 mod wheel;
@@ -571,15 +572,14 @@ unsafe fn draw_dock_surface(cv: &Canvas, count: usize, zoom: f64) {
 }
 
 
-/// Downscale the desktop into the minimap.
+/// Downscale the desktop into the minimap with GDI - the fallback path.
 ///
-/// The expensive part is the 1920x1080 -> thumbnail stretch, so the *scaled* result is
+/// This is what `map_thumb` uses when the GPU capture in `gpucap` is not
+/// available (no D3D11 device, or the driver refuses Desktop Duplication). The
+/// expensive part is the 1920x1080 -> thumbnail stretch, so the *scaled* result is
 /// cached and reused: per frame this is a small BitBlt of an already-small bitmap, and
 /// the full capture + HALFTONE stretch only happens when the cache is stale.
 unsafe fn resample_desktop(dst_ss: HDC, ss: i32, dst: RECT) {
-    use std::sync::Mutex;
-    use std::time::Instant;
-
     struct Thumb {
         dc: isize,
         bmp: isize,
@@ -636,6 +636,143 @@ unsafe fn resample_desktop(dst_ss: HDC, ss: i32, dst: RECT) {
     }
 }
 
+/// Where the virtual desktop lands inside the minimap, in canvas pixels.
+///
+/// One place computes this, because three things have to agree pixel for pixel:
+/// the frame drawn around the desktop, the captured thumbnail inside it, and the
+/// blue dot for the pointer. The scale is just "minimap size / desktop size", so
+/// a bigger minimap is sharper and a smaller one is blurrier - that is the
+/// intended behaviour, not an artefact of the capture.
+struct MapGeom {
+    vx: i32,
+    vy: i32,
+    vw: i32,
+    vh: i32,
+    /// desktop -> canvas, for the frame and the pointer dot
+    k: f64,
+    ox: i32,
+    oy: i32,
+    /// The thumbnail sits one pixel inside the frame, so it has its own slightly
+    /// smaller scale: with it the capture fills that box exactly instead of
+    /// bleeding over the border.
+    kx: f64,
+    ky: f64,
+    tx: i32,
+    ty: i32,
+}
+
+impl MapGeom {
+    fn new(cv: &Canvas) -> MapGeom {
+        let (vx, vy, vw, vh) = virtual_screen();
+        let bw = (cv.w - 16) as f64;
+        let bh = (cv.h - 16) as f64;
+        let k = (bw / vw as f64).min(bh / vh as f64);
+        let ox = 8 + ((bw - vw as f64 * k) / 2.0) as i32;
+        let oy = 8 + ((bh - vh as f64 * k) / 2.0) as i32;
+        let iw = (vw as f64 * k - 2.0).max(1.0);
+        let ih = (vh as f64 * k - 2.0).max(1.0);
+        MapGeom {
+            vx,
+            vy,
+            vw,
+            vh,
+            k,
+            ox,
+            oy,
+            kx: iw / vw as f64,
+            ky: ih / vh as f64,
+            tx: ox + 1,
+            ty: oy + 1,
+        }
+    }
+
+    /// The desktop frame: the whole virtual desktop mapped into the canvas.
+    fn frame(&self) -> RECT {
+        rect(
+            self.ox,
+            self.oy,
+            self.ox + (self.vw as f64 * self.k) as i32,
+            self.oy + (self.vh as f64 * self.k) as i32,
+        )
+    }
+
+    /// The box the desktop picture itself occupies: one pixel inside the frame.
+    fn thumb(&self) -> RECT {
+        rect(
+            self.tx,
+            self.ty,
+            self.tx + (self.vw as f64 * self.kx) as i32,
+            self.ty + (self.vh as f64 * self.ky) as i32,
+        )
+    }
+
+    /// Screen point -> canvas point, for the pointer dot.
+    fn dot(&self, dx: i32, dy: i32) -> (i32, i32) {
+        (
+            self.ox + ((dx - self.vx) as f64 * self.k) as i32,
+            self.oy + ((dy - self.vy) as f64 * self.k) as i32,
+        )
+    }
+
+    /// One monitor's place inside the thumbnail, in canvas pixels. This is what
+    /// puts a second screen next to the first, where it really is in the virtual
+    /// desktop, instead of squeezing the union into one stretch.
+    fn slot(&self, m: &gpucap::Monitor) -> (i32, i32, i32, i32) {
+        let x0 = self.tx + ((m.x - self.vx) as f64 * self.kx) as i32;
+        let y0 = self.ty + ((m.y - self.vy) as f64 * self.ky) as i32;
+        let x1 = self.tx + ((m.x + m.w - self.vx) as f64 * self.kx) as i32;
+        let y1 = self.ty + ((m.y + m.h - self.vy) as f64 * self.ky) as i32;
+        (x0, y0, (x1 - x0).max(1), (y1 - y0).max(1))
+    }
+}
+
+/// Put the live desktop into the minimap.
+///
+/// GPU first: `gpucap` duplicates every monitor's framebuffer and one pixel
+/// shader pass box-filters it straight down to the slot that monitor occupies
+/// here, so the CPU only ever touches the finished thumbnail. When the GPU path
+/// is unavailable - no D3D11 device, or the driver refusing Desktop Duplication -
+/// the GDI capture is used unchanged, so the minimap shows the desktop instead
+/// of going blank.
+unsafe fn map_thumb(cv: &Canvas, g: &MapGeom) {
+    static THUMB: Mutex<gpucap::Thumb> =
+        Mutex::new(gpucap::Thumb { w: 0, h: 0, px: Vec::new(), valid: false });
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    let inner = g.thumb();
+    let ss = cv.ss;
+    let target = |m: &gpucap::Monitor| -> (i32, i32, i32, i32) {
+        let (x, y, w, h) = g.slot(m);
+        ((x - inner.left) * ss, (y - inner.top) * ss, w * ss, h * ss)
+    };
+    // Rendered at the canvas's own supersampled resolution, so what comes back is
+    // a straight row copy into the canvas - no second stretch anywhere.
+    let tw = ((inner.right - inner.left) * ss).max(1);
+    let th = ((inner.bottom - inner.top) * ss).max(1);
+
+    {
+        let mut t = THUMB.lock().unwrap();
+        match gpucap::desktop_thumb(&mut t, tw, th, target) {
+            // A fresh thumbnail, or the previous one because the desktop has not
+            // changed: either way it is the current picture.
+            Ok(_) => {
+                if t.valid {
+                    cv.put_thumb(inner, &t.px, t.w, t.h);
+                    return;
+                }
+            }
+            Err(e) => {
+                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    logline!("ERROR", "minimap: GPU capture unavailable, using GDI fallback: {e}");
+                }
+            }
+        }
+    }
+    // Nothing from the GPU yet (first frame, or the path is unusable): keep the
+    // old capture so the minimap is never empty.
+    resample_desktop(cv.hdc_big, ss, inner);
+}
+
 unsafe fn draw_map_surface(cv: &Canvas, cx: i32, cy: i32, accent: u32) {
     cv.clear();
     // 画布就是按 zoom 建出来的，所以尺寸从画布取，而不是常量
@@ -643,38 +780,88 @@ unsafe fn draw_map_surface(cv: &Canvas, cx: i32, cy: i32, accent: u32) {
     cv.fill_round(full, 10, 0x0B1016);
     cv.stroke_round(full, 10, 0x2A3542, 1);
 
-    let (vx, vy, vsw, vsh) = virtual_screen();
-    let sw = vsw as f64;
-    let sh = vsh as f64;
-    let bw = (full.right - 16) as f64;
-    let bh = (full.bottom - 16) as f64;
-    let k = (bw / sw).min(bh / sh);
-    let ox = 8 + ((bw - sw * k) / 2.0) as i32;
-    let oy = 8 + ((bh - sh * k) / 2.0) as i32;
-    let mx = |x: i32| ox + ((x - vx) as f64 * k) as i32;
-    let my = |y: i32| oy + ((y - vy) as f64 * k) as i32;
-
+    let g = MapGeom::new(cv);
     // 桌面范围：填一层比背景亮的底，再描一圈，否则 0x2A3542 压在 0x0B1016 上等于看不见
-    let screen_rect = rect(ox, oy, mx(sw as i32), my(sh as i32));
+    let screen_rect = g.frame();
     cv.fill_round(screen_rect, 3, 0x141C26);
     cv.stroke_round(screen_rect, 3, 0x4A637D, 1);
-    // 桌面底色，让窗口块有对比
-    cv.fill_round(
-        rect(screen_rect.left + 1, screen_rect.top + 1, screen_rect.right - 1, screen_rect.bottom - 1),
-        2,
-        0x0E1620,
-    );
-    // 直接把桌面重采样下来，而不是用矩形"画"一个示意图。
-    // 抓屏 + 缩放对 GPU 来说是最省事的，画矩形反而只是人工近似。
-    resample_desktop(
-        cv.hdc_big,
-        cv.ss,
-        rect(screen_rect.left + 1, screen_rect.top + 1, screen_rect.right - 1, screen_rect.bottom - 1),
-    );
+    // 桌面底色：缩略图还没到的第一帧也不是黑块
+    let inner = g.thumb();
+    cv.fill_round(inner, 2, 0x0E1620);
+    // 桌面内容：GPU 抓屏 + 着色器降采样（GPU 不可用时退回 GDI）
+    map_thumb(cv, &g);
 
-    let (px, py) = (mx(cx), my(cy));
+    let (px, py) = g.dot(cx, cy);
     cv.fill_circle(px, py, 4, accent);
     cv.ring_circle(px, py, 6, 1, 0xFFFFFF);
+}
+
+/// Rolling cost of the minimap's own paint path, logged every couple of seconds.
+///
+/// The GPU capture reports its own share (acquire / draw / readback), so this line
+/// answers "where did the CPU go" with numbers instead of a feeling. It is also
+/// what the CPU comparison in docs/ROADMAP.md was measured with.
+struct MapStats {
+    frames: u32,
+    draw_us: u64,
+    present_us: u64,
+    since: Instant,
+    gpu_prev: Option<gpucap::Stats>,
+}
+
+impl MapStats {
+    fn new() -> MapStats {
+        MapStats {
+            frames: 0,
+            draw_us: 0,
+            present_us: 0,
+            since: Instant::now(),
+            gpu_prev: None,
+        }
+    }
+
+    fn add(&mut self, draw: Duration, present: Duration) {
+        self.frames += 1;
+        self.draw_us += draw.as_micros() as u64;
+        self.present_us += present.as_micros() as u64;
+        let el = self.since.elapsed();
+        if el.as_millis() < 2000 {
+            return;
+        }
+        let n = self.frames.max(1) as u64;
+        let fps = self.frames as f64 / el.as_secs_f64();
+        let gpu = gpucap::stats();
+        let gpu_part = match gpu {
+            Some(g) => {
+                let p = self.gpu_prev.unwrap_or_default();
+                let df = g.frames.saturating_sub(p.frames).max(1);
+                format!(
+                    "gpu frames={df} acq={}us draw={}us read={}us (copy={} map={} rows={})",
+                    g.acq_us.saturating_sub(p.acq_us) / df,
+                    g.draw_us.saturating_sub(p.draw_us) / df,
+                    g.read_us.saturating_sub(p.read_us) / df,
+                    g.copy_us.saturating_sub(p.copy_us) / df,
+                    g.map_us.saturating_sub(p.map_us) / df,
+                    g.row_us.saturating_sub(p.row_us) / df
+                )
+            }
+            None => "gpu unavailable".to_string(),
+        };
+        logline!(
+            "INFO",
+            "map stats {fps:.1}fps draw={}us present={}us | {gpu_part}",
+            self.draw_us / n,
+            self.present_us / n
+        );
+        self.gpu_prev = gpu;
+        *self = MapStats {
+            frames: 0,
+            draw_us: 0,
+            present_us: 0,
+            since: Instant::now(),
+            gpu_prev: self.gpu_prev.take(),
+        };
+    }
 }
 const PH_MAX: i32 = 1200; // the panel canvas is allocated this tall and clipped per frame
 
@@ -1261,6 +1448,48 @@ impl Canvas {
     /// The finished ARGB surface, for layers composited after the vector pass.
     fn small_mut(&self) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.bits_small, (self.w * self.h * 4) as usize) }
+    }
+
+    /// Place an already-scaled BGRA block at `dst`, one device pixel per source
+    /// pixel.
+    ///
+    /// The minimap's desktop picture is rendered by the GPU at exactly the
+    /// canvas's supersampled resolution, so this is a row copy - nothing is
+    /// resampled here, which is the whole reason the capture moved to the GPU.
+    unsafe fn put_thumb(&self, dst: RECT, px: &[u8], w: i32, h: i32) {
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        let s = self.ss;
+        let cw = self.w * s;
+        let ch = self.h * s;
+        let base_x = dst.left * s;
+        let base_y = dst.top * s;
+        let x0 = base_x;
+        let y0 = base_y.max(0);
+        let x1 = dst.right.saturating_mul(s).min(cw);
+        let y1 = dst.bottom.saturating_mul(s).min(ch);
+        if x1 <= x0 || y1 <= y0 || x0 < 0 {
+            return;
+        }
+        let src_stride = (w * 4) as usize;
+        if px.len() < src_stride * h as usize {
+            return;
+        }
+        let dx = (x0 - base_x) as usize; // clipped-away left part of the source row
+        let n = ((x1 - x0) * 4) as usize;
+        for y in y0..y1 {
+            let sy = (y - base_y) as usize;
+            if sy >= h as usize {
+                break;
+            }
+            let src_off = sy * src_stride + dx * 4;
+            if src_off + n > px.len() {
+                break;
+            }
+            let off = ((y as usize) * (cw as usize) + (x0 as usize)) * 4;
+            std::ptr::copy_nonoverlapping(px[src_off..].as_ptr(), self.bits_big.add(off), n);
+        }
     }
 
     unsafe fn blit(&self, hwnd: isize, w: i32, h: i32, dst: Option<POINT>) {
@@ -4160,6 +4389,7 @@ fn main() {
 
         let cursor_cv = Canvas::new(W, H, SS);
         let mut map_cv = Canvas::new(MAP_W, MAP_H, SS);
+        let mut map_stats = MapStats::new();
         // 停靠站和小地图都跟着桌面刷新率走（上限 120fps）；
         // 小地图原来固定 200ms(5fps)，光标点和窗口块看起来就是一顿一顿的
         let frame_interval = if DOCK_MODE.load(std::sync::atomic::Ordering::Relaxed)
@@ -4369,7 +4599,9 @@ fn main() {
                     (s.hwnd, s.accent, p.x, p.y)
                 };
                 unsafe {
+                    let t_draw = Instant::now();
                     draw_map_surface(&map_cv, cx, cy, acc);
+                    let t_present = Instant::now();
                     let packed = MAP_POS.load(std::sync::atomic::Ordering::Relaxed);
                     let (mx, my) = if packed == 0 {
                         (MAP_X, MAP_Y)
@@ -4377,6 +4609,7 @@ fn main() {
                         ((packed >> 32) as i32, (packed as u32 as i64) as i32)
                     };
                     map_cv.present(h, mw, mh, Some(POINT { x: mx, y: my }), alpha);
+                    map_stats.add(t_present - t_draw, t_present.elapsed());
                 }
                 std::thread::sleep(frame_interval);
                 continue;
@@ -4796,5 +5029,94 @@ fn main() {
         drop(cursor_cv);
         drop(panel_cv);
         std::process::exit(0);
+    }
+}
+
+#[cfg(test)]
+mod map_geometry_tests {
+    use super::*;
+
+    /// Two monitors side by side must land side by side in the minimap, each one
+    /// in the slot of the virtual desktop it really occupies.
+    ///
+    /// The capture itself cannot be exercised here (this machine has one
+    /// display), but the placement maths is what decides where a second monitor
+    /// appears, and it is pure geometry.
+    #[test]
+    fn two_monitors_are_placed_by_virtual_position() {
+        let g = MapGeom {
+            vx: 0,
+            vy: 0,
+            vw: 3840,
+            vh: 1080,
+            k: 0.1,
+            ox: 0,
+            oy: 0,
+            kx: 0.1,
+            ky: 0.1,
+            tx: 1,
+            ty: 1,
+        };
+        let left = gpucap::Monitor { name: "L".into(), x: 0, y: 0, w: 1920, h: 1080 };
+        let right = gpucap::Monitor { name: "R".into(), x: 1920, y: 0, w: 1920, h: 1080 };
+        let (lx, ly, lw, lh) = g.slot(&left);
+        let (rx, _, rw, _) = g.slot(&right);
+        assert_eq!((lx, ly), (1, 1)); // starts at the top-left of the thumbnail
+        assert_eq!((lw, lh), (192, 108)); // 1920x1080 at 0.1
+        assert_eq!(rx, lx + lw); // second screen starts where the first ends
+        assert_eq!(rw, lw);
+    }
+
+    /// A monitor to the left of the primary one has negative virtual coordinates
+    /// (SM_XVIRTUALSCREEN is negative); it must still land in the thumbnail, on
+    /// the left, not be clamped away.
+    #[test]
+    fn a_monitor_left_of_origin_lands_first() {
+        let g = MapGeom {
+            vx: -1920,
+            vy: 0,
+            vw: 3840,
+            vh: 1080,
+            k: 0.1,
+            ox: 0,
+            oy: 0,
+            kx: 0.1,
+            ky: 0.1,
+            tx: 1,
+            ty: 1,
+        };
+        let left = gpucap::Monitor { name: "L".into(), x: -1920, y: 0, w: 1920, h: 1080 };
+        let primary = gpucap::Monitor { name: "P".into(), x: 0, y: 0, w: 1920, h: 1080 };
+        assert_eq!(g.slot(&left).0, 1);
+        assert_eq!(g.slot(&primary).0, 1 + 192);
+    }
+
+    /// The captured thumbnail must fill the box inside the frame exactly, with no
+    /// letterbox and no bleed over the border - that is what `thumb()` and
+    /// `slot()` disagreeing would look like.
+    #[test]
+    fn the_thumbnail_box_fits_inside_the_frame() {
+        let g = MapGeom {
+            vx: 0,
+            vy: 0,
+            vw: 1920,
+            vh: 1080,
+            k: 0.189,
+            ox: 8,
+            oy: 28,
+            kx: 0.188,
+            ky: 0.188,
+            tx: 9,
+            ty: 29,
+        };
+        let frame = g.frame();
+        let thumb = g.thumb();
+        assert!(thumb.left >= frame.left && thumb.top >= frame.top);
+        assert!(thumb.right <= frame.right && thumb.bottom <= frame.bottom);
+        // a single monitor filling the virtual desktop covers the whole box
+        let only = gpucap::Monitor { name: "1".into(), x: 0, y: 0, w: 1920, h: 1080 };
+        let (x, y, w, h) = g.slot(&only);
+        assert_eq!((x, y), (thumb.left, thumb.top));
+        assert_eq!((x + w, y + h), (thumb.right, thumb.bottom));
     }
 }

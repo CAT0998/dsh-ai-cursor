@@ -112,6 +112,23 @@ let o = ((oy*self.w + ox)*4);        // 写出步长仍是 self.w
 
 **规矩**：每次提交前单独跑 `tsc --noEmit`。
 
+### 9b. D3D11 三个坑（2026-10-31 小地图 GPU 化踩到）
+1. **`Map` 只能用在 DYNAMIC 常量缓冲**：用 `D3D11_USAGE_DEFAULT` 建常量缓冲再 `Map(WRITE_DISCARD)`
+   直接 `E_INVALIDARG (0x80070057)`。要 Map 就 DYNAMIC + `CPU_ACCESS_WRITE`，否则用 `UpdateSubresource`。
+2. **staging 纹理的 `Map(DO_NOT_WAIT)` 在这个 Intel 驱动上照样阻塞 ~8ms**（1.4MB）。
+   本机实测 `map=8172us`，不管有没有 `D3D11_MAP_FLAG_DO_NOT_WAIT`。
+   **解法**：`CopyResource` 之后 `End(查询)`，下一帧先 `GetData` 轮询（它不阻塞），
+   查到了才 `Map` —— 实测 `8172us → 11us`，同一份代码帧率还从 32fps 升到 44fps。
+   教训：`DO_NOT_WAIT` 是"允许驱动不等待"，不是"保证驱动不等待"；要非阻塞必须自己拿查询做栅栏。
+3. **WARP 设备 + 真实输出，`DuplicateOutput` 返回 `E_INVALIDARG` 而不是 `DXGI_ERROR_UNSUPPORTED`**。
+   只认 UNSUPPORTED 会在某些驱动上一直重试而不降级。判"这台设备抓不了这个输出"要连
+   `UNSUPPORTED / NOT_CURRENTLY_AVAILABLE / INVALID_CALL / E_INVALIDARG` 一起认。
+
+### 9c. 先量每一段，再决定优化谁
+本轮一开始"readback 6.5ms"是靠 `copy / map / rows` 三段分开计时才定位的：
+`copy=3us map=8172us rows=191us` —— 一眼看出瓶颈在 Map，不在拷回内存。
+**规矩**：GPU 异步管线的耗时，必须按阶段打点（main.rs 每 2s 打一行 `map stats`）。
+
 ### 10. 关键结论以日志为准
 `bin/logs/overlay.log`：自动保存、512KB 轮转保留 5 份、`{cmd:"log_export",path}` 可导出。
 

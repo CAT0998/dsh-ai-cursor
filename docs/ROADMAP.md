@@ -148,6 +148,68 @@ z 序里光标依旧排在锚点**之前**——也就是说 **`apply_layer` 的
 - 收起/展开、宽度可调
 - 与浮层进程通过插件工具/服务通信，展示菜单项状态与停靠站槽位
 
+### P9a 小地图抓屏 + 降采样上 GPU —— ✅ 已完成并真机验证（2026-10-31）
+
+**做法**：新模块 `overlay/src/gpucap.rs`。`IDXGIOutputDuplication` 每块屏一个 duplication
+（帧是**桌面呈现时**才来的，所以刷新率天然跟随桌面，再由 `dock_frame_interval()` 钳到 30..120fps）；
+一个像素着色器把每块屏 4x4 盒式滤波直接降到它在小地图里的槽位（多屏按虚拟桌面坐标摆放），
+只有小地图大小的结果被读回 CPU，再由 `Canvas::put_thumb` 按行 memcpy 进画布。
+`resample_desktop()`（GDI + HALFTONE）完整保留为兜底。
+
+**降级链**（每一级都真跑过，全部写日志）：
+
+| 级 | 触发 | 实测（本机） |
+|---|---|---|
+| 1 | `D3D11CreateDevice(HARDWARE)` | ✅ 本机走这条：Intel HD Graphics 4000 / FL 11_0 |
+| 2 | 失败 -> `D3D11CreateDevice(WARP)` | 用 `AI_MOUSE_MINIMAP_GPU=warp` 实测：WARP 设备建得起来，但 `DuplicateOutput` 对真实输出返回 `E_INVALIDARG` |
+| 3 | `DuplicateOutput` 判"抓不了"（UNSUPPORTED / NOT_CURRENTLY_AVAILABLE / INVALID_CALL / E_INVALIDARG）-> 立即 GDI | 实测日志 `minimap GPU path unsupported: ... -> falling back to GDI capture` |
+| 4 | 运行中 `DXGI_ERROR_ACCESS_LOST` -> 销毁重建 duplication | `AI_MOUSE_MINIMAP_GPU=lost` 实测：重建后继续出帧（`attempt 1/3`） |
+| 5 | 连续丢帧 >3 次 -> 永久 GDI | `AI_MOUSE_MINIMAP_GPU=lostloop` 实测：`1/3 2/3 3/3` 之后 `dropping to GDI capture after repeated losses` |
+| 6 | 任何一级降级后画面仍然要有 | `AI_MOUSE_MINIMAP_GPU=gdi` 截图 `artifacts/map-gdi-fallback.png` 仍是真实桌面缩略图 |
+
+**实测 CPU**（`scripts/measure-map-cpu.py`，`GetProcessTimes`，8 逻辑核，单位=单核百分比，每档 10s）：
+
+| 场景 | 改前（旧 exe，GDI 抓屏） | 改后（GPU 抓屏） | 同二进制强制 GDI |
+|---|---|---|---|
+| 静置桌面 | **26.8%** | **10.8%**（10.9/8.4/10.8） | 20.8%（20.8/19.5） |
+| 光标持续移动 | 26.3% | **13.6%**（13.1/14.2） | — |
+
+**日志里的分段证据**（`bin/logs/overlay.log` 的 `map stats` 行，每 2s 一行）：
+
+```
+改前/强制 GDI：map stats 32.5fps draw=9415us present=3573us | gpu unavailable
+改后 GPU     ：map stats 42.6fps draw=2659us present=3288us | gpu frames=42 acq=402us draw=77us read=323us (copy=3 map=9 rows=310)
+```
+
+- 抓屏这一段：**~9.4ms -> 0.8ms/帧**（acq 0.40 + 着色器 draw 0.08 + 读回 0.32），剩下的是画布
+  `compose()` 与 `UpdateLayeredWindow`（3.3ms），**不在本次改动范围内**（见下面 P9b）。
+- 帧率 32.5 -> 42.6fps：因为不再被读回阻塞，小地图更跟得上桌面。
+- **踩到的坑**（详见 LESSONS 9b）：常量缓冲要 DYNAMIC 才能 Map；staging 的
+  `Map(DO_NOT_WAIT)` 在这个驱动上仍阻塞 8ms，必须用事件查询做栅栏（8.2ms -> 11µs）。
+
+**缩放比例**：`artifacts/map-gpu-zoom05.png`（zoom 0.55，8823 色，模糊）/`map-gpu.png`（1.0）/
+`map-gpu-zoom20.png`（zoom 2.0，55683 色，DSH 窗口标题可读）——同一套抓屏，比例=小地图尺寸/桌面尺寸。
+
+**未验证**：本机只有一块屏，双屏是"代码按 `DXGI_OUTPUT_DESC.DesktopCoordinates` 逐屏摆放 +
+`overlay/src/main.rs` 的 `map_geometry_tests` 单测（9/9）"，没有真的插第二块屏看过；
+非 0° 旋转的屏只打日志、不做旋转矫正。
+
+**复测命令**：
+```
+python scripts/measure-map-cpu.py bin/ai-mouse-overlay.exe --secs 10 [--move]
+python scripts/map-shots.py bin/ai-mouse-overlay.exe artifacts [gpu|gdi|warp]
+python scripts/verify-map-dot.py <exe 绝对路径>     # 蓝点跟手（3 个位置，误差 <=1px）
+AI_MOUSE_MINIMAP_GPU=warp|gdi|lost|lostloop   # 降级链测试开关（会写进日志）
+```
+
+蓝点跟手实测（`scripts/verify-map-dot.py`）：指针 (300,200)/(1600,900)/(960,540) 三处，
+画布上找不到偏差超过 **1px** 的位置 —— 缩略图有缓存，蓝点仍然每帧跟着走。
+
+### P9b 下一个瓶颈（还没做）
+抓屏已经只剩 ~0.8ms/帧，现在每帧的大头是画布 `compose()`（98,800 输出像素 x4 采样）与
+`UpdateLayeredWindow`（合计 ~3.3ms）。要继续降 CPU 应该动这里（脏矩形 / 直接合成到 D3D 纹理），
+不是动抓屏。
+
 ### P9 线程与渲染优化
 - **多核**：现在浮层是单线程（主消息循环 + 一个 stdin 读线程）。渲染、协议解析、精灵解码（GIF/SVG 解码最重）应分到不同线程；优先把**解码**和**合成**从主循环挪走。
 - **别再让 CPU 扛渲染**：现在每帧是 GDI 逐像素合成（SS=2 超采样），CPU 占用高。

@@ -36,6 +36,13 @@ features = [
   "Win32_UI_HiDpi",
   "Win32_Graphics_Gdi",
   "Win32_Storage_Xps",
+  # Minimap capture on the GPU: Desktop Duplication + a D3D11 pixel shader.
+  # See src/gpucap.rs and the P9 note in docs/ROADMAP.md.
+  "Win32_Graphics_Direct3D",
+  "Win32_Graphics_Direct3D11",
+  "Win32_Graphics_Direct3D_Fxc",
+  "Win32_Graphics_Dxgi",
+  "Win32_Graphics_Dxgi_Common",
 ]
 
 [profile.release]

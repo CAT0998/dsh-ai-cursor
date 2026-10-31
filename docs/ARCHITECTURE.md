@@ -54,6 +54,7 @@
 | **分区布局** | `overlay/src/sections.rs` | 面板各分区的排版与命中框 | 绘制像素 |
 | **控件模型** | `overlay/src/widget.rs` | `Hit`/`Kind`/`PanelView` 数据结构 | 逻辑分支 |
 | **图案** | `overlay/src/sprite.rs` | 解码、缓存、合成 | 窗口 |
+| **GPU 抓屏** | `overlay/src/gpucap.rs` | 小地图的桌面抓取、着色器降采样、能力探测与降级 | 画布绘制、窗口操作 |
 | **色环** | `overlay/src/wheel.rs` | 色环缓存与取色 | 面板 |
 | **自定义模块** | `overlay/src/custom.rs` | JSON → 按钮/标签 | 执行代码 |
 | **日志** | `overlay/src/log.rs` | 轮转、导出 | 业务 |
@@ -106,6 +107,7 @@ widget.rs  ←── sections.rs ←── main.rs(draw_panel)
 | 一个新的**跨进程数据** | 走文件，写 `<exeDir>/logs/<name>.json`；读取方自己算路径 | **不要**用 assetDir（进程写不了） |
 | 一个新的**子进程模式** | `--<mode>` 标志 + `main()` 里分支 + 复用 `make_window("AiMouseOverlay")` | **不要**新建窗口类（`CreateWindowExW` 对新类返回 null，实测） |
 | 一个新的**外观参数** | `St` 加字段 → `PanelView` 加字段 → `view_of` 传递 → 分区里出控件 | 三处一起改，漏一处就是"改了没效果" |
+| 小地图的**桌面画面**（抓屏 + 缩放） | `main.rs` 的 `draw_map_surface` → `map_thumb` → `gpucap::desktop_thumb` | 画布只收成品缩略图（`Canvas::put_thumb`）；GPU 不可用时同一函数回落到 `resample_desktop` |
 
 **反例（我犯过的）**：往 `draw_panel` 的 match 末尾追加一个 `Kind` 分支，但没在 `widget.rs` 加枚举值 → 不穷尽；
 往 `sections.rs` 末尾追加分区 → 显示在最后，顺序不对；
