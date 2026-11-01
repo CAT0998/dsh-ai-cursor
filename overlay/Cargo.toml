@@ -23,6 +23,12 @@ image = { version = "0.25", default-features = false, features = [
 ] }
 # SVG rasterisation: a maintained implementation instead of hand-rolled parsing.
 resvg = "0.45"
+# T1 feasibility probe (examples/tinyskia_probe.rs). tiny-skia is already in the
+# tree through resvg, so this pins the same 0.11.4 rather than adding a second
+# copy; fontdue is only needed to prove the text path. Neither is used by the
+# shipped binary - the example is the only consumer.
+tiny-skia = "0.11"
+fontdue = "0.9"
 
 [dependencies.windows]
 version = "0.58"
