@@ -352,6 +352,18 @@ fn dock_command_path() -> Option<std::path::PathBuf> {
     Some(dir.join("dock-command.json"))
 }
 
+/// Millisecond wall clock, the same one `St::started_ms` is taken from.
+///
+/// Every command file write must carry it: the readers treat "no epoch" as a
+/// leftover from an earlier run, so a command without one is silently ignored
+/// (and used to freeze the panel, see the `'dock_cmd` block in the main loop).
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 static DOCK_SELECTED: std::sync::Mutex<Vec<bool>> = std::sync::Mutex::new(Vec::new());
 
 /// The "back to the station" button under a berth, and the plate area above it.
@@ -2419,7 +2431,12 @@ fn on_toggle(st: &mut St, id: &str) {
                 let name = st.presets.get(sel).cloned().unwrap_or_default();
                 if let Some(path) = dock_command_path().map(|p| p.display().to_string()) {
                     let action = if id == "preset_save" { "preset_save" } else { "preset_delete" };
-                    let body = serde_json::json!({ "action": action, "name": name }).to_string();
+                    // epoch 不能省：读的一方把「没有 epoch」当成上一轮遗留的命令，
+                    // 只有带 epoch 的才算本次请求
+                    let body = serde_json::json!({
+                        "action": action, "name": name, "epoch": now_ms()
+                    })
+                    .to_string();
                     match std::fs::write(&path, body) {
                         Ok(_) => logline!("INFO", "{action} {name:?} -> {path}"),
                         Err(e) => logline!("ERROR", "{action} write {path:?}: {e}"),
@@ -2450,7 +2467,7 @@ fn on_toggle(st: &mut St, id: &str) {
                 let idx = num.parse::<usize>().unwrap_or(0);
                 if let Some(path) = dock_command_path().map(|p| p.display().to_string()) {
                     let body = serde_json::json!({
-                        "action": "toggle_column", "index": idx
+                        "action": "toggle_column", "index": idx, "epoch": now_ms()
                     })
                     .to_string();
                     match std::fs::write(&path, body) {
@@ -4473,7 +4490,15 @@ fn main() {
 
             // Dock commands: the dock writes what should happen to a berth, this
             // process acts only on the one addressed to it.
-            {
+            //
+            // `<exeDir>/logs/dock-command.json` is a mailbox that lingers: a command
+            // written by an earlier run, or one the host has not consumed yet, is
+            // still on disk for the next frame. Every exit below is therefore
+            // `break 'dock_cmd`, never `continue`: a `continue` here jumped over the
+            // rest of the frame - the repaint, the resize AND the 8 ms sleep - so a
+            // single stale command froze the panel (no redraw, 100% CPU) until the
+            // file was removed. That is the "点了导出预设/保存当前就卡死" bug.
+            'dock_cmd: {
                 let (path, my_index) = {
                     let s = st.lock().unwrap();
                     (
@@ -4498,8 +4523,9 @@ fn main() {
                                 epoch > s.started_ms
                             };
                             if !fresh {
-                                // stale command from an earlier run: ignore it
-                                continue;
+                                // stale command from an earlier run: drop the
+                                // command only - the frame must still draw
+                                break 'dock_cmd;
                             }
                             if action == "shutdown" && epoch != 0 {
                                 logline!("INFO", "shutdown command epoch={epoch}");
@@ -4525,7 +4551,9 @@ fn main() {
                                     drop(s);
                                     logline!("INFO", "stop_all epoch={epoch} applied");
                                 }
-                                continue;
+                                // the file stays on disk for the other cursor
+                                // processes; this frame still has to paint
+                                break 'dock_cmd;
                             }
                             if idx == my_index && action == "rest" {
                                 let tx = v.get("x").and_then(|x| x.as_f64()).unwrap_or(0.0);
