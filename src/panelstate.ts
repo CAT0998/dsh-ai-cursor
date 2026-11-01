@@ -3,7 +3,7 @@
  *
  * They are two separate files on purpose — requirement "鼠标设置和主题设置分开保存":
  *
- *   `<assetDir>/menu-themes.json`     the menu bar's own look: accent + zoom
+ *   `<assetDir>/menu-themes.json`     the menu bar's own look: its accent only
  *   `<assetDir>/cursor-presets.json`  a named snapshot of ONE AI cursor
  *
  * `presets.json` keeps working exactly as before as the legacy mixed store
@@ -17,11 +17,17 @@
 import { readFile, mkdir, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 
-/** One named look for the menu bar itself. */
+/**
+ * One named look for the menu bar itself.
+ *
+ * It is an accent and nothing else. Menu themes used to carry a `zoom` as well; that
+ * field went out with the 「菜单缩放」 control, which the user had removed because it
+ * duplicated the concept of resizing the window (see docs/TASKS.md, decision table).
+ * Old files that still contain `zoom` keep loading — the extra key is simply ignored.
+ */
 export interface MenuTheme {
   name: string
   accent: string
-  zoom: number
   saved_at?: string
 }
 
@@ -67,9 +73,9 @@ export function cursorPresetKey(
   ].join('|')
 }
 
-/** Same idea for a menu theme: accent + zoom are the whole look. */
-export function menuThemeKey(theme: Pick<MenuTheme, 'accent' | 'zoom'>): string {
-  return `${normColor(theme.accent)}|${round3(theme.zoom, 1)}`
+/** Same idea for a menu theme: the accent IS the whole look now. */
+export function menuThemeKey(theme: Pick<MenuTheme, 'accent'>): string {
+  return normColor(theme.accent)
 }
 
 export interface UpsertResult<T> {
@@ -168,8 +174,7 @@ export async function loadMenuThemes(file: string): Promise<MenuTheme[]> {
       typeof t === 'object' &&
       t !== null &&
       typeof (t as MenuTheme).name === 'string' &&
-      typeof (t as MenuTheme).accent === 'string' &&
-      typeof (t as MenuTheme).zoom === 'number',
+      typeof (t as MenuTheme).accent === 'string',
   )
 }
 
@@ -245,7 +250,6 @@ export async function handlePanelCommand(
     const theme: MenuTheme = {
       name: nextThemeName(list),
       accent: String(cmd.accent ?? '#4FC3F7'),
-      zoom: Number(cmd.zoom ?? 1),
       saved_at: new Date().toISOString(),
     }
     const result = upsertMenuTheme(list, theme)

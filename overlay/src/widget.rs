@@ -107,8 +107,7 @@ impl CursorSettings {
 /// function of state — the same input always produces the same widgets.
 #[allow(dead_code)]
 #[derive(Clone)]
-pub struct PanelView {
-    pub full: bool,
+pub struct PanelView {    pub full: bool,
     pub theme: String,
     pub badge: bool,
     pub opacity: f64,
@@ -134,8 +133,16 @@ pub struct PanelView {
     pub epoch_ms: u64,
     /// Which artwork slot the editor block below the rows is editing.
     pub art_sel: usize,
-    /// Panel zoom: every rect and font is derived from it.
-    pub zoom: f64,
+    /// Window width in device px. The CONTENT is always authored at `PW` (452);
+    /// a wider window simply leaves the right-hand margin empty, a narrower one
+    /// scrolls horizontally. Nothing is ever stretched.
+    pub panel_w: i32,
+    /// Window height in device px (it is also the content viewport height).
+    pub panel_h: i32,
+    /// Width of the content viewport: `min(panel_w, PW)`.
+    pub view_w: i32,
+    /// Horizontal scroll offset in design px, 0..=(PW - view_w).
+    pub hscroll: i32,
     /// Selected cursors, one column header each.
     pub columns: Vec<(String, u32)>,
     pub columns_collapsed: bool,
@@ -156,8 +163,9 @@ pub struct PanelView {
     pub scroll: i32,
     /// Design height the whole section stack needs (may exceed `view_h`).
     pub content_h: i32,
-    /// Design height of the visible viewport: the content capped by the monitor's
-    /// work area, so the last section can never hide under the taskbar again.
+    /// Height of the visible viewport (the window's client height). The content is
+    /// capped by the monitor's work area when the height is automatic, so the last
+    /// section can never hide under the taskbar again.
     pub view_h: i32,
     /// The PANEL's own accent. Menu themes drive this one only; the cursor keeps
     /// using `accent`. Two colours is what makes "菜单主题" and "AI 鼠标设置" truly
@@ -178,6 +186,17 @@ pub struct PanelView {
     /// The selected cursor's editable look: the mouse section reads THIS, not the
     /// local `St`, because the selected cursor may be a different process.
     pub sel_settings: CursorSettings,
+}
+
+impl PanelView {
+    /// Widest horizontal scroll offset, in design px.
+    ///
+    /// Zero unless the window is narrower than the content's design width, and that
+    /// is the whole rule: the panel only ever scrolls sideways because the WINDOW is
+    /// too narrow for a 452-wide column, never because the content overflowed.
+    pub fn max_hscroll(&self) -> i32 {
+        (crate::PW - self.view_w.max(0)).max(0)
+    }
 }
 
 #[allow(dead_code)]

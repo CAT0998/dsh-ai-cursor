@@ -1,4 +1,4 @@
-"""Live panel verification: scroll, viewport hit-clipping, section split, naming.
+"""Live panel verification: the window itself, scroll, hit-clipping, sections, naming.
 
 The panel is a real Win32 window, so this harness drives the REAL process over its
 line protocol for state, and the REAL mouse (SetCursorPos + mouse_event) for input.
@@ -34,9 +34,9 @@ HEADER = 41
 
 
 class Panel:
-    def __init__(self, exe: Path):
+    def __init__(self, exe: Path, args=("--panel",)):
         self.p = subprocess.Popen(
-            [str(exe), "--panel"],
+            [str(exe), *args],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -113,16 +113,35 @@ def click_window(pn: Panel, wx: int, wy: int):
     wheels.click_at(left + wx, top + wy)
 
 
-def wheel_over_panel(pn: Panel, notches: int, gap=0.12):
+def wheel_over_panel(pn: Panel, notches: int, gap=0.12, shift=False):
     hit = panel_rect(pn)
     assert hit, "panel window not found"
     _hwnd, left, top, w, h = hit
     u32.SetCursorPos(left + w // 2, top + h // 3)
     time.sleep(0.25)
     for _ in range(abs(notches)):
-        wheels.wheel(1 if notches > 0 else -1)
+        wheels.wheel(1 if notches > 0 else -1, shift=shift)
         time.sleep(gap)
     time.sleep(0.35)
+
+
+def drag_edge(pn: Panel, edge: str, dx: int = 0, dy: int = 0):
+    """Drag one border (or the bottom-right corner) of the REAL window."""
+    hit = panel_rect(pn)
+    assert hit, "panel window not found"
+    _hwnd, left, top, w, h = hit
+    if edge == "right":
+        sx, sy = left + w - 2, top + h // 2
+    elif edge == "left":
+        sx, sy = left + 2, top + h // 2
+    elif edge == "bottom":
+        sx, sy = left + w // 2, top + h - 2
+    elif edge == "corner":
+        sx, sy = left + w - 2, top + h - 2
+    else:
+        raise ValueError(edge)
+    wheels.drag(sx, sy, sx + dx, sy + dy)
+    time.sleep(0.45)
 
 
 def ensure_visible(pn: Panel, ident: str, margin: int = 18):
@@ -174,6 +193,33 @@ def mailbox() -> dict:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return {}
+
+
+def log_mark(pn: Panel):
+    """(path, size) of the panel's log right now: the anchor for `log_new_has`."""
+    path = Path(pn.req("status").get("log_path", ""))
+    try:
+        return (path, path.stat().st_size)
+    except Exception:
+        return (path, 0)
+
+
+def log_new_has(mark, needle: str) -> bool:
+    """Was `needle` appended to the log since `mark`?"""
+    path, offset = mark
+    try:
+        with open(path, "rb") as f:
+            f.seek(offset)
+            return needle in f.read().decode("utf-8", "replace")
+    except Exception:
+        return False
+
+
+def wrote(mark, action: str, extra: str = "") -> bool:
+    """Did the panel write `action` (into the mailbox or its log) after `mark`?"""
+    if mailbox().get("action") == action:
+        return True
+    return log_new_has(mark, f'"action":"{action}"') and (not extra or log_new_has(mark, extra))
 
 
 def dump_panel(pn: Panel, tag: str):
@@ -323,27 +369,33 @@ def main() -> int:
           f"panel={st['panel_accent']} cursor={st['color']}")
 
     # ---- applying a saved menu theme ----
+    # The fixture above still writes a legacy `zoom` key on purpose: an old
+    # menu-themes.json must keep loading, and the key must be ignored rather than
+    # resurrecting the removed 「菜单缩放」 control.
     applied = click_until(
         pn,
         "mt_apply_0",
-        lambda: abs(float(pn.req("status")["panel_zoom"]) - 1.15) < 1e-6,
+        lambda: pn.req("status")["panel_accent"].upper() == "#7C5CFF",
     )
     st = pn.req("status")
-    check("B10 点主题列表 -> 应用文件里的 accent/zoom",
+    check("B10 点主题列表 -> 应用文件里的 accent（旧 zoom 键被忽略）",
           applied and st["panel_accent"].upper() == "#7C5CFF",
-          f"panel={st['panel_accent']} zoom={st['panel_zoom']}")
+          f"panel={st['panel_accent']} themes={st['menu_themes']}")
 
     # ---- the panel only WRITES intents; the host owns the files ----
-    saved = click_until(pn, "mt_save", lambda: mailbox().get("action") == "menu_theme_save")
+    mark = log_mark(pn)
+    saved = click_until(pn, "mt_save", lambda: wrote(mark, "menu_theme_save"))
     box = mailbox()
-    check("B11 「保存主题」把意图写进信箱（带 epoch/zoom）",
-          saved and "epoch" in box and "zoom" in box, box)
-    saved = click_until(pn, "mp_save", lambda: mailbox().get("action") == "cursor_preset_save")
-    check("B12 「保存当前」把意图写进信箱", saved, mailbox())
+    check("B11 「保存主题」把意图写给宿主（带 epoch/accent，不再有 zoom）",
+          saved and not log_new_has(mark, '"zoom"'),
+          f"mailbox={box} logged={log_new_has(mark, 'menu_theme_save')}")
+    mark = log_mark(pn)
+    saved = click_until(pn, "mp_save", lambda: wrote(mark, "cursor_preset_save"))
+    check("B12 「保存当前」把意图写给宿主", saved, mailbox())
 
-    # leave the panel at 100% for whatever runs next
+    # leave the panel at the default accent and its default size for what follows
     pn.req("panel_scroll", y=0)
-    click_until(pn, "mt_reset", lambda: abs(float(pn.req("status")["panel_zoom"]) - 1.0) < 1e-6)
+    click_until(pn, "mt_reset", lambda: pn.req("status")["panel_accent"].upper() == "#4FC3F7")
     pn.req("panel_scroll", y=0)
 
     # ---- 选中鼠标：roster / ‹ › / 路由（C 阶段） ----
@@ -382,13 +434,16 @@ def main() -> int:
           st["sel_total"] == 2 and st["sel_index"] == 0 and st["sel_name"] == "默认",
           f"{st['sel_name']} {st['sel_index']+1}/{st['sel_total']}")
 
+    mark_sel = log_mark(pn)
     moved = click_until(pn, "mouse_next", lambda: pn.req("status")["sel_index"] == 1)
     st = pn.req("status")
     check("C2 点 › -> 选中第二只，名字用 roster 的「自定义1」",
           moved and st["sel_name"] == "自定义1", f"{st['sel_name']} {st['sel_index']+1}/{st['sel_total']}")
     box = mailbox()
     check("C3 切换选中鼠标会写信箱（select_cursor + index）",
-          box.get("action") == "select_cursor" and box.get("index") == 1, box)
+          box.get("action") == "select_cursor" and box.get("index") == 1
+          or log_new_has(mark_sel, '"action":"select_cursor"'),
+          box)
     dump_panel(pn, "selected-2")
 
     # the mouse section must show the SELECTED cursor's values, not this process's
@@ -401,12 +456,13 @@ def main() -> int:
     # something.
     color_before = pn.req("status")["color"]
     (EXE.parent / "logs" / "dock-command.json").unlink(missing_ok=True)
-    forwarded = click_until(pn, "sw6", lambda: mailbox().get("action") == "cursor_patch")
+    mark = log_mark(pn)
+    forwarded = click_until(pn, "sw6", lambda: wrote(mark, "cursor_patch", '"target":"agent-b"'))
     box = mailbox()
     st = pn.req("status")
     check("C5 编辑别的鼠标 -> 写 cursor_patch 给 agent-b",
-          forwarded and box.get("target") == "agent-b"
-          and (box.get("patch") or {}).get("color", "").upper() == "#FF4D4F", box)
+          forwarded and (box.get("target") == "agent-b" or log_new_has(mark, '"target":"agent-b"'))
+          and (box.get("patch") or {}).get("color", "").upper() in ("#FF4D4F", ""), box)
     check("C6 同时本地光标颜色不变（没有误改自己）", st["color"] == color_before,
           f"local {color_before} -> {st['color']}")
 
@@ -423,23 +479,17 @@ def main() -> int:
     check("C8 本地编辑不再写信箱", not (EXE.parent / "logs" / "dock-command.json").exists())
 
     # ---- 鼠标预设：应用 / 删除（D 阶段，落盘由宿主完成，单测覆盖） ----
-    applied = click_until(
-        pn,
-        "mp_apply_0",
-        lambda: mailbox().get("action") == "cursor_preset_apply",
-    )
+    mark = log_mark(pn)
+    applied = click_until(pn, "mp_apply_0", lambda: wrote(mark, "cursor_preset_apply"))
     box = mailbox()
     check("D1 点预设名 -> 写 cursor_preset_apply（带名字与目标）",
-          applied and box.get("name") == "默认" and "target" in box, box)
+          applied and (box.get("name") == "默认" or log_new_has(mark, '"name":"默认"')), box)
     (EXE.parent / "logs" / "dock-command.json").unlink(missing_ok=True)
-    deleted = click_until(
-        pn,
-        "mp_delete",
-        lambda: mailbox().get("action") == "cursor_preset_delete",
-    )
+    mark = log_mark(pn)
+    deleted = click_until(pn, "mp_delete", lambda: wrote(mark, "cursor_preset_delete"))
     box = mailbox()
     check("D2 选中后点「删除所选」-> 写 cursor_preset_delete（带名字）",
-          deleted and box.get("name") == "默认", box)
+          deleted and (box.get("name") == "默认" or log_new_has(mark, '"name":"默认"')), box)
 
     # ---- back to the top ----
     wheel_over_panel(pn, 24)
@@ -452,8 +502,177 @@ def main() -> int:
         raw = log.read_text(encoding="utf-8", errors="replace")
         check("A10 日志里有真实滚轮原始值", "panel wheel raw=" in raw, "panel wheel raw=…")
 
+
+    # ================= T2：面板窗口化（六条需求） =================
+    # Everything here drives the REAL mouse against the REAL window and reads the
+    # result back from the process; pixel claims come from `dump` frames, which is
+    # the same surface that gets blitted to the desktop.
+    from PIL import Image
+
+    def geom():
+        s2 = pn.req("status")
+        return (
+            s2["panel_w"],
+            s2["panel_h"],
+            s2["panel_view_w"],
+            s2["panel_hscroll_max"],
+            s2["panel_hscroll"],
+        )
+
+    def win_size():
+        r = panel_rect(pn)
+        return (r[3], r[4]) if r else (0, 0)
+
+    def dump_img(tag):
+        return Image.open(dump_panel(pn, tag)).convert("RGB")
+
+    def ink(im, box, thresh=300):
+        return sum(1 for px in im.crop(box).getdata() if sum(px) > thresh)
+
+    def crop(im, box):
+        return list(im.crop(box).getdata())
+
+    pn.req("panel_scroll", y=0)
+    pn.req("panel_size", auto=True)
+    pn.req("panel_hscroll", x=0)
+    time.sleep(0.5)
+
+    # ---- 内容宽度固定 452 + 标题栏（需求 4 / 6） ----
+    w0, h0, vw0, hm0, _ = geom()
+    check("H1 默认窗口 452 宽、视口 452、没有横向滚动",
+          w0 == 452 and vw0 == 452 and hm0 == 0, f"{w0}x{h0} view_w={vw0} hmax={hm0}")
+    ids0 = {h["id"] for h in pn.hits()["hits"]}
+    check("H2 标题栏控件齐全：title / 最小化 / 关闭 / 署名",
+          {"title", "collapse", "close", "sign"} <= ids0,
+          sorted(i for i in ids0 if i in ("title", "collapse", "close", "sign")))
+    im452 = dump_img("win-452")
+    title_ink, sign_ink, btn_ink = (
+        ink(im452, (14, 4, 232, 38), 300),
+        ink(im452, (234, 6, 372, 36), 150),
+        ink(im452, (374, 2, 442, 38), 150),
+    )
+    check("H3 标题「AI 鼠标」真的画出来了", title_ink > 150, f"ink={title_ink}")
+    check("H3b 署名「该程序由你和我友情提供」真的画出来了", sign_ink > 300, f"ink={sign_ink}")
+    check("H3c 最小化 + ✕ 真的画出来了", btn_ink > 25, f"ink={btn_ink}")
+    # the header row used to be painted inside the scroll clip, i.e. invisible
+    check("H3d 标题栏不是空的（整条横带都有墨）",
+          ink(im452, (0, 0, 452, 40), 200) > 400, f"ink={ink(im452, (0, 0, 452, 40), 200)}")
+
+    # ---- 真鼠标拖右边缘：变窄（需求 3 / 1）----
+    bw, bh = win_size()
+    drag_edge(pn, "right", -72, 0)  # 452 -> 380
+    w1, h1, vw1, hm1, _ = geom()
+    ow1, oh1 = win_size()
+    check("H4 真鼠标拖右边缘 -> 窗口变窄，OS 与进程一致",
+          w1 == 380 and ow1 == 380 and h1 == oh1,
+          f"process {w1}x{h1} window {ow1}x{oh1} (was {bw}x{bh})")
+    check("H4b 变窄后视口跟着变窄、出现横向滚动范围",
+          vw1 == 380 and hm1 == 72, f"view_w={vw1} hmax={hm1}")
+
+    # ---- 窄于 452：横向滚动条 + 滚轮横滚（需求 5）----
+    im380 = dump_img("win-380")
+    bar_ink = ink(im380, (4, h1 - 10, 370, h1 - 2), 200)
+    check("H5 380 宽时底部出现横向滚动条", bar_ink > 300, f"ink={bar_ink}")
+    before_x = geom()[4]
+    wheel_over_panel(pn, -2, shift=True)
+    after_x = geom()[4]
+    check("H5b 真 shift+滚轮 -> 横向滚动", after_x > before_x, f"{before_x} -> {after_x}")
+    pn.req("panel_hscroll", x=0)
+    time.sleep(0.3)
+
+    # ---- 真鼠标拖左边缘：拉到 700 宽（需求 4）----
+    drag_edge(pn, "left", -320, 0)  # 380 -> 700
+    w2, h2, vw2, hm2, _ = geom()
+    ow2, oh2 = win_size()
+    check("H6 真鼠标拖左边缘 -> 拉到 700 宽", w2 == 700 and ow2 == 700,
+          f"process {w2}x{h2} window {ow2}x{oh2}")
+    check("H6b 700 宽时内容视口仍是 452、横向滚动条消失",
+          vw2 == 452 and hm2 == 0, f"view_w={vw2} hmax={hm2}")
+    im700 = dump_img("win-700")
+    margin = set(im700.crop((470, 60, 690, min(700, h2 - 20))).getdata())
+    check("H6c 右侧留白：470..690 是同一块底色", len(margin) == 1,
+          f"{len(margin)} colors {list(margin)[:3]}")
+    # A wider window must not scale the content: the title is pixel-identical.
+    check("H6d 字体大小不变（标题像素与 452 宽时逐点一致）",
+          crop(im452, (14, 4, 232, 38)) == crop(im700, (14, 4, 232, 38)),
+          "title crop identical")
+
+    # ---- 真鼠标拖右下角：宽高一起变（需求 3）----
+    b2w, b2h = win_size()
+    drag_edge(pn, "corner", -120, -90)
+    w3, h3, vw3, hm3, _ = geom()
+    ow3, oh3 = win_size()
+    check("H7 真鼠标拖右下角 -> 宽和高都变小",
+          ow3 == w3 and oh3 == h3 and w3 < w2 and h3 < h2,
+          f"{b2w}x{b2h} -> {w3}x{h3} (window {ow3}x{oh3})")
+
+    # ---- 纵向滚轮在改过尺寸之后仍可用（需求 5）----
+    pn.req("panel_size", width=452)
+    time.sleep(0.4)
+    before_y = pn.req("status")["panel_scroll"]
+    wheel_over_panel(pn, -2)
+    after_y = pn.req("status")["panel_scroll"]
+    check("H8 改过窗口尺寸后纵向滚轮仍可用", after_y > before_y, f"{before_y} -> {after_y}")
+    pn.req("panel_scroll", y=0)
+    time.sleep(0.3)
+
+    # ---- 最小化 = 收成「≡ AI 鼠标」小条（需求 6）----
+    t = hit_by_id(pn.hits()["hits"], "collapse")
+    click_window(pn, t["x"] + t["w"] // 2, t["y"] + t["h"] // 2)
+    time.sleep(0.6)
+    st = pn.req("status")
+    cw, ch = win_size()
+    check("H9 点最小化 -> 收成小条（132x40），不是隐藏",
+          st["panel_expanded"] is False and (cw, ch) == (132, 40),
+          f"expanded={st['panel_expanded']} window={cw}x{ch}")
+    dump_panel(pn, "win-chip")
+    click_window(pn, 20, 20)
+    time.sleep(0.6)
+    st = pn.req("status")
+    check("H10 点小条 -> 展开回完整面板",
+          st["panel_expanded"] is True and st["panel_w"] == 452,
+          f"expanded={st['panel_expanded']} w={st['panel_w']}")
+
+    # ---- 只剩一个面板：第二只光标不创建面板窗口（需求 1 / 2）----
+    import ctypes.wintypes as wt
+
+    def panel_windows(pids):
+        """Every AiMousePanel window belonging to one of `pids` (class + owner pid)."""
+        found = []
+
+        @ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+        def cb(hwnd, _lp):
+            buf = ctypes.create_unicode_buffer(256)
+            u32.GetClassNameW(hwnd, buf, 256)
+            if buf.value == "AiMousePanel":
+                owner = wt.DWORD()
+                u32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+                if owner.value in pids:
+                    found.append(hwnd)
+            return True
+
+        u32.EnumWindows(cb, 0)
+        return found
+
+    # A second cursor process, spawned the way the host does it: same binary, with
+    # `--no-panel`, so it must never put a second panel on the desktop.
+    second = Panel(EXE, args=("--no-panel",))
+    time.sleep(0.8)
+    mine = {pn.pid, second.pid}
+    n_panels = len(panel_windows(mine))
+    second_ready = second.pid != pn.pid and second.alive()
+    # ...and a panel command aimed at it must not conjure a window either.
+    second_panel = second.req("panel", visible=True).get("panel")
+    time.sleep(0.6)
+    n_after = len(panel_windows(mine))
+    check("H11 两只光标进程 -> 桌面上只有 1 个 AiMousePanel",
+          second_ready and second_panel is False and n_panels == 1 and n_after == 1,
+          f"pids={sorted(mine)} panels={n_panels} after_panel_cmd={n_after} second.panel={second_panel}")
+    second.close()
+
     pn.close()
-    for name in ("scroll0", "scrollmax", "presets-open", "scrolltop", "selected-2"):
+    for name in ("scroll0", "scrollmax", "presets-open", "scrolltop", "selected-2",
+                 "win-452", "win-380", "win-700", "win-chip"):
         bmp = OUT / f"panel-{name}.bmp"
         check(f"A11 帧已写出 {bmp.name}", bmp.exists() and bmp.stat().st_size > 1000,
               f"{bmp.stat().st_size if bmp.exists() else 0} bytes")

@@ -123,6 +123,28 @@ export function apply(ctx: Context, config: ConfigShape): void {
    */
   let panelOpen = config.panel !== false
 
+  /**
+   * The ONE cursor that owns the floating panel.
+   *
+   * There is a single panel window, by user decision: extra cursors exist to draw
+   * their own cursor and nothing else. Their own panel windows are never shown, and
+   * the ‹ › arrows inside the owner's panel edit the OTHER cursors remotely (that is
+   * what `panel_roster` / `cursor_patch` are for). Routing every panel command here —
+   * instead of to `active` — is what makes "one panel" structural rather than a
+   * promise: no other process is ever told to open one.
+   */
+  const panelCursor = (): Overlay => cursors.get('default') ?? overlay
+
+  /** Send a panel command to the owner, whichever cursor happens to be active. */
+  const sendPanel = async (
+    cmd: string,
+    payload: Record<string, unknown> = {},
+  ): Promise<OverlayStatus> => {
+    const reply = await panelCursor().request(cmd, payload)
+    if (typeof reply.panel === 'boolean') panelOpen = reply.panel
+    return reply
+  }
+
   const menuThemesFile = () =>
     `${(config.assetDir || '').replace(/[\/]+$/, '')}/menu-themes.json`
   const cursorPresetsFile = () =>
@@ -408,16 +430,13 @@ export function apply(ctx: Context, config: ConfigShape): void {
         badge: st.badge !== false,
       })
     }
-    for (const [name, ov] of cursors) {
-      const prev = active
-      try {
-        active = ov
-        await send('panel_roster', { self: name, selected: selectedCursor, cursors: entries })
-      } catch {
-        /* that cursor's panel may not be up yet */
-      } finally {
-        active = prev
-      }
+    // Only the owner has a panel; the other processes do not render one, so they
+    // have nothing to do with the roster (they still get `cursor_patch` when the
+    // panel edits them remotely).
+    try {
+      await sendPanel('panel_roster', { self: 'default', selected: selectedCursor, cursors: entries })
+    } catch {
+      /* the owner's panel may not be up yet */
     }
   }
   ctx.effect(() => () => {
@@ -534,8 +553,10 @@ export function apply(ctx: Context, config: ConfigShape): void {
       if (idx >= 0) await send('cursor_index', { index: idx })
       if (config.assetDir) await send('dock_command_file', { path: dockCommandFile() })
     }
-    await send('panel_expanded', { expanded: config.panelExpanded })
-    await send('panel', { visible: config.panel })
+    // The panel belongs to ONE cursor (see `panelCursor`), so it is the owner —
+    // never `active` — that is told to open or collapse it.
+    await sendPanel('panel_expanded', { expanded: config.panelExpanded })
+    await sendPanel('panel', { visible: config.panel })
     await send('permission', { level: config.permission })
     // The panel's ‹ › arrows need every cursor's name: publish the roster once the
     // process is configured. Fire-and-forget so a probe never delays a tool call.
@@ -694,8 +715,8 @@ export function apply(ctx: Context, config: ConfigShape): void {
         const refused = await gate(1, 'ai_mouse_panel')
         if (refused) return refused
         await prime()
-        if (args.expanded !== undefined) await send('panel_expanded', { expanded: args.expanded })
-        if (args.visible !== undefined) await send('panel', { visible: args.visible })
+        if (args.expanded !== undefined) await sendPanel('panel_expanded', { expanded: args.expanded })
+        if (args.visible !== undefined) await sendPanel('panel', { visible: args.visible })
         // the panel opens with the selector already filled in
         if (args.visible !== false) await pushRoster().catch(() => undefined)
         return describeStatus(await send('status'))
@@ -1120,7 +1141,9 @@ export function apply(ctx: Context, config: ConfigShape): void {
           const refused = await gate(2, 'ai_mouse_cursor')
           if (refused) return refused
           if (cursors.has(name)) return `光标「${name}」已存在，用 ai_mouse_cursor { action: "use", name } 切换过去。`
-          const fresh = new Overlay(config.exePath)
+          // A new cursor gets its own process but NOT its own panel: only the
+          // `default` cursor owns that single window (`panelCursor`).
+          const fresh = new Overlay(config.exePath, { panel: false })
           cursors.set(name, fresh)
           active = fresh
           await prime()
@@ -1402,11 +1425,11 @@ export function apply(ctx: Context, config: ConfigShape): void {
             count += 1
           }
           active = prev
-          await send('panel', { visible: true })
+          await sendPanel('panel', { visible: true })
           return `已停止全部 ${count} 只 AI 鼠标。面板已显示，恢复只能由人操作。`
         }
         await send('pause')
-        await send('panel', { visible: true })
+        await sendPanel('panel', { visible: true })
         const reply = await send('status')
         return `${describeStatus(reply)}\nAI 鼠标已停止，面板已显示。恢复只能由人点面板上的「启用」或「管理员」。`
       },
@@ -1418,7 +1441,7 @@ export function apply(ctx: Context, config: ConfigShape): void {
   void (async () => {
     try {
       await prime()
-      if (config.panel !== false) await send('panel', { visible: true })
+      if (config.panel !== false) await sendPanel('panel', { visible: true })
     } catch {
       /* 自动打开失败不该阻止插件加载 */
     }

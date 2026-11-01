@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { describeStatus } from '../src/index'
-import { resolveExePath } from '../src/overlay'
+import { Overlay, resolveExePath } from '../src/overlay'
 import { LEVELS, denial, levelInfo, levelName, normalizeLevel, permits } from '../src/permissions'
 
 describe('describeStatus', () => {
@@ -101,6 +101,18 @@ describe('permission ladder', () => {
     expect(text).toContain('只读')
     expect(text).toContain('Permission denied')
     expect(levelInfo(3).zh).toBe('管理员')
+  })
+})
+
+describe('一个面板（T2）', () => {
+  it('只有 default 光标拥有面板，其它光标进程用 --no-panel 启动', () => {
+    // The panel is a single window: a second cursor must not create a second
+    // AiMousePanel window, so its process is spawned with `--no-panel`.
+    expect(new Overlay('C:/x/ai-mouse-overlay.exe').spawnArgs).toEqual([])
+    expect(new Overlay('C:/x/ai-mouse-overlay.exe', { panel: false }).spawnArgs).toEqual([
+      '--no-panel',
+    ])
+    expect(new Overlay('C:/x/ai-mouse-overlay.exe', { panel: true }).spawnArgs).toEqual([])
   })
 })
 

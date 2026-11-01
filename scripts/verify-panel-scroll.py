@@ -17,8 +17,11 @@ u32 = ctypes.windll.user32
 PANEL_CLASS = "AiMousePanel"
 INPUT_MOUSE = 0
 MOUSEEVENTF_WHEEL = 0x0800
+MOUSEEVENTF_HWHEEL = 0x01000
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
+VK_SHIFT = 0x10
+KEYEVENTF_KEYUP = 0x0002
 
 
 class MOUSEINPUT(ctypes.Structure):
@@ -63,15 +66,31 @@ def panel_rect(pid: int):
     return found[0] if found else None
 
 
-def wheel(notches: int):
+def wheel(notches: int, shift: bool = False) -> None:
     """+1 = one notch up (content up), -1 = one notch down.
 
     `mouse_event` rather than a hand-rolled SendInput struct: the INPUT union size
     differs per architecture, and a wrong cbSize makes SendInput fail silently
     (return 0) — which looks exactly like "the window did not get the wheel".
+
+    `shift=True` holds the real Shift key down across the notch, which is the standard
+    "scroll sideways" gesture: the OS puts MK_SHIFT into the message's key state, so
+    the window sees a genuine shift+wheel and not a synthesised flag.
     """
+    if shift:
+        u32.keybd_event(VK_SHIFT, 0, 0, 0)
+        time.sleep(0.06)
     data = (notches * 120) & 0xFFFFFFFF
     u32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, data, 0)
+    if shift:
+        time.sleep(0.06)
+        u32.keybd_event(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0)
+
+
+def hwheel(notches: int) -> None:
+    """A tilt-wheel notch: the OS turns this into WM_MOUSEHWHEEL."""
+    data = (notches * 120) & 0xFFFFFFFF
+    u32.mouse_event(MOUSEEVENTF_HWHEEL, 0, 0, data, 0)
 
 
 def click_at(screen_x: int, screen_y: int) -> None:
@@ -81,6 +100,29 @@ def click_at(screen_x: int, screen_y: int) -> None:
     u32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
     time.sleep(0.06)
     u32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+
+
+def drag(from_x: int, from_y: int, to_x: int, to_y: int, steps: int = 14) -> None:
+    """A real press-drag-release through the OS input path.
+
+    The panel's resize gesture is driven by GetCursorPos deltas, so the intermediate
+    moves matter: a jump straight to the target would still work, but a smooth path is
+    what a human does and it proves the handler survives many WM_MOUSEMOVE messages
+    while the window is being resized underneath the pointer.
+    """
+    u32.SetCursorPos(from_x, from_y)
+    time.sleep(0.3)
+    u32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+    time.sleep(0.12)
+    for i in range(1, steps + 1):
+        u32.SetCursorPos(
+            int(from_x + (to_x - from_x) * i / steps),
+            int(from_y + (to_y - from_y) * i / steps),
+        )
+        time.sleep(0.04)
+    time.sleep(0.15)
+    u32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+    time.sleep(0.45)
 
 
 def main() -> int:

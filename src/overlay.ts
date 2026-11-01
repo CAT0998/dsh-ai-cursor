@@ -102,9 +102,23 @@ export class Overlay {
   /** The dock station process (`--dock`); berths come from a JSON file. */
   private dockChild: ChildProcessWithoutNullStreams | undefined
   private readonly exe: string
+  /**
+   * Does this process own the floating panel?
+   *
+   * Only the `default` cursor does. Every other cursor is spawned with `--no-panel`
+   * so the overlay does not even CREATE a panel window: "one panel on the desktop"
+   * then holds for `EnumWindows`, not just for what happens to be visible.
+   */
+  private readonly ownsPanel: boolean
 
-  constructor(exePath: string) {
+  constructor(exePath: string, options: { panel?: boolean } = {}) {
     this.exe = resolveExePath(exePath)
+    this.ownsPanel = options.panel !== false
+  }
+
+  /** The argv this cursor is started with. Public so the rule can be unit-tested. */
+  get spawnArgs(): string[] {
+    return this.ownsPanel ? [] : ['--no-panel']
   }
 
   get executable(): string {
@@ -131,7 +145,10 @@ export class Overlay {
     }
 
     this.starting = new Promise<void>((resolveStart, rejectStart) => {
-      const child = spawn(this.exe, [], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
+      const child = spawn(this.exe, this.spawnArgs, {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        windowsHide: true,
+      })
       this.child = child
       this.spawnCount += 1
 

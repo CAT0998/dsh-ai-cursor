@@ -108,14 +108,20 @@ try {
   )
 
   // ---- 菜单主题：面板写的意图 -> 宿主落盘 -> 相同主题不重复 ----
-  await sendMailbox({ action: 'menu_theme_save', accent: '#7C5CFF', zoom: 1.15 })
+  // A menu theme is an accent only: `panel_zoom` (and the theme's `zoom` field) was
+  // removed with the 「菜单缩放」 control.
+  await sendMailbox({ action: 'menu_theme_save', accent: '#7C5CFF' })
   const drained = await call('ai_mouse_dock', {})
   const themeFile = join(assets, 'menu-themes.json')
   const themes = (await exists(themeFile)) ? await readJson(themeFile) : []
   check('E4 信箱命令被消费并写入 menu-themes.json', themes.length === 1, drained.slice(0, 70))
-  check('E5 主题内容正确（accent/zoom）', themes[0]?.accent === '#7C5CFF' && themes[0]?.zoom === 1.15, JSON.stringify(themes[0]))
+  check(
+    'E5 主题内容正确（只有 accent，没有 zoom）',
+    themes[0]?.accent === '#7C5CFF' && themes[0]?.zoom === undefined,
+    JSON.stringify(themes[0]),
+  )
 
-  await sendMailbox({ action: 'menu_theme_save', accent: '#7c5cff', zoom: 1.15 })
+  await sendMailbox({ action: 'menu_theme_save', accent: '#7c5cff' })
   const dedup = await call('ai_mouse_dock', {})
   const themes2 = await readJson(themeFile)
   check('E6 同一个主题存两次 -> 只有一条（端到端去重）',
@@ -123,7 +129,7 @@ try {
 
   // ---- 定时器路径：不调工具也要落盘 ----
   await rm(themeFile, { force: true })
-  await sendMailbox({ action: 'menu_theme_save', accent: '#34D399', zoom: 1 })
+  await sendMailbox({ action: 'menu_theme_save', accent: '#34D399' })
   await sleep(900)
   const timerThemes = (await exists(themeFile)) ? await readJson(themeFile) : []
   check('E7 250ms 定时器在面板打开时排空信箱', timerThemes.length === 1, JSON.stringify(timerThemes[0]?.name))
@@ -185,6 +191,16 @@ try {
   check('E15 预设按 target 存的是 agent-b 的样子（#00AAFF）',
         perCursor.length === 1 && perCursor[0]?.color === '#00AAFF',
         JSON.stringify(perCursor[0] && { name: perCursor[0].name, color: perCursor[0].color }))
+
+  // ---- 只保留一个面板：第二只光标的进程必须带 --no-panel 启动 ----
+  // The overlay logs its own argv at startup, so this proves the HOST half of the
+  // rule (the overlay half is H11 in live-panel-check.py: one AiMousePanel on the
+  // desktop for two cursor processes).
+  const spawnLines = log2.split(String.fromCharCode(10)).filter((l) => l.includes('args=['))
+  const secondCursorArgs = spawnLines[spawnLines.length - 1] ?? ''
+  check('E16 第二只光标进程用 --no-panel 启动（不会多一个面板窗口）',
+        secondCursorArgs.includes('--no-panel'),
+        secondCursorArgs.trim().slice(0, 120))
 
   await call('ai_mouse_cursor', { action: 'use', name: 'default' }).catch(() => '')
   void created

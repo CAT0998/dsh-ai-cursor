@@ -63,14 +63,15 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetClassNameW, GetCursorPos, GetWindow, GetWindowRect, GetWindowThreadProcessId,
     IsWindowVisible,
     GetSystemMetrics, HMENU,
+    LoadCursorW, SetCursor, IDC_ARROW, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE,
     PeekMessageW, RegisterClassExW, SetWindowDisplayAffinity, SetWindowPos, ShowWindow,
     TranslateMessage, UpdateLayeredWindow, HWND_TOPMOST, MA_NOACTIVATE, MSG, PM_REMOVE,
     GetWindowLongW, GWL_EXSTYLE, GW_HWNDPREV, HWND_BOTTOM, HWND_NOTOPMOST, SET_WINDOW_POS_FLAGS, SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE,
     SWP_NOMOVE, SWP_NOSIZE,
     SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, SYSTEM_METRICS_INDEX, ULW_ALPHA,
     WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_SETCURSOR, WNDCLASSEXW,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 // ---------------------------------------------------------------- geometry ---
@@ -84,8 +85,13 @@ const SS: i32 = 2; // supersample factor for the cursor artwork
 const TIP_X: f64 = 200.0; // where the cursor tip sits inside its window
 const TIP_Y: f64 = 44.0;
 
-const PW: i32 = 452; // expanded panel width
-const PH: i32 = 396; // expanded panel height
+/// **Content design width.** The panel's content is authored once at this width and
+/// never scales: a wider window leaves this much column on the left and blank margin
+/// on the right, a narrower one scrolls horizontally. The WINDOW width is
+/// `St.panel_w`, which the user drags; `panel_geom()` is the only place the two are
+/// reconciled (docs/ARCHITECTURE.md §7.5).
+const PW: i32 = 452;
+const PH: i32 = 396; // default expanded panel height
 const CHIP_W: i32 = 132; // collapsed panel width
 const CHIP_H: i32 = 40; // collapsed panel height
 const SS_PANEL: i32 = 2; // supersample factor for the panel
@@ -181,9 +187,20 @@ unsafe extern "system" fn tray_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
     }
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }
-/// Initial panel zoom x1000, from `--panel-zoom`.
-static INIT_ZOOM: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1000);
 /// `--panel` shows the panel at startup, for development and screenshots.
+/// Width of the invisible-but-solid border the user can grab to resize the window.
+///
+/// "像普通窗口一样" here means OUR border is the hot zone: the window is a layered
+/// WS_POPUP, so there is no system frame to grab, and adding WS_THICKFRAME would
+/// hand the window to the DWM's non-client painting (no transparency, black corners).
+/// The strip is drawn as an opaque 1px stroke plus this many px of grab room inside it.
+const RESIZE_EDGE: i32 = 6;
+/// Smallest window the panel may be dragged down to: below this the header (title,
+/// minimise, close, signature) no longer fits and nothing would be reachable.
+const PANEL_MIN_W: i32 = 300;
+const PANEL_MIN_H: i32 = 140;
+/// Design px one horizontal wheel notch scrolls.
+const HSCROLL_STEP: i32 = 60;
 /// Frame interval for the dock, taken from the display's own refresh rate and
 /// capped: repainting faster than the monitor can show is wasted work, and a
 /// 144Hz panel does not need 144 redraws of a static strip.
@@ -284,11 +301,13 @@ fn read_preset_names(dir: &str) -> Vec<String> {
 ///
 /// Written by the HOST only: this process cannot write the asset directory
 /// (os error 5), which is why "保存主题" goes out as a mailbox command.
+///
+/// It carries an accent and nothing else. The `zoom` field a theme used to store is
+/// gone with the 「菜单缩放」 control: the window's size belongs to the window.
 #[derive(Clone, Default)]
 struct MenuTheme {
     name: String,
     accent: u32,
-    zoom: f64,
 }
 
 /// Menu themes, read-only here. A malformed file is an empty set, never an error:
@@ -310,8 +329,7 @@ fn read_menu_themes(dir: &str) -> Vec<MenuTheme> {
                 .filter_map(|t| {
                     let name = t.get("name").and_then(|x| x.as_str())?.to_string();
                     let accent = t.get("accent").and_then(|x| x.as_str()).and_then(parse_hex).unwrap_or(0x4FC3F7);
-                    let zoom = t.get("zoom").and_then(|x| x.as_f64()).unwrap_or(1.0).clamp(0.6, 2.0);
-                    Some(MenuTheme { name, accent, zoom })
+                    Some(MenuTheme { name, accent })
                 })
                 .collect()
         })
@@ -706,6 +724,19 @@ fn dock_write_selection() {
 static DOCK_TOPMOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static DOCK_ZOOM: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(100);
 static INIT_PANEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// `--no-panel`: this process draws a cursor and nothing else.
+///
+/// The floating panel is a SINGLE window by user decision, owned by the `default`
+/// cursor; a second cursor gets its own process (so its own window, state and
+/// configuration) but no panel of its own. The host passes this flag to every cursor
+/// it spawns after the first, so "one panel" holds at the level of what exists on the
+/// desktop: `EnumWindows` finds exactly one `AiMousePanel` no matter how many cursors
+/// are running.
+static NO_PANEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn has_panel() -> bool {
+    !NO_PANEL.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// What each berth currently holds. Pushed over stdin as one JSON line, so the
 /// dock stays a dumb renderer: all the knowledge (which subagent, which preset)
@@ -1206,6 +1237,20 @@ struct RosterEntry {
 /// One editable change, in the same shape the mailbox uses.
 type Patch = serde_json::Value;
 
+/// One in-progress edge drag (resize).
+///
+/// `edge` is a bitmask — 1 = left, 2 = right, 4 = top, 8 = bottom — so a corner is
+/// simply two bits. `from` is the pointer position where the drag started and `rect`
+/// the window rect at that moment: every move is computed as a delta against that
+/// origin, which keeps the drag exact even though the window itself is being resized
+/// underneath the pointer (client coordinates would drift).
+#[derive(Clone, Copy, Default)]
+struct ResizeDrag {
+    edge: u32,
+    from: (i32, i32),
+    rect: (i32, i32, i32, i32),
+}
+
 #[derive(Clone)]
 struct St {
     // --- cursor window ---
@@ -1254,8 +1299,8 @@ struct St {
     drag_slider: Option<&'static str>,
     drag_panel: Option<(i32, i32)>,
     drag_wheel: bool,
-    drag_grip: bool,
-    grip_start: (f64, i32),
+    /// An edge drag in progress (resize). See `ResizeDrag`.
+    resize: Option<ResizeDrag>,
 
     // --- permission ---
     permission: u8,
@@ -1268,8 +1313,16 @@ struct St {
     panel_px_h: i32,
     /// How far the section stack is scrolled, in design px. 0 = top.
     scroll: i32,
-    /// Panel zoom: layout stays at design size, only the image is stretched.
-    panel_zoom: f64,
+    /// How far the content is scrolled horizontally, in design px. Only ever
+    /// non-zero when the window is narrower than the design width (`PW`).
+    hscroll: i32,
+    /// The WINDOW's own width. Independent of the content width: the content stays
+    /// `PW` wide and the difference shows up as a right-hand margin.
+    panel_w: i32,
+    /// A height the user dragged for the window; `None` = automatic (fit the content,
+    /// capped by the monitor's work area). Kept separate from `panel_px_h`, which is
+    /// what was last applied to the window.
+    panel_h_user: Option<i32>,
     asset_dir: String,
     custom: custom::CustomSpec,
     art_sel: usize,
@@ -1405,8 +1458,7 @@ impl St {
             drag_slider: None,
             drag_panel: None,
             drag_wheel: false,
-            drag_grip: false,
-            grip_start: (1.0, 0),
+            resize: None,
             permission: 3,
             prev_permission: 3,
             slots: [Slot::new(SLOT_CURSOR), Slot::new(SLOT_HINT), Slot::new(SLOT_ORNAMENT)],
@@ -1419,7 +1471,9 @@ impl St {
             assets: Vec::new(),
             panel_px_h: PH,
             scroll: 0,
-            panel_zoom: INIT_ZOOM.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0,
+            hscroll: 0,
+            panel_w: PW,
+            panel_h_user: None,
             asset_dir: String::new(),
             art_sel: 0,
             layer_mode: "topmost".to_string(),
@@ -1490,6 +1544,15 @@ fn state() -> &'static Arc<Mutex<St>> {
 
 // ------------------------------------------------------------ widget model ---
 
+/// The panel's widget model: header chrome first, then the scrollable content.
+///
+/// Geometry rule (the thing that used to drift):
+///   * the HEADER is laid out against the **window** width (`v.panel_w`): it is the
+///     window's title bar, so `─` / `✕` / the signature hug the real right edge;
+///   * the CONTENT is laid out against the fixed **design** width (`PW`): widening the
+///     window leaves blank margin, it never stretches a control;
+///   * the content span is shifted by `-v.hscroll` **in this one place**, after the
+///     footer is in, so the rects that get painted are the rects that get hit-tested.
 fn panel_layout(v: &PanelView) -> Vec<Hit> {
     let mut o: Vec<Hit> = Vec::with_capacity(96);
 
@@ -1502,7 +1565,10 @@ fn panel_layout(v: &PanelView) -> Vec<Hit> {
     }
 
     let pad = sections::PAD;
-    let right = PW - pad;
+    let right = v.panel_w - pad;
+
+    // ---- title bar (never scrolls; ids are unchanged, hit tests rely on them) ----
+    // 最小化 = 收成「≡ AI 鼠标」小条（再点一下展开），id 仍是 `collapse`。
     o.push(
         Hit::new(rect(right - 60, 8, right - 34, 32), Kind::Button, "collapse")
             .text("\u{2500}")
@@ -1513,16 +1579,24 @@ fn panel_layout(v: &PanelView) -> Vec<Hit> {
             .text("\u{2715}")
             .hover(v.hover == "close"),
     );
-    o.push(Hit::new(rect(0, 0, PW, 40), Kind::Header, "drag"));
-    o.push(Hit::new(rect(pad, 0, 200, 40), Kind::Label, "title").text("AI 鼠标"));
+    o.push(Hit::new(rect(0, 0, v.panel_w, 40), Kind::Header, "drag"));
+    o.push(Hit::new(rect(pad, 10, pad + 200, 34), Kind::Label, "title").text("AI 鼠标"));
+    // 署名：标题栏右侧、✕ 左边，小号灰字（Label 的 12px 字体 + muted 色）
+    o.push(
+        Hit::new(rect(pad, 12, right - 70, 30), Kind::LabelRight, "sign")
+            .text("该程序由你和我友情提供"),
+    );
     o.push(Hit::new(rect(pad, 40, right, 41), Kind::Sep, "sep1"));
 
+    // ---- content (fixed design width, both scroll offsets) ----
     // The section stack is laid out from an offset y: scrolling is therefore a
     // single number that moves the paint AND every hit box together, which is why
     // no second coordinate space is needed anywhere.
+    let content = o.len();
     let bottom = sections::build(v, 48 - v.scroll, &mut o);
 
-    o.push(Hit::new(rect(pad, bottom, right, bottom + 1), Kind::Sep, "sep5"));
+    let cr = PW - pad;
+    o.push(Hit::new(rect(pad, bottom, cr, bottom + 1), Kind::Sep, "sep5"));
     let perm_name = match v.permission {
         0 => "停止",
         1 => "只读",
@@ -1537,7 +1611,15 @@ fn panel_layout(v: &PanelView) -> Vec<Hit> {
         v.fps,
         perm_name
     );
-    o.push(Hit::new(rect(pad, bottom + 6, right, bottom + 24), Kind::Label, "footer").text(footer));
+    o.push(Hit::new(rect(pad, bottom + 6, cr, bottom + 24), Kind::Label, "footer").text(footer));
+
+    if v.hscroll != 0 {
+        let dx = -v.hscroll;
+        for h in o[content..].iter_mut() {
+            h.r.left += dx;
+            h.r.right += dx;
+        }
+    }
     o
 }
 
@@ -1703,13 +1785,20 @@ impl Canvas {
         let _ = DeleteObject(pen);
     }
 
+    /// Width of `s` in DESIGN px.
+    ///
+    /// The font is created at `ss` times the design size and measured on the
+    /// supersampled DC, so the raw extent is in supersampled pixels. Every caller
+    /// works in design px (hit rects, layout), so the division belongs here — it used
+    /// to be forgotten, which pushed every right-aligned label left by half its own
+    /// width (invisible for a short "#4FC3F7", obvious for the title-bar signature).
     unsafe fn text_w(&self, font: HGDIOBJ, s: &str) -> i32 {
         let prev = SelectObject(self.hdc_big, font);
         let buf: Vec<u16> = s.encode_utf16().collect();
         let mut ext = SIZE::default();
         let _ = GetTextExtentPoint32W(self.hdc_big, &buf, &mut ext);
         SelectObject(self.hdc_big, prev);
-        ext.cx
+        ext.cx / self.ss.max(1)
     }
 
     unsafe fn text_at(&self, font: HGDIOBJ, x: i32, y: i32, s: &str, rgb: u32) {
@@ -1841,37 +1930,6 @@ impl Canvas {
             Some(&blend),
             ULW_ALPHA,
         );
-    }
-
-    /// Present the panel at a zoom factor.
-    ///
-    /// The layout is always computed at its design size, so nothing has to know
-    /// about the zoom; only the finished image is stretched. That is what makes
-    /// the controls and the text scale together and re-flow as one piece.
-    /// Present the panel at a zoom factor.
-    ///
-    /// The layout is always computed at its design size, so nothing has to know
-    /// about the zoom. `compose` already resamples the supersampled surface to an
-    /// arbitrary target size, so asking it for the zoomed size IS the scale — no
-    /// separate stretch surface, which had no alpha channel and came out empty.
-    unsafe fn present_scaled(
-        &self,
-        hwnd: isize,
-        dw: i32,
-        dh: i32,
-        zoom: f64,
-        dst: Option<POINT>,
-        alpha: f64,
-    ) {
-        // The canvas composes by INDEX, not by proportion: `w`/`h` are only the
-        // loop bounds while the sampling and the write stride both stay tied to
-        // the canvas's fixed size. Handing it a zoomed size therefore writes out
-        // of bounds and comes out blank. Scaling has to happen in the layout, with
-        // every rect and font computed from the scale factor - so until that
-        // exists, a non-unit zoom is ignored rather than producing an empty panel.
-        let _ = zoom;
-        self.compose(dw, dh, alpha);
-        self.blit(hwnd, dw, dh, dst);
     }
 
     unsafe fn present(&self, hwnd: isize, w: i32, h: i32, dst: Option<POINT>, alpha: f64) {
@@ -2238,32 +2296,67 @@ impl Canvas {
 
 // -------------------------------------------------------------- panel paint ---
 
-/// A thin scrollbar on the right edge: only chrome, never clickable.
+/// The two scroll bars: chrome, never clickable.
 ///
-/// It is the visible proof that the panel scrolls — without it a user cannot tell
-/// whether the menu simply ends or there is more below the taskbar.
-unsafe fn draw_scroll_indicator(cv: &Canvas, v: &PanelView, h: i32, z: f64) {
-    if !v.full || v.content_h <= v.view_h {
+/// They are the visible proof that the panel scrolls — without them a user cannot
+/// tell whether the menu simply ends or there is more beyond the edge.
+///
+/// The VERTICAL bar hugs the right edge of the content viewport (that is what it
+/// scrolls, and it stays beside the 452-wide column when the window is wider). The
+/// HORIZONTAL bar only exists when the window is narrower than the design width: the
+/// content column is fixed, so "window too narrow" is the only sideways case there is.
+unsafe fn draw_scroll_bars(cv: &Canvas, v: &PanelView) {
+    if !v.full {
         return;
     }
-    let top = (widget::HEADER_BOTTOM as f64 * z).round() as i32 + 4;
-    let bottom = ((h as f64) * z).round() as i32 - 4;
-    let track_h = bottom - top;
-    if track_h < 12 {
-        return;
+    let h = v.panel_h;
+    let hbar = v.max_hscroll() > 0;
+    let top = widget::HEADER_BOTTOM + 4;
+    let vmax = (v.content_h - v.view_h).max(0);
+    if vmax > 0 {
+        let bottom = h - 6 - if hbar { 8 } else { 0 };
+        let track_h = bottom - top;
+        if track_h >= 12 && v.view_w > 16 {
+            let x1 = v.view_w - 4;
+            let x0 = v.view_w - 7;
+            cv.fill_round(rect(x0, top, x1, bottom), 1, C_TRACK);
+            let ratio = (v.view_h as f64 / v.content_h.max(1) as f64).clamp(0.05, 1.0);
+            let thumb_h = ((track_h as f64 * ratio).round() as i32).clamp(24, track_h);
+            let frac = (v.scroll as f64 / vmax as f64).clamp(0.0, 1.0);
+            let ty = top + ((track_h - thumb_h) as f64 * frac).round() as i32;
+            cv.fill_round(rect(x0, ty, x1, ty + thumb_h), 1, C_MUTED);
+        }
     }
-    let cx = ((PW as f64) * z).round() as i32;
-    let x1 = cx - 4;
-    let x0 = cx - 7;
-    cv.fill_round(rect(x0, top, x1, bottom), 1, C_TRACK);
-    let max_scroll = (v.content_h - v.view_h).max(1);
-    let ratio = (v.view_h as f64 / v.content_h.max(1) as f64).clamp(0.05, 1.0);
-    let thumb_h = ((track_h as f64 * ratio).round() as i32).clamp(24, track_h);
-    let frac = (v.scroll as f64 / max_scroll as f64).clamp(0.0, 1.0);
-    let ty = top + ((track_h - thumb_h) as f64 * frac).round() as i32;
-    cv.fill_round(rect(x0, ty, x1, ty + thumb_h), 1, C_MUTED);
+    let hmax = v.max_hscroll();
+    if hmax > 0 {
+        let y0 = h - 7;
+        let y1 = h - 4;
+        let right = v.view_w - 4;
+        let track_w = right - 4;
+        if track_w >= 24 {
+            cv.fill_round(rect(4, y0, right, y1), 1, C_TRACK);
+            let ratio = (v.view_w as f64 / PW as f64).clamp(0.05, 1.0);
+            let thumb_w = ((track_w as f64 * ratio).round() as i32).clamp(24, track_w);
+            let frac = (v.hscroll as f64 / hmax as f64).clamp(0.0, 1.0);
+            let tx = 4 + ((track_w - thumb_w) as f64 * frac).round() as i32;
+            cv.fill_round(rect(tx, y0, tx + thumb_w, y1), 1, C_MUTED);
+        }
+    }
 }
 
+/// Paint the panel: the WHOLE window, at the window's own size.
+///
+/// Draw order is load-bearing and is the fix for the invisible title bar:
+///
+///   1. background + header strip — no clip,
+///   2. **the title bar's own widgets**, still unclipped: `AI 鼠标`, `─`, `✕`, the
+///      signature. They live above `HEADER_BOTTOM`, so drawing them inside the scroll
+///      clip (as before) painted them into a clipped-away band: present in the widget
+///      model, clickable, and completely invisible on screen.
+///   3. `IntersectClipRect` down to the content viewport, then the scrolled content,
+///   4. `SelectClipRgn(NULL)` — restore the whole surface so the scroll bars can use
+///      the full height,
+///   5. compose + previews + blit, at `panel_w x panel_h`.
 unsafe fn draw_panel(cv: &Canvas, v: &PanelView, hits: &[Hit], h: i32) {
     cv.clear();
 
@@ -2280,194 +2373,209 @@ unsafe fn draw_panel(cv: &Canvas, v: &PanelView, hits: &[Hit], h: i32) {
         return;
     }
 
-    // background
-    let body = rect(0, 0, PW, h);
+    // ---- 1. background: the whole window, whatever the user dragged it to ----
+    // The opaque RESIZE frame goes down FIRST: a layered window is hit-tested per
+    // pixel and an alpha-0 pixel falls straight through to the desktop, so with only
+    // a rounded body the four corners were ungrabbable (a press on the visible corner
+    // never reached us). Filling the border band — and painting the body over it —
+    // is what makes "拖边框改大小" work everywhere, corners included; it is also
+    // literally the "不透明边框热区" the requirement asks for.
+    let e = RESIZE_EDGE.min(h / 3).max(1).min(v.panel_w / 3);
+    cv.fill_rect(rect(0, 0, v.panel_w, e), C_PANEL);
+    cv.fill_rect(rect(0, h - e, v.panel_w, h), C_PANEL);
+    cv.fill_rect(rect(0, 0, e, h), C_PANEL);
+    cv.fill_rect(rect(v.panel_w - e, 0, v.panel_w, h), C_PANEL);
+
+    let body = rect(0, 0, v.panel_w, h);
     cv.fill_round(body, 14, C_PANEL);
     cv.stroke_round(body, 14, C_BORDER, 1);
     // header strip
-    cv.fill_round(rect(1, 1, PW - 1, 40), 13, C_PANEL_2);
-    cv.fill_rect(rect(1, 30, PW - 1, 40), C_PANEL_2);
+    cv.fill_round(rect(1, 1, v.panel_w - 1, 40), 13, C_PANEL_2);
+    cv.fill_rect(rect(1, 30, v.panel_w - 1, 40), C_PANEL_2);
 
-    // Scrolling means widgets can now sit above the header or below the window
-    // edge, so the content pass is clipped to the scroll viewport. Without this a
-    // scrolled-up button would paint straight over the title bar.
-    let z = v.zoom.clamp(0.6, 2.0);
-    let ss = cv.ss;
-    let clip_top = (widget::HEADER_BOTTOM as f64 * z).round() as i32 * ss;
-    let clip_right = ((PW as f64) * z).round() as i32 * ss;
-    let clip_bottom = ((h as f64) * z).round() as i32 * ss;
-    let _ = IntersectClipRect(cv.hdc_big, 0, clip_top, clip_right.max(1), clip_bottom.max(1));
-
-    for h in hits {
-        match h.kind {
-            Kind::Sep => {
-                cv.fill_rect(rect(h.r.left, h.r.top, h.r.right, h.r.top + 1), C_SEP);
-            }
-            Kind::Label | Kind::LabelRight => {
-                let font = if h.id == "title" { cv.fonts.title } else { cv.fonts.value };
-                let rgb = if h.id == "title" { C_TEXT } else { C_MUTED };
-                let y = h.r.top;
-                if h.kind == Kind::LabelRight {
-                    let tw = cv.text_w(font, &h.text);
-                    cv.text_at(font, h.r.right - tw, y, &h.text, rgb);
-                } else {
-                    cv.text_at(font, h.r.left, y, &h.text, rgb);
-                }
-            }
-            Kind::Button => {
-                // Panel chrome uses the MENU accent (`panel_accent`), never the
-                // cursor colour: that separation is the whole point of the redesign.
-                let bg = if h.active {
-                    v.panel_accent
-                } else if h.hover {
-                    C_BTN_HOVER
-                } else {
-                    C_BTN
-                };
-                cv.fill_round(h.r, 8, bg);
-                if h.active {
-                    cv.stroke_round(h.r, 8, shade(v.panel_accent, 1.35), 1);
-                }
-                let fg = if h.active { C_DARK_TEXT } else { C_TEXT };
-                let tw = cv.text_w(cv.fonts.button, &h.text);
-                let th = 17;
-                let tx = h.r.left + (h.r.right - h.r.left - tw) / 2;
-                let ty = h.r.top + (h.r.bottom - h.r.top - th) / 2;
-                cv.text_at(cv.fonts.button, tx, ty, &h.text, fg);
-            }
-            Kind::Slider => {
-                let cy = (h.r.top + h.r.bottom) / 2;
-                let knob = (h.r.left + 9, h.r.right - 9);
-                let track = rect(knob.0, cy - 2, knob.1, cy + 2);
-                cv.fill_round(track, 2, C_TRACK);
-                let value = (h.data as f64 / 1000.0).clamp(0.0, 1.0);
-                let kx = knob.0 + ((knob.1 - knob.0) as f64 * value) as i32;
-                cv.fill_round(rect(knob.0, cy - 2, kx, cy + 2), 2, v.panel_accent);
-                cv.fill_circle(kx, cy, 7, if h.hover { 0xFFFFFF } else { shade(v.panel_accent, 1.5) });
-                cv.ring_circle(kx, cy, 7, 1, v.panel_accent);
-            }
-            Kind::Swatch => {
-                let cx = (h.r.left + h.r.right) / 2;
-                let cy = (h.r.top + h.r.bottom) / 2;
-                let rgb = u32::from_str_radix(h.text.trim_start_matches('#'), 16).unwrap_or(0xFFFFFF);
-                cv.fill_circle(cx, cy, 11, rgb);
-                if h.active {
-                    cv.ring_circle(cx, cy, 13, 2, 0xFFFFFF);
-                } else if h.hover {
-                    cv.ring_circle(cx, cy, 13, 1, C_BORDER);
-                }
-            }
-            Kind::Section => {
-                if h.hover {
-                    cv.fill_round(h.r, 6, C_BTN_HOVER);
-                }
-                cv.text_at(
-                    cv.fonts.button,
-                    h.r.left + 2,
-                    h.r.top + 3,
-                    &h.text,
-                    if h.hover { C_TEXT } else { C_MUTED },
-                );
-            }
-            Kind::Channel => {
-                let cy = (h.r.top + h.r.bottom) / 2;
-                let track = rect(h.r.left, cy - 5, h.r.right, cy + 5);
-                let ch = h.data.clamp(0, 2) as usize;
-                let mut rgb = [0u32; 3];
-                rgb[ch] = 255;
-                let full = (rgb[0] << 16) | (rgb[1] << 8) | rgb[2];
-                let w = track.right - track.left;
-                let steps = 48;
-                for i in 0..steps {
-                    let a = i as f64 / (steps - 1) as f64;
-                    let x0 = track.left + (w * i) / steps;
-                    let x1 = track.left + (w * (i + 1)) / steps;
-                    cv.fill_rect(rect(x0, track.top, x1, track.bottom), blend(0x000000, full, a));
-                }
-                let value = h.text.trim().parse::<f64>().unwrap_or(0.0) / 255.0;
-                let kx = track.left + (w as f64 * value) as i32;
-                cv.fill_circle(kx, cy, 6, 0xFFFFFF);
-                cv.ring_circle(kx, cy, 6, 1, 0x101820);
-            }
-            Kind::Wheel => {
-                let mut wh = wheel().lock().unwrap();
-                if !wh.is_synced() {
-                    // the wheel belongs to the selected cursor, not to this process
-                    wh.set_from_rgb(v.sel_settings.accent);
-                }
-                wh.ensure();
-                // The hit box is scaled with the panel, so the artwork and both
-                // markers have to follow the same factor - otherwise the wheel stays
-                // at its design size while the box around it grows.
-                let side = (h.r.right - h.r.left).max(1);
-                let k = side as f64 / wheel::D as f64;
-                wh.blit_scaled(cv.hdc_big, h.r.left * cv.ss, h.r.top * cv.ss, side * cv.ss);
-                let cx = h.r.left + side / 2;
-                let cy = h.r.top + side / 2;
-                // hue marker on the ring
-                let angle_hue = (1.0 - wh.hue).rem_euclid(1.0);
-                let ang = angle_hue * std::f64::consts::TAU;
-                let rr = (wheel::R_IN + wheel::R_OUT) / 2.0 * k;
-                let mx = cx + (rr * ang.cos()) as i32;
-                let my = cy + (rr * ang.sin()) as i32;
-                let mw = (6.0 * k).max(2.0) as i32;
-                cv.ring_circle(mx, my, mw, 2, 0xFFFFFF);
-                cv.ring_circle(mx, my, mw + 1, 1, 0x101820);
-                // saturation/value marker inside the square
-                let sx = cx + ((wh.sat - 0.5) * wheel::SQ * k) as i32;
-                let sy = cy + ((0.5 - wh.val) * wheel::SQ * k) as i32;
-                cv.ring_circle(sx, sy, (5.0 * k).max(2.0) as i32, 2, 0xFFFFFF);
-                cv.ring_circle(sx, sy, (6.0 * k).max(2.0) as i32, 1, 0x101820);
-            }
-            Kind::Preview => {}
-            Kind::Minimap => {
-                // screen outline, then the windows on top of it, then the cursor
-                cv.fill_round(h.r, 8, 0x0B1016);
-                cv.stroke_round(h.r, 8, C_BORDER, 1);
-                let sw = GetSystemMetrics(SYSTEM_METRICS_INDEX(SM_CXSCREEN.0)).max(1) as f64;
-                let sh = GetSystemMetrics(SYSTEM_METRICS_INDEX(SM_CYSCREEN.0)).max(1) as f64;
-                let bw = (h.r.right - h.r.left - 8) as f64;
-                let bh = (h.r.bottom - h.r.top - 8) as f64;
-                let k = (bw / sw).min(bh / sh);
-                let ox = h.r.left + 4 + ((bw - sw * k) / 2.0) as i32;
-                let oy = h.r.top + 4 + ((bh - sh * k) / 2.0) as i32;
-                let map = |x: i32, y: i32| -> (i32, i32) {
-                    (ox + (x as f64 * k) as i32, oy + (y as f64 * k) as i32)
-                };
-                let (sx, sy) = map(0, 0);
-                cv.stroke_round(
-                    rect(sx, sy, sx + (sw * k) as i32, sy + (sh * k) as i32),
-                    3,
-                    0x2A3542,
-                    1,
-                );
-                for (wx, wy, ww, wh) in top_window_rects(10) {
-                    let (a, b) = map(wx, wy);
-                    let (c, d) = map(wx + ww, wy + wh);
-                    cv.fill_round(rect(a, b, c.max(a + 1), d.max(b + 1)), 2, 0x1D2733);
-                }
-                let (cx, cy) = map(v.cur.0 as i32, v.cur.1 as i32);
-                cv.fill_circle(cx, cy, 4, v.accent);
-                cv.ring_circle(cx, cy, 5, 1, 0xFFFFFF);
-            }
-            Kind::Header | Kind::Chip => {}
-        }
+    // ---- 2. title bar: painted BEFORE any clip exists (see the doc comment) ----
+    for hit in hits.iter().filter(|hit| is_header_widget(hit.id)) {
+        draw_hit(cv, v, hit);
     }
 
-    // Restore the full surface so the scroll indicator can use the whole height.
-    let _ = SelectClipRgn(cv.hdc_big, HRGN(std::ptr::null_mut()));
-    draw_scroll_indicator(cv, v, h, z);
+    // ---- 3. content viewport: a fixed 452-wide column, clipped to the window ----
+    let ss = cv.ss;
+    let clip_top = widget::HEADER_BOTTOM * ss;
+    let clip_right = v.view_w.max(1) * ss;
+    let clip_bottom = h.max(1) * ss;
+    let _ = IntersectClipRect(cv.hdc_big, 0, clip_top, clip_right, clip_bottom);
+    for hit in hits.iter().filter(|hit| !is_header_widget(hit.id)) {
+        draw_hit(cv, v, hit);
+    }
 
-    // The canvas is sized to the zoomed width, so composing at that same width is
-    // the only shape compose can handle: it samples by index and writes with a
-    // stride fixed to the canvas width.
-    let z = v.zoom.clamp(0.6, 2.0);
-    let lw = ((PW as f64) * z).round() as i32;
-    let lh = ((h as f64) * z).round() as i32;
-    logline!("TRACE", "draw_panel h_in={h} zoom={z:.3} -> lw={lw} lh={lh}");
-    cv.compose(lw, lh, 0.98);
-    draw_previews(cv, v, hits, h);
-    cv.blit(state().lock().unwrap().panel_hwnd, lw, lh, None);
+    // ---- 4. restore the full surface for the scroll bars ----
+    let _ = SelectClipRgn(cv.hdc_big, HRGN(std::ptr::null_mut()));
+    draw_scroll_bars(cv, v);
+
+    // ---- 5. present: canvas and window are the same size, so compose cannot scale
+    // (it samples by index with a stride fixed to the canvas width — LESSONS §4) ----
+    logline!("TRACE", "draw_panel {}x{} content_h={} view_w={} hscroll={}", v.panel_w, h, v.content_h, v.view_w, v.hscroll);
+    cv.compose(v.panel_w, h, 0.98);
+    draw_previews(cv, v, hits);
+    cv.blit(state().lock().unwrap().panel_hwnd, v.panel_w, h, None);
+}
+
+/// Paint one widget. The rects come from `panel_layout`, so this can never disagree
+/// with what `pick()` hit-tests — that is the whole point of the model.
+unsafe fn draw_hit(cv: &Canvas, v: &PanelView, h: &Hit) {
+    match h.kind {
+        Kind::Sep => {
+            cv.fill_rect(rect(h.r.left, h.r.top, h.r.right, h.r.top + 1), C_SEP);
+        }
+        Kind::Label | Kind::LabelRight => {
+            let font = if h.id == "title" { cv.fonts.title } else { cv.fonts.value };
+            let rgb = if h.id == "title" { C_TEXT } else { C_MUTED };
+            let y = h.r.top;
+            if h.kind == Kind::LabelRight {
+                let tw = cv.text_w(font, &h.text);
+                cv.text_at(font, h.r.right - tw, y, &h.text, rgb);
+            } else {
+                cv.text_at(font, h.r.left, y, &h.text, rgb);
+            }
+        }
+        Kind::Button => {
+            // Panel chrome uses the MENU accent (`panel_accent`), never the
+            // cursor colour: that separation is the whole point of the redesign.
+            let bg = if h.active {
+                v.panel_accent
+            } else if h.hover {
+                C_BTN_HOVER
+            } else {
+                C_BTN
+            };
+            cv.fill_round(h.r, 8, bg);
+            if h.active {
+                cv.stroke_round(h.r, 8, shade(v.panel_accent, 1.35), 1);
+            }
+            let fg = if h.active { C_DARK_TEXT } else { C_TEXT };
+            let tw = cv.text_w(cv.fonts.button, &h.text);
+            let th = 17;
+            let tx = h.r.left + (h.r.right - h.r.left - tw) / 2;
+            let ty = h.r.top + (h.r.bottom - h.r.top - th) / 2;
+            cv.text_at(cv.fonts.button, tx, ty, &h.text, fg);
+        }
+        Kind::Slider => {
+            let cy = (h.r.top + h.r.bottom) / 2;
+            let knob = (h.r.left + 9, h.r.right - 9);
+            let track = rect(knob.0, cy - 2, knob.1, cy + 2);
+            cv.fill_round(track, 2, C_TRACK);
+            let value = (h.data as f64 / 1000.0).clamp(0.0, 1.0);
+            let kx = knob.0 + ((knob.1 - knob.0) as f64 * value) as i32;
+            cv.fill_round(rect(knob.0, cy - 2, kx, cy + 2), 2, v.panel_accent);
+            cv.fill_circle(kx, cy, 7, if h.hover { 0xFFFFFF } else { shade(v.panel_accent, 1.5) });
+            cv.ring_circle(kx, cy, 7, 1, v.panel_accent);
+        }
+        Kind::Swatch => {
+            let cx = (h.r.left + h.r.right) / 2;
+            let cy = (h.r.top + h.r.bottom) / 2;
+            let rgb = u32::from_str_radix(h.text.trim_start_matches('#'), 16).unwrap_or(0xFFFFFF);
+            cv.fill_circle(cx, cy, 11, rgb);
+            if h.active {
+                cv.ring_circle(cx, cy, 13, 2, 0xFFFFFF);
+            } else if h.hover {
+                cv.ring_circle(cx, cy, 13, 1, C_BORDER);
+            }
+        }
+        Kind::Section => {
+            if h.hover {
+                cv.fill_round(h.r, 6, C_BTN_HOVER);
+            }
+            cv.text_at(
+                cv.fonts.button,
+                h.r.left + 2,
+                h.r.top + 3,
+                &h.text,
+                if h.hover { C_TEXT } else { C_MUTED },
+            );
+        }
+        Kind::Channel => {
+            let cy = (h.r.top + h.r.bottom) / 2;
+            let track = rect(h.r.left, cy - 5, h.r.right, cy + 5);
+            let ch = h.data.clamp(0, 2) as usize;
+            let mut rgb = [0u32; 3];
+            rgb[ch] = 255;
+            let full = (rgb[0] << 16) | (rgb[1] << 8) | rgb[2];
+            let w = track.right - track.left;
+            let steps = 48;
+            for i in 0..steps {
+                let a = i as f64 / (steps - 1) as f64;
+                let x0 = track.left + (w * i) / steps;
+                let x1 = track.left + (w * (i + 1)) / steps;
+                cv.fill_rect(rect(x0, track.top, x1, track.bottom), blend(0x000000, full, a));
+            }
+            let value = h.text.trim().parse::<f64>().unwrap_or(0.0) / 255.0;
+            let kx = track.left + (w as f64 * value) as i32;
+            cv.fill_circle(kx, cy, 6, 0xFFFFFF);
+            cv.ring_circle(kx, cy, 6, 1, 0x101820);
+        }
+        Kind::Wheel => {
+            let mut wh = wheel().lock().unwrap();
+            if !wh.is_synced() {
+                // the wheel belongs to the selected cursor, not to this process
+                wh.set_from_rgb(v.sel_settings.accent);
+            }
+            wh.ensure();
+            // The hit box is scaled with the panel, so the artwork and both
+            // markers have to follow the same factor - otherwise the wheel stays
+            // at its design size while the box around it grows.
+            let side = (h.r.right - h.r.left).max(1);
+            let k = side as f64 / wheel::D as f64;
+            wh.blit_scaled(cv.hdc_big, h.r.left * cv.ss, h.r.top * cv.ss, side * cv.ss);
+            let cx = h.r.left + side / 2;
+            let cy = h.r.top + side / 2;
+            // hue marker on the ring
+            let angle_hue = (1.0 - wh.hue).rem_euclid(1.0);
+            let ang = angle_hue * std::f64::consts::TAU;
+            let rr = (wheel::R_IN + wheel::R_OUT) / 2.0 * k;
+            let mx = cx + (rr * ang.cos()) as i32;
+            let my = cy + (rr * ang.sin()) as i32;
+            let mw = (6.0 * k).max(2.0) as i32;
+            cv.ring_circle(mx, my, mw, 2, 0xFFFFFF);
+            cv.ring_circle(mx, my, mw + 1, 1, 0x101820);
+            // saturation/value marker inside the square
+            let sx = cx + ((wh.sat - 0.5) * wheel::SQ * k) as i32;
+            let sy = cy + ((0.5 - wh.val) * wheel::SQ * k) as i32;
+            cv.ring_circle(sx, sy, (5.0 * k).max(2.0) as i32, 2, 0xFFFFFF);
+            cv.ring_circle(sx, sy, (6.0 * k).max(2.0) as i32, 1, 0x101820);
+        }
+        Kind::Preview => {}
+        Kind::Minimap => {
+            // screen outline, then the windows on top of it, then the cursor
+            cv.fill_round(h.r, 8, 0x0B1016);
+            cv.stroke_round(h.r, 8, C_BORDER, 1);
+            let sw = GetSystemMetrics(SYSTEM_METRICS_INDEX(SM_CXSCREEN.0)).max(1) as f64;
+            let sh = GetSystemMetrics(SYSTEM_METRICS_INDEX(SM_CYSCREEN.0)).max(1) as f64;
+            let bw = (h.r.right - h.r.left - 8) as f64;
+            let bh = (h.r.bottom - h.r.top - 8) as f64;
+            let k = (bw / sw).min(bh / sh);
+            let ox = h.r.left + 4 + ((bw - sw * k) / 2.0) as i32;
+            let oy = h.r.top + 4 + ((bh - sh * k) / 2.0) as i32;
+            let map = |x: i32, y: i32| -> (i32, i32) {
+                (ox + (x as f64 * k) as i32, oy + (y as f64 * k) as i32)
+            };
+            let (sx, sy) = map(0, 0);
+            cv.stroke_round(
+                rect(sx, sy, sx + (sw * k) as i32, sy + (sh * k) as i32),
+                3,
+                0x2A3542,
+                1,
+            );
+            for (wx, wy, ww, wh) in top_window_rects(10) {
+                let (a, b) = map(wx, wy);
+                let (c, d) = map(wx + ww, wy + wh);
+                cv.fill_round(rect(a, b, c.max(a + 1), d.max(b + 1)), 2, 0x1D2733);
+            }
+            let (cx, cy) = map(v.cur.0 as i32, v.cur.1 as i32);
+            cv.fill_circle(cx, cy, 4, v.accent);
+            cv.ring_circle(cx, cy, 5, 1, 0xFFFFFF);
+        }
+        Kind::Header | Kind::Chip => {}
+    }
 }
 
 // ---------------------------------------------------------------- windows ----
@@ -2569,7 +2677,7 @@ unsafe fn make_panel(x: i32, y: i32) -> HWND {
 /// The sprite cache lock is taken and released here, never held across a call
 /// that locks the state mutex — the window procedure takes them in the opposite
 /// order (state, then sprites) and holding both would deadlock the panel.
-unsafe fn draw_previews(cv: &Canvas, v: &PanelView, hits: &[Hit], h: i32) {
+unsafe fn draw_previews(cv: &Canvas, v: &PanelView, hits: &[Hit]) {
     let boxes: Vec<(i32, i32, i32, i32, usize)> = hits
         .iter()
         .filter(|h| h.kind == Kind::Preview)
@@ -2594,7 +2702,7 @@ unsafe fn draw_previews(cv: &Canvas, v: &PanelView, hits: &[Hit], h: i32) {
         let th = (spr.h as f64 * scale).round().max(1.0) as u32;
         let dx = bx + (bw - tw as i32) / 2;
         let dy = by + (bh - th as i32) / 2;
-        sprite::composite(cv.small_mut(), PW, h, dx, dy,
+        sprite::composite(cv.small_mut(), cv.w, cv.h, dx, dy,
                           frame, spr.w, spr.h, tw, th, 1.0, false);
     }
 }
@@ -2624,7 +2732,13 @@ fn view_of(st: &St) -> PanelView {
         custom: custom_view(st),
         epoch_ms: Instant::now().duration_since(st.sprite_epoch).as_millis() as u64,
         art_sel: st.art_sel,
-        zoom: st.panel_zoom,
+        // Filled in below by `panel_geom`, the only place the window geometry is
+        // computed: the content height first (it does not depend on the viewport),
+        // then the clamped viewport and both scroll offsets.
+        panel_w: st.panel_w,
+        panel_h: 0,
+        view_w: 0,
+        hscroll: st.hscroll,
         columns: st.columns.clone(),
         columns_collapsed: st.columns_collapsed,
         presets: st.presets.clone(),
@@ -2650,7 +2764,15 @@ fn view_of(st: &St) -> PanelView {
         view_h: 0,
     };
     v.content_h = panel_content_h(&v);
-    v.view_h = if v.full { panel_view_h(&v) } else { CHIP_H };
+    let g = panel_geom(st, v.content_h);
+    v.panel_w = g.w;
+    v.panel_h = if v.full { g.h } else { CHIP_H };
+    v.view_w = g.view_w;
+    v.view_h = g.h;
+    v.hscroll = g.hscroll;
+    // The layout runs on the CLAMPED offsets, so an out-of-range scroll can never
+    // paint/hit-test a widget that should be out of reach.
+    v.scroll = g.vscroll;
     v
 }
 
@@ -2697,37 +2819,62 @@ fn slot_view(slot: &Slot, name: &str) -> SlotView {
     v
 }
 
-/// Height the panel needs for the current expansion state.
-fn panel_height(v: &PanelView) -> i32 {
-    if !v.full {
-        return CHIP_H;
-    }
-    panel_view_h(v)
+/// **The single source of the panel window's geometry.**
+///
+/// Every number that depends on the window size lives here and nowhere else: the
+/// window rect, the content viewport, both scroll ranges and the clamped offsets.
+/// `view_of()` copies the result onto the `PanelView`, so painting, hit-testing, the
+/// scroll bars, the window procedure and the resize path all read the same values.
+/// Writing a second copy of "where the window is / how wide the content is" is the
+/// bug class this struct exists to prevent (docs/LESSONS.md §12b).
+#[derive(Clone, Copy, Debug)]
+pub struct PanelGeom {
+    /// Window position/size on screen, device px.
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+    /// Content viewport width: `min(w, PW)`. The content itself never widens.
+    pub view_w: i32,
+    pub content_h: i32,
+    /// Horizontal / vertical scroll offsets (already clamped) and their maxima.
+    pub hscroll: i32,
+    pub hmax: i32,
+    pub vscroll: i32,
+    pub vmax: i32,
+}
+
+/// Automatic window height: the content, capped by the monitor's WORK area (taskbar
+/// excluded) — that cap is the fix for "1080p 时「预设」落在任务栏下面点不到".
+fn panel_auto_h(content_h: i32) -> i32 {
+    let (_, _, _, wh) = work_area();
+    let max_h = (wh.max(240) - 16).max(PANEL_MIN_H);
+    content_h.clamp(PANEL_MIN_H, max_h.min(PH_MAX))
+}
+
+fn panel_geom(st: &St, content_h: i32) -> PanelGeom {
+    let (wx, wy, ww, wh) = work_area();
+    let w = st.panel_w.clamp(PANEL_MIN_W, ww.max(PANEL_MIN_W));
+    let max_h = (wh.max(PANEL_MIN_H * 2) - 8).min(PH_MAX).max(PANEL_MIN_H);
+    let h = match st.panel_h_user {
+        Some(h) => h.clamp(PANEL_MIN_H, max_h),
+        None => panel_auto_h(content_h).min(max_h),
+    };
+    let x = rect_x_clamp_in(st.panel_pos.0, w, wx, ww);
+    let y = rect_y_clamp_in(st.panel_pos.1, h, wy, wh);
+    let view_w = w.min(PW);
+    let hmax = (PW - view_w).max(0);
+    let hscroll = st.hscroll.clamp(0, hmax);
+    let vmax = (content_h - h).max(0);
+    let vscroll = st.scroll.clamp(0, vmax);
+    PanelGeom { x, y, w, h, view_w, content_h, hscroll, hmax, vscroll, vmax }
 }
 
 /// Design height the whole section stack needs, unscrolled.
-///
-/// `sections::build` returns a SCALED bottom, but callers multiply by the zoom
-/// again when they size the canvas, so convert back to the design height here.
-/// Without this the panel got scaled twice and came out short.
 fn panel_content_h(v: &PanelView) -> i32 {
-    let z = v.zoom.clamp(0.6, 2.0);
     let mut sink: Vec<Hit> = Vec::new();
-    let bottom = (sections::build(v, 48, &mut sink) as f64 / z).round() as i32;
+    let bottom = sections::build(v, 48, &mut sink);
     (bottom + 30).max(160)
-}
-
-/// Design height of the visible viewport.
-///
-/// The content, capped by the monitor's WORK area (taskbar excluded) instead of by
-/// the raw screen height — that cap is the fix for "1080p 时「预设」落在任务栏下面
-/// 点不到": whatever does not fit is now reached by scrolling, never clipped away.
-fn panel_view_h(v: &PanelView) -> i32 {
-    let z = v.zoom.clamp(0.6, 2.0);
-    let content = panel_content_h(v);
-    let (_, _, _, wh) = work_area();
-    let max_view = (((wh.max(240) as f64) - 16.0) / z).floor() as i32;
-    content.min(max_view.max(200)).min(PH_MAX)
 }
 
 fn cursor_view(st: &St) -> CursorView {
@@ -2826,17 +2973,9 @@ fn on_toggle(st: &mut St, id: &str) {
                 if let Ok(i) = rest.parse::<usize>() {
                     if let Some(t) = st.menu_themes.get(i).cloned() {
                         st.panel_accent = t.accent & 0xFFFFFF;
-                        st.panel_zoom = t.zoom.clamp(0.6, 2.0);
                         st.menu_theme_sel = i;
-                        st.want_panel_resize = true;
                         st.panel_dirty = true;
-                        logline!(
-                            "INFO",
-                            "menu theme applied: {} accent={:06X} zoom={:.2}",
-                            t.name,
-                            t.accent,
-                            t.zoom
-                        );
+                        logline!("INFO", "menu theme applied: {} accent={:06X}", t.name, t.accent);
                     }
                 }
             } else if id == "mt_save" {
@@ -2844,7 +2983,6 @@ fn on_toggle(st: &mut St, id: &str) {
                 write_mailbox(serde_json::json!({
                     "action": "menu_theme_save",
                     "accent": hex(st.panel_accent),
-                    "zoom": st.panel_zoom,
                 }));
             } else if id == "mt_delete" {
                 if let Some(name) = st.menu_themes.get(st.menu_theme_sel).map(|t| t.name.clone()) {
@@ -2855,8 +2993,6 @@ fn on_toggle(st: &mut St, id: &str) {
                 }
             } else if id == "mt_reset" {
                 st.panel_accent = 0x4FC3F7;
-                st.panel_zoom = 1.0;
-                st.want_panel_resize = true;
                 st.panel_dirty = true;
             }
             // -------------------------------------------- 选中鼠标 / 鼠标预设 ---
@@ -3207,12 +3343,6 @@ unsafe fn slider_value(st: &mut St, id: &str, x: i32, hits: &[Hit]) {
         // another mouse's opacity works instead of silently repainting this one.
         "opacity" => edit_selected(st, serde_json::json!({ "opacity": 0.15 + t * 0.85 })),
         "scale" => edit_selected(st, serde_json::json!({ "scale": 0.6 + t * 1.4 })),
-        "panel_zoom" => {
-            // The menu bar's own scale: independent of the cursor's `scale`, and
-            // kept to 1% steps exactly like the corner grip does.
-            st.panel_zoom = ((0.6 + t * 1.4) * 100.0).round() / 100.0;
-            st.want_panel_resize = true;
-        }
         "art_opacity" => {
             let i = st.art_sel.min(2);
             st.slots[i].opacity = t;
@@ -3262,10 +3392,12 @@ fn pick<'a>(hits: &'a [Hit], x: i32, y: i32, view: &PanelView) -> Option<&'a Hit
             Kind::Label | Kind::LabelRight | Kind::Sep => 3,
         }
     }
-    let z = view.zoom.clamp(0.6, 2.0);
-    let top = (widget::HEADER_BOTTOM as f64 * z).round() as i32;
-    let bottom = if view.full { (view.view_h as f64 * z).round() as i32 } else { CHIP_H };
-    let in_view = y >= top && y < bottom;
+    // The viewport is the WINDOW (device px, no zoom any more): content that scrolled
+    // under the title bar, past the bottom edge or out of a narrow window is painted
+    // through the clip rect but must be completely unreachable.
+    let top = widget::HEADER_BOTTOM;
+    let (bottom, right) = if view.full { (view.panel_h, view.panel_w) } else { (CHIP_H, CHIP_W) };
+    let in_view = y >= top && y < bottom && x >= 0 && x < right;
     hits.iter()
         .filter(|h| h.hit(x, y))
         .filter(|h| in_view || is_header_widget(h.id))
@@ -3275,7 +3407,7 @@ fn pick<'a>(hits: &'a [Hit], x: i32, y: i32, view: &PanelView) -> Option<&'a Hit
 /// The fixed chrome above the scroll area. Everything else scrolls with the
 /// content, so a point above the viewport may only reach these.
 fn is_header_widget(id: &str) -> bool {
-    matches!(id, "expand" | "collapse" | "close" | "drag" | "title" | "sep1")
+    matches!(id, "expand" | "collapse" | "close" | "drag" | "title" | "sign" | "sep1")
 }
 
 /// Cycle a picture slot: builtin vector art -> every picture in the asset folder
@@ -3626,16 +3758,117 @@ fn client_xy(lparam: LPARAM) -> (i32, i32) {
     ((v & 0xFFFF) as i16 as i32, ((v >> 16) & 0xFFFF) as i16 as i32)
 }
 
+/// The window's client rect as (left, top, w, h), straight from the OS.
+///
+/// Used by the resize gesture as its origin: taking the truth from `GetWindowRect`
+/// means the gesture cannot start from a stale copy of the geometry.
+unsafe fn window_rect_of(hwnd: HWND) -> (i32, i32, i32, i32) {
+    let mut r = RECT::default();
+    if GetWindowRect(hwnd, &mut r).is_err() {
+        return (0, 0, PW, PH);
+    }
+    (r.left, r.top, (r.right - r.left).max(1), (r.bottom - r.top).max(1))
+}
+
+/// Which resize edge a client point is on: 1 = left, 2 = right, 4 = top, 8 = bottom.
+/// 0 means "not on an edge", i.e. the point belongs to the widgets.
+///
+/// The panel is a `WS_POPUP` layered window on purpose (a system frame would paint a
+/// non-client area we cannot make transparent), so this strip just *inside* the drawn
+/// 1px border is the only thing that can act as the window frame. The top strip is
+/// thinner than the rest so the title bar stays usable for moving the window.
+fn resize_edge_at(x: i32, y: i32, w: i32, h: i32) -> u32 {
+    if w <= PANEL_MIN_W / 2 || h <= PANEL_MIN_H / 2 {
+        return 0;
+    }
+    let mut e = 0;
+    if x < RESIZE_EDGE {
+        e |= 1;
+    }
+    if x >= w - RESIZE_EDGE {
+        e |= 2;
+    }
+    if y < 3 {
+        e |= 4;
+    }
+    if y >= h - RESIZE_EDGE {
+        e |= 8;
+    }
+    e
+}
+
+/// Show the size cursor that belongs to an edge mask.
+unsafe fn set_resize_cursor(edge: u32) {
+    let name = match edge {
+        5 | 10 => IDC_SIZENWSE, // left+top / right+bottom
+        6 | 9 => IDC_SIZENESW,  // right+top / left+bottom
+        3 => IDC_SIZEWE,
+        12 => IDC_SIZENS,
+        _ => IDC_ARROW,
+    };
+    if let Ok(c) = LoadCursorW(HINSTANCE::default(), name) {
+        SetCursor(c);
+    }
+}
+
+/// One resize step: the new window rect for a pointer at (cx, cy).
+///
+/// Deltas are measured against the rect captured when the drag STARTED, never against
+/// the live window: the window is being resized underneath the pointer, so a
+/// client-relative delta would shrink the gesture a little more on every move.
+fn resize_apply(d: &ResizeDrag, cx: i32, cy: i32) -> (i32, i32, i32, i32) {
+    let (rx, ry, rw, rh) = d.rect;
+    let dx = cx - d.from.0;
+    let dy = cy - d.from.1;
+    let (mut x, mut y, mut w, mut h) = (rx, ry, rw, rh);
+    if d.edge & 1 != 0 {
+        let nx = (rx + dx).min(rx + rw - PANEL_MIN_W);
+        x = nx;
+        w = rw + (rx - nx);
+    }
+    if d.edge & 2 != 0 {
+        w = (rw + dx).max(PANEL_MIN_W);
+    }
+    if d.edge & 4 != 0 {
+        let ny = (ry + dy).min(ry + rh - PANEL_MIN_H);
+        y = ny;
+        h = rh + (ry - ny);
+    }
+    if d.edge & 8 != 0 {
+        h = (rh + dy).max(PANEL_MIN_H);
+    }
+    // Keep both the size and the position inside the work area: a window dragged half
+    // off the screen would be unreachable (the same rule the automatic layout uses).
+    let (wx, wy, ww, wh) = work_area();
+    w = w.clamp(PANEL_MIN_W, ww.max(PANEL_MIN_W));
+    h = h.clamp(PANEL_MIN_H, (wh.max(240) - 8).min(PH_MAX).max(PANEL_MIN_H));
+    let x = rect_x_clamp_in(x, w, wx, ww);
+    let y = rect_y_clamp_in(y, h, wy, wh);
+    (x, y, w, h)
+}
+
 unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
+        WM_SETCURSOR => {
+            // The class has no `hCursor`, so the shape is ours to pick: an edge gets a
+            // size cursor, everything else the arrow (returning TRUE stops the default
+            // processing from overriding it).
+            let mut p = POINT::default();
+            let _ = GetCursorPos(&mut p);
+            let (wx, wy, ww, wh) = window_rect_of(hwnd);
+            let edge = resize_edge_at(p.x - wx, p.y - wy, ww, wh);
+            set_resize_cursor(edge);
+            return LRESULT(TRUE.0 as isize);
+        }
         WM_MOUSEWHEEL => {
             // LESSONS rule 1: print the RAW value before deriving anything. The dock
             // once looked "dead" because the message was swallowed by a catch-all and
             // the derived delta was read from a value that never existed; the raw log
             // is what tells the two apart.
             let raw = wparam.0 as u32;
-            let lo = (raw & 0xFFFF) as i32;
+            let keys = (raw & 0xFFFF) as i32;
+            let lo = keys;
             let hi = ((raw >> 16) & 0xFFFF) as i32;
             let delta = hi as i16 as i32;
             logline!("INFO", "panel wheel raw=0x{raw:X} lo={lo} hi={hi} delta={delta}");
@@ -3645,19 +3878,56 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                 let s = state();
                 let mut st = s.lock().unwrap();
                 let pv = view_of(&st);
-                let max_scroll = (pv.content_h - pv.view_h).max(0);
-                let next = (st.scroll - steps * SCROLL_STEP).clamp(0, max_scroll);
-                if next != st.scroll {
-                    st.scroll = next;
+                // Vertical by default. Shift+wheel is the standard horizontal gesture,
+                // and so is wheeling over the horizontal bar itself — the content is a
+                // fixed 452 wide, so "narrow window" is the only thing that scrolls
+                // sideways and the user needs an obvious way to reach it.
+                let mut p = POINT::default();
+                let _ = GetCursorPos(&mut p);
+                let (_wx, wy, _ww, wh) = window_rect_of(hwnd);
+                let over_hbar = p.y - wy >= wh - 8;
+                let shift = keys & 0x0004 != 0; // MK_SHIFT
+                let horizontal =
+                    pv.full && (shift || over_hbar || (pv.content_h <= pv.view_h && pv.view_w < PW));
+                if horizontal {
+                    let next = (st.hscroll - steps * HSCROLL_STEP).clamp(0, pv.max_hscroll());
+                    if next != st.hscroll {
+                        st.hscroll = next;
+                        st.panel_dirty = true;
+                    }
+                    logline!("INFO", "panel hscroll x={} max={}", st.hscroll, pv.max_hscroll());
+                } else {
+                    let max_scroll = (pv.content_h - pv.view_h).max(0);
+                    let next = (st.scroll - steps * SCROLL_STEP).clamp(0, max_scroll);
+                    if next != st.scroll {
+                        st.scroll = next;
+                        st.panel_dirty = true;
+                    }
+                    logline!(
+                        "INFO",
+                        "panel scroll y={} max={max_scroll} view={} content={}",
+                        st.scroll,
+                        pv.view_h,
+                        pv.content_h
+                    );
+                }
+            }
+            return LRESULT(0);
+        }
+        WM_MOUSEHWHEEL => {
+            // A tilt wheel scrolls the content sideways; same 120-per-notch unit.
+            let delta = ((wparam.0 as u32 >> 16) & 0xFFFF) as i16 as i32;
+            let steps = (delta as f64 / 120.0).round() as i32;
+            if steps != 0 {
+                let s = state();
+                let mut st = s.lock().unwrap();
+                let pv = view_of(&st);
+                let next = (st.hscroll + steps * HSCROLL_STEP).clamp(0, pv.max_hscroll());
+                if next != st.hscroll {
+                    st.hscroll = next;
                     st.panel_dirty = true;
                 }
-                logline!(
-                    "INFO",
-                    "panel scroll y={} max={max_scroll} view={} content={}",
-                    st.scroll,
-                    pv.view_h,
-                    pv.content_h
-                );
+                logline!("INFO", "panel hwheel delta={delta} x={} max={}", st.hscroll, pv.max_hscroll());
             }
             return LRESULT(0);
         }
@@ -3665,21 +3935,26 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
             let (x, y) = client_xy(lparam);
             let s = state();
             let mut st = s.lock().unwrap();
+            if let Some(d) = st.resize {
+                let mut p = POINT::default();
+                let _ = GetCursorPos(&mut p);
+                let (nx, ny, nw, nh) = resize_apply(&d, p.x, p.y);
+                let (ow, oh) = (st.panel_w, st.panel_h_user);
+                st.panel_pos = (nx, ny);
+                st.panel_w = nw;
+                st.panel_h_user = Some(nh);
+                st.want_panel_resize = true;
+                st.panel_dirty = true;
+                if ow != nw || oh != Some(nh) {
+                    logline!("INFO", "panel resize {}x{} at ({nx},{ny}) edge={}", nw, nh, d.edge);
+                }
+                return LRESULT(0);
+            }
             if let Some((ox, oy)) = st.drag_panel {
                 let mut p = POINT::default();
                 let _ = GetCursorPos(&mut p);
                 st.panel_pos = (p.x - ox, p.y - oy);
                 st.want_panel_move = true;
-                return LRESULT(0);
-            }
-            if st.drag_grip {
-                // the client is the zoomed panel, so client_x / design width is the
-                // zoom the user is asking for
-                let (z0, x0) = st.grip_start;
-                let z = (z0 + (x - x0) as f64 / PW as f64).clamp(0.6, 2.0);
-                st.panel_zoom = (z * 100.0).round() / 100.0;
-                st.want_panel_resize = true;
-                st.panel_dirty = true;
                 return LRESULT(0);
             }
             if st.drag_wheel {
@@ -3729,7 +4004,23 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
             let (x, y) = client_xy(lparam);
             let s = state();
             let mut st = s.lock().unwrap();
+            // The frame wins over the widgets: a click on the border resizes, exactly
+            // like a normal window, and never lands on a control that happens to sit
+            // under the border strip.
             let pv = view_of(&st);
+            let edge = if pv.full { resize_edge_at(x, y, pv.panel_w, pv.panel_h) } else { 0 };
+            if edge != 0 {
+                let mut p = POINT::default();
+                let _ = GetCursorPos(&mut p);
+                let (wx, wy, ww, wh) = window_rect_of(hwnd);
+                st.resize = Some(ResizeDrag { edge, from: (p.x, p.y), rect: (wx, wy, ww, wh) });
+                st.hover.clear();
+                st.panel_dirty = true;
+                drop(st);
+                let _ = SetCapture(hwnd);
+                logline!("INFO", "panel resize start edge={edge} rect=({wx},{wy},{ww}x{wh})");
+                return LRESULT(0);
+            }
             let hits = panel_layout(&pv);
             let mut handled = false;
             if let Some(h) = pick(&hits, x, y, &pv) {
@@ -3738,11 +4029,6 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                         let mut p = POINT::default();
                         let _ = GetCursorPos(&mut p);
                         st.drag_panel = Some((p.x - st.panel_pos.0, p.y - st.panel_pos.1));
-                        handled = true;
-                    }
-                    Kind::Button if h.id == "panel_grip" => {
-                        st.drag_grip = true;
-                        st.grip_start = (st.panel_zoom, x);
                         handled = true;
                     }
                     Kind::Wheel => {
@@ -3799,7 +4085,9 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                 st.drag_slider = None;
                 st.drag_panel = None;
                 st.drag_wheel = false;
-                st.drag_grip = false;
+                if st.resize.take().is_some() {
+                    st.panel_dirty = true;
+                }
                 st.panel_dirty = true;
             }
             let _ = ReleaseCapture();
@@ -4198,7 +4486,9 @@ fn handle_line(line: &str) {
             st.want_show = true;
         }
         "panel" => {
-            let on = v.get("visible").and_then(|b| b.as_bool()).unwrap_or(true);
+            // `--no-panel` processes have no window to show; saying otherwise would
+            // make the host believe a second panel exists.
+            let on = v.get("visible").and_then(|b| b.as_bool()).unwrap_or(true) && has_panel();
             st.panel_shown = on;
             if on {
                 st.want_panel_show = true;
@@ -4331,12 +4621,9 @@ fn handle_line(line: &str) {
         }
         "panel_theme" => {
             // The host can drive the menu's own look (a theme switch from a tool).
+            // Only the accent: the panel's SIZE belongs to the window, not to a theme.
             if let Some(accent) = v.get("accent").and_then(|x| x.as_str()).and_then(parse_hex) {
                 st.panel_accent = accent & 0xFFFFFF;
-            }
-            if let Some(z) = v.get("zoom").and_then(|x| x.as_f64()) {
-                st.panel_zoom = z.clamp(0.6, 2.0);
-                st.want_panel_resize = true;
             }
             st.panel_dirty = true;
         }
@@ -4514,11 +4801,42 @@ fn handle_line(line: &str) {
                 }
             }
         }
-        "panel_zoom" => {
-            let v = v.get("value").and_then(|x| x.as_f64()).unwrap_or(1.0);
-            st.panel_zoom = v.clamp(0.6, 2.0);
+        "panel_size" => {
+            // The WINDOW's size, the same thing the user changes by dragging a border.
+            // `height: null` (or `auto: true`) hands the height back to the automatic
+            // rule (fit the content, capped by the work area).
+            if let Some(w) = v.get("width").and_then(|x| x.as_i64()) {
+                st.panel_w = (w as i32).clamp(PANEL_MIN_W, 4096);
+            }
+            if v.get("auto").and_then(|x| x.as_bool()).unwrap_or(false) {
+                st.panel_h_user = None;
+            } else if let Some(h) = v.get("height") {
+                st.panel_h_user = h.as_i64().map(|n| (n as i32).clamp(PANEL_MIN_H, PH_MAX));
+            }
+            let pv = view_of(&st);
             st.panel_dirty = true;
             st.want_panel_resize = true;
+            out["panel_w"] = serde_json::json!(pv.panel_w);
+            out["panel_h"] = serde_json::json!(pv.panel_h);
+            out["view_w"] = serde_json::json!(pv.view_w);
+            out["panel_hscroll_max"] = serde_json::json!(pv.max_hscroll());
+        }
+        "panel_hscroll" => {
+            // Absolute `x` or relative `delta`, in design px. Mirrors `panel_scroll`
+            // so the sideways behaviour can be asserted without a mouse; the real
+            // wheel/shift-wheel path is verified by hand (a protocol call never
+            // proves input works).
+            let pv = view_of(&st);
+            let hmax = pv.max_hscroll();
+            let target = match v.get("x").and_then(|n| n.as_i64()) {
+                Some(x) => x as i32,
+                None => st.hscroll + v.get("delta").and_then(|n| n.as_i64()).unwrap_or(0) as i32,
+            };
+            st.hscroll = target.clamp(0, hmax);
+            st.panel_dirty = true;
+            out["hscroll"] = serde_json::json!(st.hscroll);
+            out["hscroll_max"] = serde_json::json!(hmax);
+            out["view_w"] = serde_json::json!(pv.view_w);
         }
         "log_export" => {
             let dst = v.get("path").and_then(|p| p.as_str()).unwrap_or("");
@@ -4855,11 +5173,17 @@ fn handle_line(line: &str) {
         out["panel_scroll"] = serde_json::json!(st.scroll);
         out["panel_content_h"] = serde_json::json!(pv.content_h);
         out["panel_view_h"] = serde_json::json!(pv.view_h);
+        // The window itself, and the sideways scroll that only exists when it is
+        // narrower than the 452-wide content column.
+        out["panel_w"] = serde_json::json!(pv.panel_w);
+        out["panel_h"] = serde_json::json!(pv.panel_h);
+        out["panel_view_w"] = serde_json::json!(pv.view_w);
+        out["panel_hscroll"] = serde_json::json!(st.hscroll);
+        out["panel_hscroll_max"] = serde_json::json!(pv.max_hscroll());
     }
     // The redesign's state, reported so a test can assert it instead of peeking at
-    // pixels: menu accent/zoom (panel chrome) vs the cursor's own colour/size.
+    // pixels: menu accent (panel chrome) vs the cursor's own colour/size.
     out["panel_accent"] = serde_json::json!(hex(st.panel_accent));
-    out["panel_zoom"] = serde_json::json!(st.panel_zoom);
     out["menu_themes"] = serde_json::json!(
         st.menu_themes.iter().map(|t| t.name.clone()).collect::<Vec<String>>()
     );
@@ -4963,11 +5287,6 @@ fn main() {
     }
     {
         let args: Vec<String> = std::env::args().collect();
-        if let Some(i) = args.iter().position(|a| a == "--panel-zoom") {
-            if let Some(v) = args.get(i + 1).and_then(|x| x.parse::<f64>().ok()) {
-                INIT_ZOOM.store((v.clamp(0.6, 2.0) * 1000.0) as i32, std::sync::atomic::Ordering::Relaxed);
-            }
-        }
         if args.iter().any(|a| a == "--dock-topmost") {
             DOCK_TOPMOST.store(true, std::sync::atomic::Ordering::Relaxed);
         }
@@ -4978,6 +5297,9 @@ fn main() {
         }
         if args.iter().any(|a| a == "--panel") {
             INIT_PANEL.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        if args.iter().any(|a| a == "--no-panel") {
+            NO_PANEL.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         if let Some(i) = args.iter().position(|a| a == "--slots") {
             if let Some(path) = args.get(i + 1) {
@@ -5038,8 +5360,10 @@ fn main() {
         let py = wy + ((wh - PH) / 2).max(8);
 
         let hwnd = make_overlay();
-        let panel = make_panel(px, py);
-        if INIT_PANEL.load(std::sync::atomic::Ordering::Relaxed) {
+        // A cursor that is not the panel owner does not create the window at all: a
+        // hidden panel would still be a second `AiMousePanel` on the desktop.
+        let panel = if has_panel() { make_panel(px, py) } else { null_hwnd() };
+        if has_panel() && INIT_PANEL.load(std::sync::atomic::Ordering::Relaxed) {
             let _ = ShowWindow(panel, SW_SHOWNOACTIVATE);
         }
         let grab = make_grab();
@@ -5140,13 +5464,12 @@ fn main() {
         let mut dock_cv = Canvas::new(DOCK_W, DOCK_H, SS);
         let mut dock_cv_w = DOCK_W;
         let mut dock_cv_h = DOCK_H;
-        let mut panel_cv = Canvas::new_scaled(
-            PW,
-            PH_MAX,
-            SS_PANEL,
-            INIT_ZOOM.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0,
-        );
+        // The panel canvas is exactly the WINDOW: paint, compose and blit all run at
+        // one size, which is what stops `compose` from sampling with a stale stride
+        // (LESSONS §4). It is recreated whenever the user resizes the window.
+        let mut panel_cv = Canvas::new(PW, PH, SS_PANEL);
         let mut panel_cv_w = PW;
+        let mut panel_cv_h = PH;
 
         loop {
             let mut msg = MSG::default();
@@ -5190,28 +5513,27 @@ fn main() {
 
             // Deferred Win32 actions run on the window thread, never while the
             // state lock is held (these calls can re-enter the wndproc).
-            // The panel grows and shrinks with its sections, so the requested
-            // height is recomputed from the live expansion state.
+            //
+            // `panel_geom` already clamps both scroll offsets to what the current
+            // viewport can show; write the clamped values back so a section collapse
+            // (or a window that got taller) cannot leave the panel scrolled past its
+            // end, and so a window widened past 452 drops its stale sideways offset.
             {
-                // The viewport is derived from the content and the WORK area, and the
-                // scroll offset is clamped to what that viewport can actually show, so
-                // collapsing a section cannot leave the panel scrolled past its end.
-                let (want_h, content_h) = {
-                    let s = st.lock().unwrap();
-                    if s.panel_full {
-                        let v = view_of(&s);
-                        (panel_view_h(&v), panel_content_h(&v))
-                    } else {
-                        (CHIP_H, CHIP_H)
-                    }
-                };
                 let mut s = st.lock().unwrap();
-                let max_scroll = (content_h - want_h).max(0);
-                let sc = s.scroll.clamp(0, max_scroll);
-                if sc != s.scroll {
-                    s.scroll = sc;
+                let content_h = {
+                    let v = view_of(&s);
+                    v.content_h
+                };
+                let g = panel_geom(&s, content_h);
+                if g.vscroll != s.scroll {
+                    s.scroll = g.vscroll;
                     s.panel_dirty = true;
                 }
+                if g.hscroll != s.hscroll {
+                    s.hscroll = g.hscroll;
+                    s.panel_dirty = true;
+                }
+                let want_h = if s.panel_full { g.h } else { CHIP_H };
                 if s.panel_px_h != want_h {
                     s.panel_px_h = want_h;
                     s.want_panel_resize = true;
@@ -5392,7 +5714,7 @@ fn main() {
                 }
                 take
             };
-            let (do_show, do_hide, affinity, dump, p_show, p_hide, p_resize, p_move, p_pos, p_full, p_h) = {
+            let (do_show, do_hide, affinity, dump, p_show, p_hide, p_resize, p_move, p_full) = {
                 let mut s = st.lock().unwrap();
                 let show = s.want_show;
                 let hide = s.want_hide;
@@ -5409,7 +5731,7 @@ fn main() {
                 s.want_panel_resize = false;
                 s.want_panel_move = false;
                 s.panel_dirty = s.panel_dirty || ps || ph || pr;
-                (show, hide, aff, d, ps, ph, pr, pm, s.panel_pos, s.panel_full, s.panel_px_h)
+                (show, hide, aff, d, ps, ph, pr, pm, s.panel_full)
             };
 
             let (ohwnd, phwnd) = {
@@ -5448,7 +5770,7 @@ fn main() {
                         let _ = DestroyWindow(hwnd_of(phwnd));
                         let fresh = make_overlay();
                         let (x, y) = { st.lock().unwrap().panel_pos };
-                        let fresh_panel = make_panel(x, y);
+                        let fresh_panel = if has_panel() { make_panel(x, y) } else { null_hwnd() };
                         if cap {
                             let _ = SetWindowDisplayAffinity(fresh, WDA_NONE);
                             let _ = SetWindowDisplayAffinity(fresh_panel, WDA_NONE);
@@ -5518,45 +5840,51 @@ fn main() {
             if p_hide {
                 let _ = ShowWindow(hwnd_of(phwnd), SW_HIDE);
             }
-            if p_show {
+            if p_show && phwnd != 0 {
                 let _ = ShowWindow(hwnd_of(phwnd), SW_SHOWNOACTIVATE);
             }
-            if p_resize {
-                let z = st.lock().unwrap().panel_zoom;
-                let w = if p_full { ((PW as f64) * z).round() as i32 } else { CHIP_W };
-                let h = if p_full { p_h } else { CHIP_H };
-                logline!("TRACE", "resize w={w} h={h} zoom={z:.3} p_h={p_h}");
-                // Opening a section grows the panel downward; keep it on screen by
-                // sliding it up rather than letting it run off the bottom edge. The
-                // work area is used (not SM_CYSCREEN) so the taskbar is off limits.
+            if p_resize && phwnd != 0 {
+                // Geometry comes from `panel_geom` at apply time, never from a value
+                // captured a few statements earlier: the drag path, the automatic
+                // layout and a section toggle can all have moved it since.
+                let (g, full) = {
+                    let s = st.lock().unwrap();
+                    let content_h = view_of(&s).content_h;
+                    (panel_geom(&s, content_h), s.panel_full)
+                };
+                let (w, h) = if full { (g.w, g.h) } else { (CHIP_W, CHIP_H) };
                 let (wx, wy, ww, wh) = work_area();
-                if p_pos.1 + h > wy + wh - 8 || p_pos.1 < wy + 8 {
-                    let moved = rect_y_clamp_in(p_pos.1, h, wy, wh);
+                let pos = if full {
+                    (g.x, g.y)
+                } else {
+                    let s = st.lock().unwrap();
+                    (
+                        rect_x_clamp_in(s.panel_pos.0, w, wx, ww),
+                        rect_y_clamp_in(s.panel_pos.1, h, wy, wh),
+                    )
+                };
+                {
                     let mut s = st.lock().unwrap();
-                    s.panel_pos.1 = moved;
+                    s.panel_pos = pos;
                 }
-                if p_pos.0 + w > wx + ww - 8 || p_pos.0 < wx + 8 {
-                    let moved = rect_x_clamp_in(p_pos.0, w, wx, ww);
-                    let mut s = st.lock().unwrap();
-                    s.panel_pos.0 = moved;
-                }
-                let p_pos = { st.lock().unwrap().panel_pos };
+                logline!("TRACE", "panel resize -> {}x{} at ({},{})", w, h, pos.0, pos.1);
                 let _ = SetWindowPos(
                     hwnd_of(phwnd),
                     HWND_TOPMOST,
-                    p_pos.0,
-                    p_pos.1,
+                    pos.0,
+                    pos.1,
                     w,
                     h,
                     SWP_NOACTIVATE | SWP_NOZORDER,
                 );
             }
-            if p_move {
+            if p_move && phwnd != 0 {
+                let pos = { st.lock().unwrap().panel_pos };
                 let _ = SetWindowPos(
                     hwnd_of(phwnd),
                     HWND_TOPMOST,
-                    p_pos.0,
-                    p_pos.1,
+                    pos.0,
+                    pos.1,
                     0,
                     0,
                     SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
@@ -5567,9 +5895,12 @@ fn main() {
                 if target_panel {
                     let vw = { view_of(&st.lock().unwrap()) };
                     let hits = panel_layout(&vw);
-                    let (w, h) = if vw.full { (PW, panel_height(&vw)) } else { (CHIP_W, CHIP_H) };
-                    draw_panel(&panel_cv, &vw, &hits, h);
-                    panel_cv.dump_bmp(&path, w, h);
+                    let (w, h) = if vw.full { (vw.panel_w, vw.panel_h) } else { (CHIP_W, CHIP_H) };
+                    // A dump must not depend on the live canvas size: the window may
+                    // have been resized since the canvas was last rebuilt.
+                    let cv = Canvas::new(w, h, SS_PANEL);
+                    draw_panel(&cv, &vw, &hits, h);
+                    cv.dump_bmp(&path, w, h);
                 } else {
                     let cvv = { cursor_view(&st.lock().unwrap()) };
                     draw_cursor(&cursor_cv, &cvv);
@@ -5754,7 +6085,7 @@ fn main() {
 
             let (draw_panel_now, pv) = {
                 let mut s = st.lock().unwrap();
-                if s.panel_shown && s.panel_dirty {
+                if s.panel_shown && s.panel_hwnd != 0 && s.panel_dirty {
                     s.panel_dirty = false;
                     (true, view_of(&s))
                 } else {
@@ -5762,19 +6093,19 @@ fn main() {
                 }
             };
             if draw_panel_now {
-                let want_w = ((PW as f64) * pv.zoom.clamp(0.6, 2.0)).round() as i32;
-                if want_w != panel_cv_w {
-                    panel_cv = Canvas::new_scaled(
-                        want_w,
-                        ((PH_MAX as f64) * pv.zoom.clamp(0.6, 2.0)).round() as i32,
-                        SS_PANEL,
-                        pv.zoom.clamp(0.6, 2.0),
-                    );
+                // The canvas IS the window: recreate it whenever the user (or the
+                // automatic layout) changed the window size. `compose` samples by
+                // index with a stride tied to the canvas width, so a canvas that is
+                // bigger than the window is fine, a smaller one would write out of
+                // bounds. Both are kept equal on purpose.
+                let (want_w, want_h) = if pv.full { (pv.panel_w, pv.panel_h) } else { (CHIP_W, CHIP_H) };
+                if want_w != panel_cv_w || want_h != panel_cv_h {
+                    panel_cv = Canvas::new(want_w, want_h, SS_PANEL);
                     panel_cv_w = want_w;
+                    panel_cv_h = want_h;
                 }
                 let hits = panel_layout(&pv);
-                let h = if pv.full { panel_height(&pv) } else { CHIP_H };
-                draw_panel(&panel_cv, &pv, &hits, h);
+                draw_panel(&panel_cv, &pv, &hits, want_h);
             }
 
             {

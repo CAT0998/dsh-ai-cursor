@@ -91,14 +91,21 @@ describe('鼠标预设：相同设置只留一份 (requirement 7)', () => {
 })
 
 describe('菜单主题：同一个主题只留一份', () => {
-  const theme: MenuTheme = { name: '主题1', accent: '#4FC3F7', zoom: 1 }
+  const theme: MenuTheme = { name: '主题1', accent: '#4FC3F7' }
 
-  it('deduplicates on accent + zoom', () => {
+  it('deduplicates on the accent (the zoom field is gone)', () => {
     const first = upsertMenuTheme([], theme)
     const again = upsertMenuTheme(first.list, { ...theme, name: '主题2', accent: '#4fc3f7' })
     expect(again.duplicate).toBe(true)
     expect(again.list).toHaveLength(1)
-    expect(menuThemeKey({ accent: '#4FC3F7', zoom: 1 })).toBe(menuThemeKey({ accent: '4fc3f7', zoom: 1 }))
+    expect(menuThemeKey({ accent: '#4FC3F7' })).toBe(menuThemeKey({ accent: '4fc3f7' }))
+  })
+
+  it('two themes that differ only by an old `zoom` key are the same theme', async () => {
+    // A file written by an older build still carries `zoom`; it must load (the extra
+    // key is ignored) and must not create a second entry for the same accent.
+    const legacy = { name: '旧主题', accent: '#7C5CFF', zoom: 1.15 } as unknown as MenuTheme
+    expect(menuThemeKey(legacy)).toBe(menuThemeKey({ accent: '#7c5cff' }))
   })
 
   it('names new themes 主题1, 主题2 …', () => {
@@ -144,7 +151,7 @@ describe('存储分离 (requirement 4)', () => {
   it('writes menu themes and mouse presets to different files', async () => {
     const themeFile = join(dir, 'menu-themes.json')
     const presetFile = join(dir, 'cursor-presets.json')
-    await saveMenuThemes(themeFile, [{ name: '主题1', accent: '#7C5CFF', zoom: 1.15 }])
+    await saveMenuThemes(themeFile, [{ name: '主题1', accent: '#7C5CFF' }])
     await saveCursorPresets(presetFile, [base])
 
     const themes = await loadMenuThemes(themeFile)
@@ -162,7 +169,9 @@ describe('存储分离 (requirement 4)', () => {
       cursorPresetsFile: join(dir, 'cursor-presets.json'),
       status: async () => ({ theme: 'whale', color: '#4FC3F7' }),
     }
-    const first = await handlePanelCommand('menu_theme_save', { accent: '#7C5CFF', zoom: 1.2 }, env)
+    // `zoom` is no longer part of a menu theme; a stale sender that still includes
+    // it must not matter.
+    const first = await handlePanelCommand('menu_theme_save', { accent: '#7C5CFF' }, env)
     const second = await handlePanelCommand('menu_theme_save', { accent: '#7c5cff', zoom: 1.2 }, env)
     expect(first?.message).toContain('已保存')
     expect(second?.message).toContain('已存在')

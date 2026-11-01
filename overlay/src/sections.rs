@@ -32,7 +32,7 @@ pub struct SecDef {
 /// registration step; `docs/MODULES.md` documents the contract.
 ///
 /// Structure rule (2026-11-01 redesign, see `docs/PANEL-REDESIGN.md`): the panel is
-/// split into **菜单主题** (the menu bar's own chrome: accent + zoom) and
+/// split into **菜单主题** (the menu bar's own accent) and
 /// **AI 鼠标设置** (one cursor's look). The two never share a control, so choosing a
 /// menu theme can no longer repaint the cursor and vice versa.
 pub const SECTIONS: &[SecDef] = &[
@@ -99,42 +99,38 @@ pub fn is_collapsed(v: &PanelView, key: &str) -> bool {
     v.collapsed.iter().any(|k| k == key)
 }
 
-/// Everything the layout needs, derived from one number.
+/// Everything the layout needs: design units only.
 ///
 /// Rectangles must never be written as bare constants again: they come from here,
-/// so changing `zoom` moves and resizes every dependent widget together, and the
-/// hit test (which uses the same values) always matches what is drawn.
+/// so a widget's padding, row height and right edge have exactly one definition and
+/// the hit test (which consumes the same rects) always matches what is drawn.
+///
+/// There is deliberately **no scale factor**: the panel content is authored at its
+/// design width (`crate::PW` = 452) and stays there. Resizing the window changes how
+/// much of it is visible (and how much empty margin sits on the right), never its
+/// size — that is the difference between "window zoom" and "menu zoom", and the
+/// latter was removed on purpose (docs/TASKS.md, decision table).
 #[derive(Clone, Copy, Debug)]
-pub struct Layout {
-    pub zoom: f64,
-    pub width: i32,
-}
+pub struct Layout;
 
 impl Layout {
-    pub fn new(zoom: f64) -> Layout {
-        let z = zoom.clamp(0.6, 2.0);
-        Layout {
-            zoom: z,
-            width: (crate::PW as f64 * z).round() as i32,
-        }
-    }
-    fn sc(&self, v: i32) -> i32 {
-        (v as f64 * self.zoom).round() as i32
+    pub fn new() -> Layout {
+        Layout
     }
     pub fn pad(&self) -> i32 {
-        self.sc(14)
+        PAD
     }
     pub fn gap(&self) -> i32 {
-        self.sc(8)
+        8
     }
     pub fn row(&self) -> i32 {
-        self.sc(22)
+        22
     }
     pub fn btn_h(&self) -> i32 {
-        self.sc(34)
+        34
     }
     pub fn content_right(&self) -> i32 {
-        self.width - self.pad()
+        content_right()
     }
     pub fn button_row(&self, y: i32, n: i32) -> (i32, i32) {
         let total = self.content_right() - self.pad();
@@ -156,32 +152,16 @@ fn col_w() -> i32 {
 }
 
 /// Build the whole section stack starting at `y`. Returns the bottom y.
-pub fn build(v: &PanelView, mut y: i32, out: &mut Vec<Hit>) -> i32 {
+///
+/// `y` carries the vertical scroll (the caller passes `48 - v.scroll`), so one number
+/// moves the paint AND every hit box together — there is no second coordinate space.
+/// The horizontal offset is NOT applied here: `panel_layout` applies it to the whole
+/// content span (sections *and* the footer) in one place.
+pub fn build(v: &PanelView, y: i32, out: &mut Vec<Hit>) -> i32 {
     if !v.full {
         return y;
     }
-    // Geometry is authored once at the design size and scaled here, at the single
-    // exit point. Drawing and hit testing both consume these hits, so they cannot
-    // drift apart when the zoom changes.
-    let zoom = v.zoom.clamp(0.6, 2.0);
-    let start = out.len();
-    let bottom = build_design(v, y, out);
-    // A grip in the footer: dragging it changes the zoom. Authored at the design
-    // size like everything else, so it scales with the panel.
-    out.push(
-        Hit::new(rect(content_right() - 84, bottom + 4, content_right(), bottom + 24), Kind::Button, "panel_grip")
-            .text("大小")
-            .hover(hov(v, "panel_grip")),
-    );
-    if (zoom - 1.0).abs() > 0.001 {
-        for h in out[start..].iter_mut() {
-            h.r.left = (h.r.left as f64 * zoom).round() as i32;
-            h.r.top = (h.r.top as f64 * zoom).round() as i32;
-            h.r.right = (h.r.right as f64 * zoom).round() as i32;
-            h.r.bottom = (h.r.bottom as f64 * zoom).round() as i32;
-        }
-    }
-    return (bottom as f64 * zoom).round() as i32;
+    build_design(v, y, out)
 }
 
 fn build_design(v: &PanelView, mut y: i32, out: &mut Vec<Hit>) -> i32 {
@@ -252,8 +232,7 @@ fn build_design(v: &PanelView, mut y: i32, out: &mut Vec<Hit>) -> i32 {
 // ------------------------------------------------------------------ bodies ---
 
 fn body_actions(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
-    // authored at design size; build() scales the whole panel in one place
-    let l = Layout::new(1.0);
+    let l = Layout::new();
     let acts: [(&'static str, &str, bool); 4] = [
         ("show", "显示", v.visible),
         ("hide", "隐藏", !v.visible),
@@ -262,7 +241,7 @@ fn body_actions(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
     ];
     let (w, by) = l.button_row(y, 4);
     for (i, (id, text, on)) in acts.iter().enumerate() {
-        let bx = l.pad() + i as i32 * (w + l.gap());
+        let bx = x + i as i32 * (w + l.gap());
         out.push(
             Hit::new(rect(bx, by, bx + w, by + l.btn_h()), Kind::Button, id)
                 .text(*text)
@@ -270,15 +249,14 @@ fn body_actions(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
                 .hover(hov(v, id)),
         );
     }
-    y = by + l.btn_h() + l.sc(4);
+    y = by + l.btn_h() + 4;
     // the drag switch sits on its own line, also laid out from the model
     out.push(
-        Hit::new(rect(l.pad(), y, l.pad() + l.sc(34), y + l.sc(16)), Kind::Label, "l_drag")
-            .text("拖拽"),
+        Hit::new(rect(x, y, x + 34, y + 16), Kind::Label, "l_drag").text("拖拽"),
     );
     out.push(
         Hit::new(
-            rect(l.pad() + l.sc(38), y - l.sc(2), l.pad() + l.sc(130), y + l.sc(22)),
+            rect(x + 38, y - 2, x + 130, y + 22),
             Kind::Button,
             "drag_toggle",
         )
@@ -287,60 +265,44 @@ fn body_actions(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
         .hover(hov(v, "drag_toggle")),
     );
     out.push(
-        Hit::new(
-            rect(l.pad(), y + l.sc(30), l.pad() + l.sc(120), y + l.sc(56)),
-            Kind::Button,
-            "stop_all",
-        )
-        .text("停止全部")
-        .hover(hov(v, "stop_all")),
+        Hit::new(rect(x, y + 30, x + 120, y + 56), Kind::Button, "stop_all")
+            .text("停止全部")
+            .hover(hov(v, "stop_all")),
     );
     out.push(
         Hit::new(
-            rect(l.pad() + l.sc(128), y + l.sc(35), l.content_right(), y + l.sc(53)),
+            rect(x + 128, y + 35, l.content_right(), y + 53),
             Kind::Label,
             "l_stop_all_hint",
         )
         .text("停掉所有 AI 鼠标"),
     );
     out.push(
-        Hit::new(
-            rect(l.pad(), y + l.sc(30), l.pad() + l.sc(120), y + l.sc(56)),
-            Kind::Button,
-            "quit_app",
-        )
-        .text("退出")
-        .hover(hov(v, "quit_app")),
+        Hit::new(rect(x, y + 30, x + 120, y + 56), Kind::Button, "quit_app")
+            .text("退出")
+            .hover(hov(v, "quit_app")),
     );
     out.push(
         Hit::new(
-            rect(l.pad() + l.sc(128), y + l.sc(35), l.content_right(), y + l.sc(53)),
+            rect(x + 128, y + 35, l.content_right(), y + 53),
             Kind::Label,
             "l_quit_hint",
         )
         .text("关闭所有 AI 鼠标并退出"),
     );
     out.push(
-        Hit::new(
-            rect(l.pad(), y + l.sc(62), l.pad() + l.sc(120), y + l.sc(88)),
-            Kind::Button,
-            "dock_toggle",
-        )
-        .text("停靠站")
-        .hover(hov(v, "dock_toggle")),
+        Hit::new(rect(x, y + 62, x + 120, y + 88), Kind::Button, "dock_toggle")
+            .text("停靠站")
+            .hover(hov(v, "dock_toggle")),
+    );
+    out.push(
+        Hit::new(rect(x + 128, y + 62, x + 248, y + 88), Kind::Button, "map_toggle")
+            .text("小地图")
+            .hover(hov(v, "map_toggle")),
     );
     out.push(
         Hit::new(
-            rect(l.pad() + l.sc(128), y + l.sc(62), l.pad() + l.sc(248), y + l.sc(88)),
-            Kind::Button,
-            "map_toggle",
-        )
-        .text("小地图")
-        .hover(hov(v, "map_toggle")),
-    );
-    out.push(
-        Hit::new(
-            rect(l.pad() + l.sc(140), y, l.content_right(), y + l.sc(18)),
+            rect(x + 140, y, l.content_right(), y + 18),
             Kind::Label,
             "l_drag_hint",
         )
@@ -350,13 +312,15 @@ fn body_actions(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
             "按住光标即可用真实鼠标拖动它"
         }),
     );
-    y + l.sc(122)
+    y + 122
 }
 
 /// 菜单主题：**只**描述菜单栏自己长什么样。
 ///
-/// 硬判据：这个分区里没有任何一个控件会改变 AI 光标的像素。它写 `panel_accent`
-/// 与 `panel_zoom`，与光标用的 `accent` / `scale` 是两套值、两套存储。
+/// 硬判据：这个分区里没有任何一个控件会改变 AI 光标的像素，也没有任何控件会改变
+/// 面板自身的大小 —— 「菜单缩放」已按用户决定删除（docs/TASKS.md 决策表）：它被实现成
+/// "整体放大字体+间距"，与窗口缩放重复。窗口大小现在由拖边框改，几何在 `main.rs` 的
+/// `PanelGeom` 里只有一份。
 fn body_menu_theme(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
     // 面板强调色（只影响菜单栏的按钮/滑杆/滚动条）
     for (i, (id, rgb)) in MT_SWATCH_IDS.iter().zip(SWATCHES.iter()).enumerate() {
@@ -373,19 +337,6 @@ fn body_menu_theme(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32
             .text(hex(v.panel_accent)),
     );
     y += 32;
-
-    // 菜单缩放：和右下角「大小」把手是同一个值
-    out.push(Hit::new(rect(x, y + 4, x + 56, y + 20), Kind::Label, "l_mt_zoom").text("菜单缩放"));
-    out.push(
-        Hit::new(rect(x + 62, y + 2, x + 330, y + 20), Kind::Slider, "panel_zoom")
-            .data((((v.zoom - 0.6) / 1.4) * 1000.0).clamp(0.0, 1000.0) as i32)
-            .hover(hov(v, "panel_zoom")),
-    );
-    out.push(
-        Hit::new(rect(x + 336, y + 4, content_right(), y + 20), Kind::LabelRight, "l_mt_zoom_v")
-            .text(format!("{:.0}%", v.zoom * 100.0)),
-    );
-    y += 30;
 
     // 主题预设列表（menu-themes.json，宿主写、面板只读）
     let current = v

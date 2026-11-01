@@ -147,7 +147,7 @@ widget.rs  ←── sections.rs ←── main.rs(draw_panel)
 | 顺序 | key | 标题 | 归属 | 只改什么 |
 |---|---|---|---|---|
 | 1 | `actions` | 操作 | 全局 | 显示/隐藏/停止/启用、拖拽、停靠站、小地图、停止全部、退出 |
-| 2 | `menu_theme` | **菜单主题** | 菜单 | `panel_accent` + `panel_zoom` + 菜单主题预设（`menu-themes.json`） |
+| 2 | `menu_theme` | **菜单主题** | 菜单 | `panel_accent` + 菜单主题预设（`menu-themes.json`，**只有强调色**：`panel_zoom` 已删） |
 | 3 | `mouse` | **AI 鼠标设置** | 光标 | 选中光标（roster）、造型、颜色、大小、透明度、徽标 |
 | 4 | `mouse_presets` | **鼠标预设** | 光标 | `cursor-presets.json`：保存/应用/删除/导出 |
 | 5 | `artwork` | 图案 | **本面板光标** | 三个槽位与参数（不随选择切换，UI 里有明示） |
@@ -187,8 +187,10 @@ stdin 的写端只有宿主持有。见 LESSONS 11 / 3d。
 |---|---|---|
 | `panel_roster` | 宿主→面板 | 全部光标的名字 + 每只的实时外观；`self` 是本面板所属光标 |
 | `panel_identity` | 宿主→面板 | 只报本面板属于哪只（等价于只推 self） |
-| `panel_theme` | 宿主→面板 | 直接设菜单强调色/缩放 |
-| `panel_scroll` | 任意→面板 | 设绝对 `y` 或相对 `delta` 滚动（自动化用） |
+| `panel_theme` | 宿主→面板 | 直接设菜单强调色（**只有强调色**，尺寸归窗口） |
+| `panel_scroll` | 任意→面板 | 设绝对 `y` 或相对 `delta` 纵向滚动（自动化用） |
+| `panel_hscroll` | 任意→面板 | 设绝对 `x` 或相对 `delta` 横向滚动；回 `hscroll/max/view_w` |
+| `panel_size` | 任意→面板 | 设窗口 `width` / `height`（`auto:true` 交回车高自动）；回窗口与视口尺寸。**真机拖边框**走的是同一份几何 |
 | `hits` | 任意→面板 | **诊断**：返回当前所有控件框（id/kind/x/y/w/h/text），点击脚本靠它定位 |
 
 ### 7.4 存储一览
@@ -202,14 +204,39 @@ stdin 的写端只有宿主持有。见 LESSONS 11 / 3d。
 | 选中的光标 | `<exeDir>/logs/cursor-ui.json` | 宿主 |
 | 面板列表缓存 | 内存（每 1.5s 重读上面两个 json） | 浮层 |
 
-### 7.5 滚动（视口模型）
+### 7.5 窗口几何、滚动与改大小（2026-11-01 重做）
 
-- `PH_MAX` 只是画布分配上限；**窗口高度 = 视口高度** = `min(内容高, 工作区高-16)`，
-  工作区用 `GetMonitorInfoW` 的 `rcWork`（排除任务栏）——这就是 1080p「预设点不到」的修复。
-- `sections::build(v, 48 - v.scroll, …)`：绘制与命中框一起平移，**没有第二套坐标**。
-- 内容区用 `IntersectClipRect` 裁剪到 `[HEADER_BOTTOM, view_h]`；画完 `SelectClipRgn` 恢复。
-- `pick()` 带视口守卫：表头以上的点只能命中表头自己的控件，滚出去的控件**彻底不响应**。
-- 滚轮：`panel_proc` 的 `WM_MOUSEWHEEL`，先打原始 `wParam` 再换算（一格 60px）。
+面板现在**像普通窗口**：一个窗口、可拖边框改大小、内容永远是设计尺寸。
+
+- **一份几何**：`main.rs` 的 `panel_geom(&St, content_h) -> PanelGeom` 是唯一算窗口矩形 /
+  内容视口 / 两个滚动夹紧的地方。`view_of()` 把结果写进 `PanelView`，所以绘制、命中、
+  滚动条、窗口过程和 resize 全读同一份数；`pick()` 用的视口就是 `panel_w/panel_h`。
+- **内容固定**：内容按设计宽 `PW=452` 排版。窗口更宽 → `view_w = min(panel_w, 452)`，
+  右边是留白（不拉伸、不重排）；窗口更窄 → `view_w = panel_w`，出现横向滚动条。
+- **偏移只有一个落点**：`panel_layout()` 在拼完“分区 + 页脚”之后，把整段内容按
+  `-v.hscroll` 平移一次；纵向平移仍由 `sections::build(v, 48 - v.scroll)` 的 `y` 承担。
+  绘制与命中共用这些矩形，因此不存在第二套坐标。
+- **裁剪**：内容区 `IntersectClipRect(0, HEADER_BOTTOM, view_w, h)`，画完
+  `SelectClipRgn(NULL)` 恢复。**标题栏必须在设裁剪之前画**——顺序反了就会出现
+  “控件表里有、画面没有”（这次修的就是它）。
+- **改大小**：窗口是 `WS_POPUP + WS_EX_LAYERED`（系统边框会画出不可透明的非客户区），
+  所以边框热区是自己画的**不透明** 6px 带（顶部 3px，避免和拖标题栏抢）。
+  `WM_LBUTTONDOWN` 先测边框再测控件；`ResizeDrag` 用按下瞬间的窗口矩形做原点算增量
+  （窗口在自己脚下变小，用客户区坐标会越拖越偏）；`WM_SETCURSOR` 给尺寸光标。
+- **分层窗口是逐像素命中的**：alpha=0 的像素点击会直接落到桌面，所以圆角外侧那圈
+  以前点不到——这就是为什么要先填一条不透明边框带，再在上面画圆角机身。
+- **横向滚动怎么“滚”**：Shift+滚轮、倾斜滚轮（`WM_MOUSEHWHEEL`）、或把指针放在
+  底部横条上再滚；纵向仍是裸滚轮，两者互不抢占。
+- 画布尺寸 = 窗口尺寸（`Canvas::new(panel_w, panel_h, SS_PANEL)`，窗口一变就重建），
+  这样 `compose` 只能按画布自身宽度取样（LESSONS §4），不会出现“画布比窗口小 → 空白”。
+
+### 7.5b 一个面板，多个光标
+
+- 面板归 `default` 光标进程；宿主 `src/overlay.ts` 用 `new Overlay(exe, { panel:false })`
+  给第二只之后的光标加 `--no-panel`，那个进程**不创建** `AiMousePanel`（不是隐藏），
+  所以 “`EnumWindows` 只有一个面板”成立。
+- 所有面板命令走 `index.ts` 的 `sendPanel()`（永远发给面板 owner），不再发给 `active`。
+- 面板里 ‹ › 切换编辑对象、`cursor_patch` 远端改别的光标，协议与之前一致。
 
 ### 7.6 想加东西时的新插入点
 
@@ -220,4 +247,6 @@ stdin 的写端只有宿主持有。见 LESSONS 11 / 3d。
 | 新的"面板要宿主做事"的动作 | 1) `sections.rs` 出按钮 2) `on_toggle` 里 `write_mailbox({action,…})` 3) 宿主 `drainMailbox` 加一个分支 4) `panelstate.ts` 的纯函数 + 单测 |
 | 新的按光标保存的数据 | 归到 `cursor-presets.json`（`panelstate.ts` 的 `cursorPresetKey` 决定去重） |
 | 新的菜单自身外观 | `St.panel_*` 字段 + `menu-themes.json`，**不要**复用 `st.accent` |
+| 改窗口大小/位置/滚动范围 | 只改 `panel_geom()`；另写一份坐标就是回归 |
+| 标题栏/边框上的东西 | `panel_layout()` 的 header 段 + `is_header_widget()`（否则会被滚动裁剪吃掉） |
 
