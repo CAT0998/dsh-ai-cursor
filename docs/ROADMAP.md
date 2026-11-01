@@ -1,5 +1,7 @@
 # 路线图
 
+> 当前待办与已定决策见 [TASKS.md](TASKS.md)。
+
 > 动手前先读 [ARCHITECTURE.md](ARCHITECTURE.md)：区块职责 + 插入点分析。
 
 > 新会话请先读 [LESSONS.md](LESSONS.md)：踩坑规矩 + 当前进度，能省掉一半返工。
