@@ -43,6 +43,9 @@ use windows::Win32::Graphics::Gdi::{
     Polygon, ReleaseDC, RoundRect, SelectObject, SetBkMode, SetTextColor, TextOutW, AC_SRC_ALPHA,
     AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_USAGE, HDC, HGDIOBJ,
     NULL_PEN, PS_SOLID, SRCCOPY, TRANSPARENT,
+    // 面板滚动：视口裁剪 + 用工作区（rcWork）而不是整屏高来定视口高度。
+    GetMonitorInfoW, HRGN, IntersectClipRect, MONITORINFO, MonitorFromWindow, SelectClipRgn,
+    MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -66,8 +69,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SWP_NOMOVE, SWP_NOSIZE,
     SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, SYSTEM_METRICS_INDEX, ULW_ALPHA,
     WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE,
-    WM_MOUSEMOVE, WM_QUIT, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 // ---------------------------------------------------------------- geometry ---
@@ -199,6 +202,34 @@ fn virtual_screen() -> (i32, i32, i32, i32) {
     }
 }
 
+/// Work area of the primary monitor: the screen minus the taskbar.
+///
+/// This is the fix for the 1080p defect where the panel was sized against
+/// `SM_CYSCREEN` (taskbar included) and the last section landed in a region no
+/// click can reach. The viewport is capped by `rcWork` instead.
+fn work_area() -> (i32, i32, i32, i32) {
+    unsafe {
+        // A null window resolves to the primary monitor, which is where the panel
+        // starts; this keeps the call usable from pure layout code (no lock, no
+        // window handle needed, no re-entrancy risk).
+        let mon = MonitorFromWindow(null_hwnd(), MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if GetMonitorInfoW(mon, &mut mi).as_bool() {
+            let r = mi.rcWork;
+            return (r.left, r.top, (r.right - r.left).max(1), (r.bottom - r.top).max(1));
+        }
+        (
+            0,
+            0,
+            GetSystemMetrics(SYSTEM_METRICS_INDEX(SM_CXSCREEN.0)).max(1),
+            GetSystemMetrics(SYSTEM_METRICS_INDEX(SM_CYSCREEN.0)).max(1),
+        )
+    }
+}
+
 fn dock_frame_interval() -> std::time::Duration {
     let mut dm = windows::Win32::Graphics::Gdi::DEVMODEW::default();
     dm.dmSize = std::mem::size_of::<windows::Win32::Graphics::Gdi::DEVMODEW>() as u16;
@@ -249,6 +280,92 @@ fn read_preset_names(dir: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// One named look for the menu bar itself (`<assetDir>/menu-themes.json`).
+///
+/// Written by the HOST only: this process cannot write the asset directory
+/// (os error 5), which is why "保存主题" goes out as a mailbox command.
+#[derive(Clone, Default)]
+struct MenuTheme {
+    name: String,
+    accent: u32,
+    zoom: f64,
+}
+
+/// Menu themes, read-only here. A malformed file is an empty set, never an error:
+/// the panel has to open on a fresh machine.
+fn read_menu_themes(dir: &str) -> Vec<MenuTheme> {
+    if dir.is_empty() {
+        return Vec::new();
+    }
+    let path = std::path::Path::new(dir).join("menu-themes.json");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return Vec::new();
+    };
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|t| {
+                    let name = t.get("name").and_then(|x| x.as_str())?.to_string();
+                    let accent = t.get("accent").and_then(|x| x.as_str()).and_then(parse_hex).unwrap_or(0x4FC3F7);
+                    let zoom = t.get("zoom").and_then(|x| x.as_f64()).unwrap_or(1.0).clamp(0.6, 2.0);
+                    Some(MenuTheme { name, accent, zoom })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Names from `<assetDir>/cursor-presets.json`, the per-cursor store. Read-only.
+fn read_cursor_preset_names(dir: &str) -> Vec<String> {
+    if dir.is_empty() {
+        return Vec::new();
+    }
+    let path = std::path::Path::new(dir).join("cursor-presets.json");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return Vec::new();
+    };
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|p| p.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Re-read the two panel lists (menu themes, mouse presets) at a low rate.
+///
+/// They are written by the host, so the panel has to notice the change on its own.
+/// Skipped while the panel is hidden: no panel, no reason to touch the disk.
+fn refresh_panel_lists(st: &mut St) {
+    if st.asset_dir.is_empty() || !st.panel_shown {
+        return;
+    }
+    let themes = read_menu_themes(&st.asset_dir);
+    let names: Vec<String> = themes.iter().map(|t| t.name.clone()).collect();
+    let current: Vec<String> = st.menu_themes.iter().map(|t| t.name.clone()).collect();
+    let mut changed = names != current;
+    st.menu_themes = themes;
+    if changed {
+        st.menu_theme_sel = st.menu_theme_sel.min(st.menu_themes.len().saturating_sub(1));
+    }
+    let presets = read_cursor_preset_names(&st.asset_dir);
+    if presets != st.mouse_presets {
+        st.mouse_presets = presets;
+        st.mouse_preset_sel = st.mouse_preset_sel.min(st.mouse_presets.len().saturating_sub(1));
+        changed = true;
+    }
+    if changed {
+        st.panel_dirty = true;
+    }
+}
+
 /// Apply one preset to this cursor. Same fields the plugin's preset tool touches.
 fn apply_preset(dir: &str, name: &str, st: &mut St) -> Result<(), String> {
     let path = std::path::Path::new(dir).join("presets.json");
@@ -284,6 +401,7 @@ fn apply_preset(dir: &str, name: &str, st: &mut St) -> Result<(), String> {
     }
     Ok(())
 }
+
 
 /// Copy presets.json next to the executable, the one place this process may write.
 fn export_presets(dir: &str) -> Result<std::path::PathBuf, String> {
@@ -362,6 +480,151 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// Write one intent to the shared mailbox (`<exeDir>/logs/dock-command.json`).
+///
+/// Every write carries `epoch`: readers treat a command without one as a leftover
+/// from an earlier run and ignore it (LESSONS 11). The host drains this file, which
+/// is the only way a panel process can ask for something outside itself — it cannot
+/// write the asset directory, and another cursor is another process entirely.
+fn write_mailbox(body: serde_json::Value) {
+    let Some(path) = dock_command_path().map(|p| p.display().to_string()) else {
+        return;
+    };
+    let mut body = body;
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("epoch".to_string(), serde_json::json!(now_ms()));
+    }
+    let text = body.to_string();
+    match std::fs::write(&path, &text) {
+        Ok(_) => logline!("INFO", "mailbox <- {text}"),
+        Err(e) => logline!("ERROR", "mailbox write {path:?}: {e}"),
+    }
+}
+
+/// This cursor's own look, as a `CursorSettings` (the panel's editable shape).
+fn settings_of(st: &St) -> widget::CursorSettings {
+    widget::CursorSettings {
+        theme: st.theme.clone(),
+        label: if st.label_wanted { st.label.clone() } else { String::new() },
+        accent: st.accent,
+        opacity: st.opacity,
+        scale: st.scale,
+        badge: st.badge,
+    }
+}
+
+/// Is the arrow selection pointing at THIS process's cursor?
+///
+/// With no roster (single cursor, or before the host says anything) it is, which
+/// keeps the panel fully usable on its own.
+fn sel_is_self(st: &St) -> bool {
+    match st.roster.get(st.sel_index) {
+        None => true,
+        Some(entry) => st.self_name.is_empty() || entry.name == st.self_name,
+    }
+}
+
+/// Refresh the selector's label and the values the mouse section shows.
+fn sync_selected(st: &mut St) {
+    if st.roster.is_empty() {
+        st.sel_total = 1;
+        st.sel_index = 0;
+        st.sel_name = "默认".to_string();
+        st.sel_settings = settings_of(st);
+        return;
+    }
+    let i = st.sel_index.min(st.roster.len() - 1);
+    st.sel_index = i;
+    st.sel_total = st.roster.len();
+    st.sel_name = st.roster[i].display.clone();
+    if st.roster[i].name == st.self_name || st.self_name.is_empty() {
+        st.sel_settings = settings_of(st);
+    } else {
+        st.sel_settings = st.roster[i].settings.clone();
+    }
+    // switching cursors must repaint the wheel in the newly selected colour
+    sync_wheel_to(st.sel_settings.accent);
+}
+
+/// Apply one edit to the **selected** cursor.
+///
+/// The panel always updates its mirror first, so the value it shows is the value it
+/// just set. If the selected cursor is this process, the edit is applied locally and
+/// instantly. If it is another cursor, it is a different process with its own memory:
+/// the only way in is the mailbox, and the host turns the patch into protocol calls.
+fn edit_selected(st: &mut St, patch: Patch) {
+    if let Some(obj) = patch.as_object() {
+        for (key, value) in obj {
+            match (key.as_str(), value) {
+                ("theme", serde_json::Value::String(s)) => st.sel_settings.theme = s.clone(),
+                ("label", serde_json::Value::String(s)) => st.sel_settings.label = s.clone(),
+                ("color", serde_json::Value::String(s)) => {
+                    if let Some(rgb) = parse_hex(s) {
+                        st.sel_settings.accent = rgb;
+                    }
+                }
+                ("opacity", serde_json::Value::Number(n)) => {
+                    if let Some(x) = n.as_f64() {
+                        st.sel_settings.opacity = x.clamp(0.15, 1.0);
+                    }
+                }
+                ("scale", serde_json::Value::Number(n)) => {
+                    if let Some(x) = n.as_f64() {
+                        st.sel_settings.scale = x.clamp(0.6, 2.0);
+                    }
+                }
+                ("badge", serde_json::Value::Bool(b)) => st.sel_settings.badge = *b,
+                _ => {}
+            }
+        }
+    }
+    st.panel_dirty = true;
+    // The wheel must show the colour of the cursor being edited, not this one's.
+    sync_wheel_to(st.sel_settings.accent);
+    if sel_is_self(st) {
+        st.theme = st.sel_settings.theme.clone();
+        st.label = st.sel_settings.label.clone();
+        st.label_wanted = !st.sel_settings.label.is_empty();
+        st.accent = st.sel_settings.accent;
+        st.opacity = st.sel_settings.opacity;
+        st.scale = st.sel_settings.scale;
+        st.badge = st.sel_settings.badge;
+        st.dirty = true;
+    } else {
+        let target = st.roster.get(st.sel_index).map(|r| r.name.clone()).unwrap_or_default();
+        logline!("INFO", "cursor_patch -> {target} {}", patch);
+        write_mailbox(serde_json::json!({
+            "action": "cursor_patch",
+            "target": target,
+            "patch": patch,
+        }));
+    }
+}
+
+/// Copy the three preset stores next to the executable (the only place this
+/// process may write) so the human can back them up.
+fn export_panel_files(st: &St) -> Result<Vec<String>, String> {
+    if st.asset_dir.is_empty() {
+        return Err("asset directory not set".to_string());
+    }
+    let mut out = Vec::new();
+    for name in ["presets.json", "cursor-presets.json", "menu-themes.json"] {
+        let src = std::path::Path::new(&st.asset_dir).join(name);
+        if !src.exists() {
+            continue;
+        }
+        let Some(dst) = dock_command_path()
+            .and_then(|p| p.parent().map(|d| d.join(format!("{name}-export"))))
+        else {
+            continue;
+        };
+        std::fs::copy(&src, &dst)
+            .map_err(|e| format!("copy {} -> {}: {e}", src.display(), dst.display()))?;
+        out.push(dst.display().to_string());
+    }
+    Ok(out)
 }
 
 static DOCK_SELECTED: std::sync::Mutex<Vec<bool>> = std::sync::Mutex::new(Vec::new());
@@ -876,6 +1139,8 @@ impl MapStats {
     }
 }
 const PH_MAX: i32 = 1200; // the panel canvas is allocated this tall and clipped per frame
+/// Design px one wheel notch scrolls: three small rows, enough to feel like a list.
+const SCROLL_STEP: i32 = 60;
 
 // Palette. Accent-dependent colours are derived from the live accent value.
 const C_PANEL: u32 = 0x0F141C;
@@ -927,6 +1192,19 @@ fn hwnd_of(v: isize) -> HWND {
 }
 
 // ------------------------------------------------------------------- state ---
+
+/// One entry of the host-published cursor roster.
+#[derive(Clone, Default)]
+struct RosterEntry {
+    /// The cursor's stable name in the host (`default`, `agent-b`, …).
+    name: String,
+    /// What the arrows show: its mouse-preset name, else 默认 / 自定义N.
+    display: String,
+    settings: widget::CursorSettings,
+}
+
+/// One editable change, in the same shape the mailbox uses.
+type Patch = serde_json::Value;
 
 #[derive(Clone)]
 struct St {
@@ -988,6 +1266,8 @@ struct St {
     collapsed: Vec<String>,
     assets: Vec<String>,
     panel_px_h: i32,
+    /// How far the section stack is scrolled, in design px. 0 = top.
+    scroll: i32,
     /// Panel zoom: layout stays at design size, only the image is stretched.
     panel_zoom: f64,
     asset_dir: String,
@@ -1034,6 +1314,27 @@ struct St {
     /// Preset names read from presets.json, and which one is highlighted.
     presets: Vec<String>,
     preset_sel: usize,
+    /// The MENU's own accent — menu themes write this, cursor colour never does.
+    panel_accent: u32,
+    /// Menu theme presets (`menu-themes.json`) and the highlighted one.
+    menu_themes: Vec<MenuTheme>,
+    menu_theme_sel: usize,
+    /// Mouse presets (`cursor-presets.json`) and the highlighted one.
+    mouse_presets: Vec<String>,
+    mouse_preset_sel: usize,
+    /// The cursor the ‹ › arrows select. Stage C fills these from the host roster;
+    /// until then they describe this process's own cursor.
+    sel_name: String,
+    sel_index: usize,
+    sel_total: usize,
+    /// The selected cursor's editable look (mirror when it is another process).
+    sel_settings: widget::CursorSettings,
+    /// What this panel's process is called in the roster (`default`, `agent-b`, …).
+    self_name: String,
+    /// The cursors the host published, in display order.
+    roster: Vec<RosterEntry>,
+    /// When the panel lists were last re-read from disk.
+    lists_tick: Instant,
     /// Process start time, so a command file left over from an earlier run is
     /// ignored instead of being replayed on startup.
     started_ms: u64,
@@ -1117,6 +1418,7 @@ impl St {
                 .collect(),
             assets: Vec::new(),
             panel_px_h: PH,
+            scroll: 0,
             panel_zoom: INIT_ZOOM.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0,
             asset_dir: String::new(),
             art_sel: 0,
@@ -1144,6 +1446,18 @@ impl St {
             map_pid: None,
             presets: Vec::new(),
             preset_sel: usize::MAX,
+            panel_accent: 0x4FC3F7,
+            menu_themes: Vec::new(),
+            menu_theme_sel: 0,
+            mouse_presets: Vec::new(),
+            mouse_preset_sel: 0,
+            sel_name: "默认".to_string(),
+            sel_index: 0,
+            sel_total: 1,
+            sel_settings: widget::CursorSettings::initial(),
+            self_name: String::new(),
+            roster: Vec::new(),
+            lists_tick: now,
             started_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -1203,7 +1517,10 @@ fn panel_layout(v: &PanelView) -> Vec<Hit> {
     o.push(Hit::new(rect(pad, 0, 200, 40), Kind::Label, "title").text("AI 鼠标"));
     o.push(Hit::new(rect(pad, 40, right, 41), Kind::Sep, "sep1"));
 
-    let bottom = sections::build(v, 48, &mut o);
+    // The section stack is laid out from an offset y: scrolling is therefore a
+    // single number that moves the paint AND every hit box together, which is why
+    // no second coordinate space is needed anywhere.
+    let bottom = sections::build(v, 48 - v.scroll, &mut o);
 
     o.push(Hit::new(rect(pad, bottom, right, bottom + 1), Kind::Sep, "sep5"));
     let perm_name = match v.permission {
@@ -1686,11 +2003,17 @@ fn wheel() -> &'static Mutex<wheel::Wheel> {
 /// sync with the colour set by a swatch, a channel bar or a tool call.
 fn set_accent(st: &mut St, rgb: u32) {
     st.accent = rgb & 0xFFFFFF;
-    if let Some(w) = WHEEL.get() {
-        w.lock().unwrap().set_from_rgb(st.accent);
-    }
+    sync_wheel_to(st.accent);
     st.dirty = true;
     st.panel_dirty = true;
+}
+
+/// Point the colour wheel at a colour. Used both for this cursor's own accent and
+/// for the selected cursor's, so the wheel always shows what the swatches show.
+fn sync_wheel_to(rgb: u32) {
+    if let Some(w) = WHEEL.get() {
+        w.lock().unwrap().set_from_rgb(rgb & 0xFFFFFF);
+    }
 }
 
 fn sprites() -> &'static Mutex<SpriteCache> {
@@ -1915,6 +2238,32 @@ impl Canvas {
 
 // -------------------------------------------------------------- panel paint ---
 
+/// A thin scrollbar on the right edge: only chrome, never clickable.
+///
+/// It is the visible proof that the panel scrolls — without it a user cannot tell
+/// whether the menu simply ends or there is more below the taskbar.
+unsafe fn draw_scroll_indicator(cv: &Canvas, v: &PanelView, h: i32, z: f64) {
+    if !v.full || v.content_h <= v.view_h {
+        return;
+    }
+    let top = (widget::HEADER_BOTTOM as f64 * z).round() as i32 + 4;
+    let bottom = ((h as f64) * z).round() as i32 - 4;
+    let track_h = bottom - top;
+    if track_h < 12 {
+        return;
+    }
+    let cx = ((PW as f64) * z).round() as i32;
+    let x1 = cx - 4;
+    let x0 = cx - 7;
+    cv.fill_round(rect(x0, top, x1, bottom), 1, C_TRACK);
+    let max_scroll = (v.content_h - v.view_h).max(1);
+    let ratio = (v.view_h as f64 / v.content_h.max(1) as f64).clamp(0.05, 1.0);
+    let thumb_h = ((track_h as f64 * ratio).round() as i32).clamp(24, track_h);
+    let frac = (v.scroll as f64 / max_scroll as f64).clamp(0.0, 1.0);
+    let ty = top + ((track_h - thumb_h) as f64 * frac).round() as i32;
+    cv.fill_round(rect(x0, ty, x1, ty + thumb_h), 1, C_MUTED);
+}
+
 unsafe fn draw_panel(cv: &Canvas, v: &PanelView, hits: &[Hit], h: i32) {
     cv.clear();
 
@@ -1939,6 +2288,16 @@ unsafe fn draw_panel(cv: &Canvas, v: &PanelView, hits: &[Hit], h: i32) {
     cv.fill_round(rect(1, 1, PW - 1, 40), 13, C_PANEL_2);
     cv.fill_rect(rect(1, 30, PW - 1, 40), C_PANEL_2);
 
+    // Scrolling means widgets can now sit above the header or below the window
+    // edge, so the content pass is clipped to the scroll viewport. Without this a
+    // scrolled-up button would paint straight over the title bar.
+    let z = v.zoom.clamp(0.6, 2.0);
+    let ss = cv.ss;
+    let clip_top = (widget::HEADER_BOTTOM as f64 * z).round() as i32 * ss;
+    let clip_right = ((PW as f64) * z).round() as i32 * ss;
+    let clip_bottom = ((h as f64) * z).round() as i32 * ss;
+    let _ = IntersectClipRect(cv.hdc_big, 0, clip_top, clip_right.max(1), clip_bottom.max(1));
+
     for h in hits {
         match h.kind {
             Kind::Sep => {
@@ -1956,8 +2315,10 @@ unsafe fn draw_panel(cv: &Canvas, v: &PanelView, hits: &[Hit], h: i32) {
                 }
             }
             Kind::Button => {
+                // Panel chrome uses the MENU accent (`panel_accent`), never the
+                // cursor colour: that separation is the whole point of the redesign.
                 let bg = if h.active {
-                    v.accent
+                    v.panel_accent
                 } else if h.hover {
                     C_BTN_HOVER
                 } else {
@@ -1965,7 +2326,7 @@ unsafe fn draw_panel(cv: &Canvas, v: &PanelView, hits: &[Hit], h: i32) {
                 };
                 cv.fill_round(h.r, 8, bg);
                 if h.active {
-                    cv.stroke_round(h.r, 8, shade(v.accent, 1.35), 1);
+                    cv.stroke_round(h.r, 8, shade(v.panel_accent, 1.35), 1);
                 }
                 let fg = if h.active { C_DARK_TEXT } else { C_TEXT };
                 let tw = cv.text_w(cv.fonts.button, &h.text);
@@ -1981,9 +2342,9 @@ unsafe fn draw_panel(cv: &Canvas, v: &PanelView, hits: &[Hit], h: i32) {
                 cv.fill_round(track, 2, C_TRACK);
                 let value = (h.data as f64 / 1000.0).clamp(0.0, 1.0);
                 let kx = knob.0 + ((knob.1 - knob.0) as f64 * value) as i32;
-                cv.fill_round(rect(knob.0, cy - 2, kx, cy + 2), 2, v.accent);
-                cv.fill_circle(kx, cy, 7, if h.hover { 0xFFFFFF } else { shade(v.accent, 1.5) });
-                cv.ring_circle(kx, cy, 7, 1, v.accent);
+                cv.fill_round(rect(knob.0, cy - 2, kx, cy + 2), 2, v.panel_accent);
+                cv.fill_circle(kx, cy, 7, if h.hover { 0xFFFFFF } else { shade(v.panel_accent, 1.5) });
+                cv.ring_circle(kx, cy, 7, 1, v.panel_accent);
             }
             Kind::Swatch => {
                 let cx = (h.r.left + h.r.right) / 2;
@@ -2031,7 +2392,8 @@ unsafe fn draw_panel(cv: &Canvas, v: &PanelView, hits: &[Hit], h: i32) {
             Kind::Wheel => {
                 let mut wh = wheel().lock().unwrap();
                 if !wh.is_synced() {
-                    wh.set_from_rgb(v.accent);
+                    // the wheel belongs to the selected cursor, not to this process
+                    wh.set_from_rgb(v.sel_settings.accent);
                 }
                 wh.ensure();
                 // The hit box is scaled with the panel, so the artwork and both
@@ -2091,6 +2453,10 @@ unsafe fn draw_panel(cv: &Canvas, v: &PanelView, hits: &[Hit], h: i32) {
             Kind::Header | Kind::Chip => {}
         }
     }
+
+    // Restore the full surface so the scroll indicator can use the whole height.
+    let _ = SelectClipRgn(cv.hdc_big, HRGN(std::ptr::null_mut()));
+    draw_scroll_indicator(cv, v, h, z);
 
     // The canvas is sized to the zoomed width, so composing at that same width is
     // the only shape compose can handle: it samples by index and writes with a
@@ -2234,7 +2600,7 @@ unsafe fn draw_previews(cv: &Canvas, v: &PanelView, hits: &[Hit], h: i32) {
 }
 
 fn view_of(st: &St) -> PanelView {
-    PanelView {
+    let mut v = PanelView {
         full: st.panel_full,
         theme: st.theme.clone(),
         badge: st.badge,
@@ -2269,7 +2635,23 @@ fn view_of(st: &St) -> PanelView {
         map_window: st.map_window,
         drag_enabled: st.drag_enabled,
         dragging: st.dragging,
-    }
+        scroll: st.scroll,
+        panel_accent: st.panel_accent,
+        menu_themes: st.menu_themes.iter().map(|t| t.name.clone()).collect(),
+        menu_theme_sel: st.menu_theme_sel,
+        mouse_presets: st.mouse_presets.clone(),
+        mouse_preset_sel: st.mouse_preset_sel,
+        sel_name: st.sel_name.clone(),
+        sel_index: st.sel_index,
+        sel_total: st.sel_total,
+        sel_settings: st.sel_settings.clone(),
+        // Filled in below: both need the finished view to lay the sections out.
+        content_h: 0,
+        view_h: 0,
+    };
+    v.content_h = panel_content_h(&v);
+    v.view_h = if v.full { panel_view_h(&v) } else { CHIP_H };
+    v
 }
 
 fn custom_view(st: &St) -> widget::CustomView {
@@ -2320,13 +2702,32 @@ fn panel_height(v: &PanelView) -> i32 {
     if !v.full {
         return CHIP_H;
     }
-    // build() returns a SCALED bottom, but callers multiply by the zoom again when
-    // they size the canvas, so convert back to the design height here. Without
-    // this the panel got scaled twice and came out short.
+    panel_view_h(v)
+}
+
+/// Design height the whole section stack needs, unscrolled.
+///
+/// `sections::build` returns a SCALED bottom, but callers multiply by the zoom
+/// again when they size the canvas, so convert back to the design height here.
+/// Without this the panel got scaled twice and came out short.
+fn panel_content_h(v: &PanelView) -> i32 {
     let z = v.zoom.clamp(0.6, 2.0);
     let mut sink: Vec<Hit> = Vec::new();
     let bottom = (sections::build(v, 48, &mut sink) as f64 / z).round() as i32;
-    (bottom + 30).clamp(160, PH_MAX)
+    (bottom + 30).max(160)
+}
+
+/// Design height of the visible viewport.
+///
+/// The content, capped by the monitor's WORK area (taskbar excluded) instead of by
+/// the raw screen height — that cap is the fix for "1080p 时「预设」落在任务栏下面
+/// 点不到": whatever does not fit is now reached by scrolling, never clipped away.
+fn panel_view_h(v: &PanelView) -> i32 {
+    let z = v.zoom.clamp(0.6, 2.0);
+    let content = panel_content_h(v);
+    let (_, _, _, wh) = work_area();
+    let max_view = (((wh.max(240) as f64) - 16.0) / z).floor() as i32;
+    content.min(max_view.max(200)).min(PH_MAX)
 }
 
 fn cursor_view(st: &St) -> CursorView {
@@ -2381,11 +2782,11 @@ fn on_toggle(st: &mut St, id: &str) {
             st.dirty = true;
         }
         "badge_on" => {
-            st.badge = true;
+            edit_selected(st, serde_json::json!({ "badge": true }));
             st.dirty = true;
         }
         "badge_off" => {
-            st.badge = false;
+            edit_selected(st, serde_json::json!({ "badge": false }));
             st.dirty = true;
         }
         "collapse" | "close" => {
@@ -2399,19 +2800,131 @@ fn on_toggle(st: &mut St, id: &str) {
             st.panel_dirty = true;
         }
         "theme_whale" => {
-            st.theme = "whale".into();
+            edit_selected(st, serde_json::json!({ "theme": "whale" }));
             st.dirty = true;
         }
         "theme_dot" => {
-            st.theme = "dot".into();
+            edit_selected(st, serde_json::json!({ "theme": "dot" }));
             st.dirty = true;
         }
         "theme_arrow" => {
-            st.theme = "arrow".into();
+            edit_selected(st, serde_json::json!({ "theme": "arrow" }));
             st.dirty = true;
         }
         _ => {
-            if let Some(num) = id.strip_prefix("preset_apply_") {
+            // ------------------------------------------------------ 菜单主题 ---
+            // 注意：`mt0..mt7` 是色板，`mt_apply_/mt_save/...` 是动作。前缀 `mt` 两者
+            // 都匹配，所以这里先把"数字后缀"解析出来，解析失败才能落到动作分支——
+            // 用 `if let Some(..) = strip_prefix("mt")` 直接进分支会把动作全吞掉。
+            let mt_swatch = id.strip_prefix("mt").and_then(|r| r.parse::<usize>().ok());
+            if let Some(i) = mt_swatch {
+                if let Some(rgb) = SWATCHES.get(i) {
+                    st.panel_accent = *rgb & 0xFFFFFF;
+                    st.panel_dirty = true;
+                }
+            } else if let Some(rest) = id.strip_prefix("mt_apply_") {
+                if let Ok(i) = rest.parse::<usize>() {
+                    if let Some(t) = st.menu_themes.get(i).cloned() {
+                        st.panel_accent = t.accent & 0xFFFFFF;
+                        st.panel_zoom = t.zoom.clamp(0.6, 2.0);
+                        st.menu_theme_sel = i;
+                        st.want_panel_resize = true;
+                        st.panel_dirty = true;
+                        logline!(
+                            "INFO",
+                            "menu theme applied: {} accent={:06X} zoom={:.2}",
+                            t.name,
+                            t.accent,
+                            t.zoom
+                        );
+                    }
+                }
+            } else if id == "mt_save" {
+                // 素材目录只有宿主要写，面板只能写信箱（LESSONS 3d）
+                write_mailbox(serde_json::json!({
+                    "action": "menu_theme_save",
+                    "accent": hex(st.panel_accent),
+                    "zoom": st.panel_zoom,
+                }));
+            } else if id == "mt_delete" {
+                if let Some(name) = st.menu_themes.get(st.menu_theme_sel).map(|t| t.name.clone()) {
+                    write_mailbox(serde_json::json!({
+                        "action": "menu_theme_delete",
+                        "name": name,
+                    }));
+                }
+            } else if id == "mt_reset" {
+                st.panel_accent = 0x4FC3F7;
+                st.panel_zoom = 1.0;
+                st.want_panel_resize = true;
+                st.panel_dirty = true;
+            }
+            // -------------------------------------------- 选中鼠标 / 鼠标预设 ---
+            else if id == "mouse_prev" || id == "mouse_next" {
+                let dir = if id == "mouse_prev" { -1 } else { 1 };
+                let total = st.sel_total.max(1) as i32;
+                let cur = (st.sel_index as i32).min(total - 1);
+                let next = (cur + dir).clamp(0, total - 1);
+                if next != cur && st.sel_total > 1 {
+                    st.sel_index = next as usize;
+                    // Mirror the new selection at once so the arrows and the values
+                    // move together; the host is told which cursor is now selected so
+                    // every panel (and the dock) agrees.
+                    sync_selected(st);
+                    logline!(
+                        "INFO",
+                        "select_cursor -> {} ({}/{})",
+                        st.sel_name,
+                        st.sel_index + 1,
+                        st.sel_total
+                    );
+                    write_mailbox(serde_json::json!({
+                        "action": "select_cursor",
+                        "index": st.sel_index,
+                        "name": st.sel_name,
+                    }));
+                    st.panel_dirty = true;
+                }
+            } else if let Some(rest) = id.strip_prefix("mp_apply_") {
+                if let Ok(i) = rest.parse::<usize>() {
+                    if let Some(name) = st.mouse_presets.get(i).cloned() {
+                        st.mouse_preset_sel = i;
+                        // apply to the SELECTED cursor: the arrows choose the target
+                        let target =
+                            st.roster.get(st.sel_index).map(|r| r.name.clone()).unwrap_or_default();
+                        write_mailbox(serde_json::json!({
+                            "action": "cursor_preset_apply",
+                            "name": name,
+                            "target": target,
+                            "index": st.sel_index,
+                        }));
+                        st.panel_dirty = true;
+                    }
+                }
+            } else if id == "mp_save" {
+                // Save the SELECTED cursor, named by the host from its own index —
+                // "self" would be ambiguous here: the host does not know which
+                // cursor's panel wrote the command.
+                let target = st.roster.get(st.sel_index).map(|r| r.name.clone()).unwrap_or_default();
+                write_mailbox(serde_json::json!({
+                    "action": "cursor_preset_save",
+                    "target": target,
+                    "index": st.sel_index,
+                }));
+            } else if id == "mp_delete" {
+                if let Some(name) = st.mouse_presets.get(st.mouse_preset_sel).cloned() {
+                    write_mailbox(serde_json::json!({
+                        "action": "cursor_preset_delete",
+                        "name": name,
+                    }));
+                }
+            } else if id == "mp_export" {
+                match export_panel_files(st) {
+                    Ok(files) => logline!("INFO", "panel stores exported: {files:?}"),
+                    Err(e) => logline!("ERROR", "panel export: {e}"),
+                }
+                st.panel_dirty = true;
+            } else if let Some(num) = id.strip_prefix("preset_apply_") {
                 let idx = num.parse::<usize>().unwrap_or(0);
                 if let Some(name) = st.presets.get(idx).cloned() {
                     let dir = st.asset_dir.clone();
@@ -2648,7 +3161,9 @@ fn on_toggle(st: &mut St, id: &str) {
             } else if let Some(rest) = id.strip_prefix("sw") {
                 if let Ok(i) = rest.parse::<usize>() {
                     if let Some(rgb) = SWATCHES.get(i) {
-                        set_accent(st, *rgb);
+                        // routed: applies here when this panel owns the selected
+                        // cursor, otherwise it goes to the host
+                        edit_selected(st, serde_json::json!({ "color": hex(*rgb) }));
                     }
                 }
             }
@@ -2677,9 +3192,10 @@ fn channel_value(st: &mut St, channel: i32, x: i32, hits: &[Hit]) {
         return;
     };
     let t = ((x - h.r.left) as f64 / (h.r.right - h.r.left).max(1) as f64).clamp(0.0, 1.0);
-    let mut c = channels_of(st.accent);
+    let mut c = channels_of(st.sel_settings.accent);
     c[channel as usize] = (t * 255.0).round() as u8;
-    set_accent(st, ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32);
+    let rgb = ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32;
+    edit_selected(st, serde_json::json!({ "color": hex(rgb) }));
 }
 
 unsafe fn slider_value(st: &mut St, id: &str, x: i32, hits: &[Hit]) {
@@ -2687,8 +3203,16 @@ unsafe fn slider_value(st: &mut St, id: &str, x: i32, hits: &[Hit]) {
     let (a, b) = (h.r.left + 9, h.r.right - 9);
     let t = ((x - a) as f64 / (b - a) as f64).clamp(0.0, 1.0);
     match id {
-        "opacity" => st.opacity = 0.15 + t * 0.85,
-        "scale" => st.scale = 0.6 + t * 1.4,
+        // The cursor's own look: routed through the selected cursor, so editing
+        // another mouse's opacity works instead of silently repainting this one.
+        "opacity" => edit_selected(st, serde_json::json!({ "opacity": 0.15 + t * 0.85 })),
+        "scale" => edit_selected(st, serde_json::json!({ "scale": 0.6 + t * 1.4 })),
+        "panel_zoom" => {
+            // The menu bar's own scale: independent of the cursor's `scale`, and
+            // kept to 1% steps exactly like the corner grip does.
+            st.panel_zoom = ((0.6 + t * 1.4) * 100.0).round() / 100.0;
+            st.want_panel_resize = true;
+        }
         "art_opacity" => {
             let i = st.art_sel.min(2);
             st.slots[i].opacity = t;
@@ -2715,14 +3239,19 @@ unsafe fn slider_value(st: &mut St, id: &str, x: i32, hits: &[Hit]) {
     st.panel_dirty = true;
 }
 
-/// Pick the widget under a point.
+/// Pick the widget under a point, honouring the scroll viewport.
 ///
-/// The panel's header is a single full-width rectangle drawn for dragging, and it
+/// The header is a single full-width rectangle drawn for dragging, and it
 /// geometrically contains `─` and `✕`. Resolving by "first rectangle that
 /// contains the point" therefore turned a click on either button into a window
 /// drag. Interactive widgets always win over the drag zone, and labels/separators
 /// never take a click at all.
-fn pick<'a>(hits: &'a [Hit], x: i32, y: i32) -> Option<&'a Hit> {
+///
+/// The second rule is the scroll viewport: a control that scrolled under the
+/// header (or past the bottom edge) is still painted through the clip rectangle,
+/// but it must be **completely** unreachable — a click on a button nobody can see
+/// must not fire.
+fn pick<'a>(hits: &'a [Hit], x: i32, y: i32, view: &PanelView) -> Option<&'a Hit> {
     fn rank(k: Kind) -> u8 {
         match k {
             Kind::Button | Kind::Swatch | Kind::Chip | Kind::Section => 0,
@@ -2733,7 +3262,20 @@ fn pick<'a>(hits: &'a [Hit], x: i32, y: i32) -> Option<&'a Hit> {
             Kind::Label | Kind::LabelRight | Kind::Sep => 3,
         }
     }
-    hits.iter().filter(|h| h.hit(x, y)).min_by_key(|h| rank(h.kind))
+    let z = view.zoom.clamp(0.6, 2.0);
+    let top = (widget::HEADER_BOTTOM as f64 * z).round() as i32;
+    let bottom = if view.full { (view.view_h as f64 * z).round() as i32 } else { CHIP_H };
+    let in_view = y >= top && y < bottom;
+    hits.iter()
+        .filter(|h| h.hit(x, y))
+        .filter(|h| in_view || is_header_widget(h.id))
+        .min_by_key(|h| rank(h.kind))
+}
+
+/// The fixed chrome above the scroll area. Everything else scrolls with the
+/// content, so a point above the viewport may only reach these.
+fn is_header_widget(id: &str) -> bool {
+    matches!(id, "expand" | "collapse" | "close" | "drag" | "title" | "sep1")
 }
 
 /// Cycle a picture slot: builtin vector art -> every picture in the asset folder
@@ -2785,15 +3327,18 @@ fn cycle_slot_source(st: &mut St, slot_idx: usize, dir: i32) {
     st.panel_dirty = true;
 }
 
-/// Keep a panel of height `h` fully visible in a screen of height `screen_h`.
-fn rect_x_clamp(x: i32, w: i32, screen_w: i32) -> i32 {
-    let max_x = (screen_w - w - 8).max(8);
-    x.min(max_x).max(8)
+/// Keep a rect of size `w` inside a work area: `[left, left+width)`.
+fn rect_x_clamp_in(x: i32, w: i32, left: i32, width: i32) -> i32 {
+    let min_x = left + 8;
+    let max_x = (left + width - w - 8).max(min_x);
+    x.min(max_x).max(min_x)
 }
 
-fn rect_y_clamp(y: i32, h: i32, screen_h: i32) -> i32 {
-    let max_y = (screen_h - h - 8).max(8);
-    y.min(max_y).max(8)
+/// Keep a rect of size `h` inside a work area: `[top, top+height)`.
+fn rect_y_clamp_in(y: i32, h: i32, top: i32, height: i32) -> i32 {
+    let min_y = top + 8;
+    let max_y = (top + height - h - 8).max(min_y);
+    y.min(max_y).max(min_y)
 }
 
 // ---------------------------------------------------------- window layer ----
@@ -3084,6 +3629,38 @@ fn client_xy(lparam: LPARAM) -> (i32, i32) {
 unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
+        WM_MOUSEWHEEL => {
+            // LESSONS rule 1: print the RAW value before deriving anything. The dock
+            // once looked "dead" because the message was swallowed by a catch-all and
+            // the derived delta was read from a value that never existed; the raw log
+            // is what tells the two apart.
+            let raw = wparam.0 as u32;
+            let lo = (raw & 0xFFFF) as i32;
+            let hi = ((raw >> 16) & 0xFFFF) as i32;
+            let delta = hi as i16 as i32;
+            logline!("INFO", "panel wheel raw=0x{raw:X} lo={lo} hi={hi} delta={delta}");
+            // One notch is 120; the panel scrolls three small rows per notch.
+            let steps = (delta as f64 / 120.0).round() as i32;
+            if steps != 0 {
+                let s = state();
+                let mut st = s.lock().unwrap();
+                let pv = view_of(&st);
+                let max_scroll = (pv.content_h - pv.view_h).max(0);
+                let next = (st.scroll - steps * SCROLL_STEP).clamp(0, max_scroll);
+                if next != st.scroll {
+                    st.scroll = next;
+                    st.panel_dirty = true;
+                }
+                logline!(
+                    "INFO",
+                    "panel scroll y={} max={max_scroll} view={} content={}",
+                    st.scroll,
+                    pv.view_h,
+                    pv.content_h
+                );
+            }
+            return LRESULT(0);
+        }
         WM_MOUSEMOVE => {
             let (x, y) = client_xy(lparam);
             let s = state();
@@ -3114,9 +3691,8 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                     if wh.hit(lx, ly) {
                         let rgb = wh.rgb();
                         drop(wh);
-                        st.accent = rgb & 0xFFFFFF;
-                        st.dirty = true;
-                        st.panel_dirty = true;
+                        // routed: the wheel edits the SELECTED cursor's colour
+                        edit_selected(&mut st, serde_json::json!({ "color": hex(rgb) }));
                     }
                 }
                 return LRESULT(0);
@@ -3132,8 +3708,9 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                 }
                 return LRESULT(0);
             }
-            let hits = panel_layout(&view_of(&st));
-            let hover = pick(&hits, x, y)
+            let pv = view_of(&st);
+            let hits = panel_layout(&pv);
+            let hover = pick(&hits, x, y, &pv)
                 .filter(|h| {
                     matches!(
                         h.kind,
@@ -3152,9 +3729,10 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
             let (x, y) = client_xy(lparam);
             let s = state();
             let mut st = s.lock().unwrap();
-            let hits = panel_layout(&view_of(&st));
+            let pv = view_of(&st);
+            let hits = panel_layout(&pv);
             let mut handled = false;
-            if let Some(h) = pick(&hits, x, y) {
+            if let Some(h) = pick(&hits, x, y, &pv) {
                 match h.kind {
                     Kind::Header => {
                         let mut p = POINT::default();
@@ -3174,9 +3752,7 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                         if wh.hit(lx, ly) {
                             let rgb = wh.rgb();
                             drop(wh);
-                            st.accent = rgb & 0xFFFFFF;
-                            st.dirty = true;
-                            st.panel_dirty = true;
+                            edit_selected(&mut st, serde_json::json!({ "color": hex(rgb) }));
                         }
                         st.drag_wheel = true;
                         handled = true;
@@ -3638,6 +4214,131 @@ fn handle_line(line: &str) {
                 st.want_panel_resize = true;
                 st.panel_dirty = true;
             }
+        }
+        "panel_scroll" => {
+            // Absolute `y` or relative `delta`, both in design px. Exists so the
+            // scroll behaviour can be checked without a mouse (the real wheel is
+            // still verified by hand — a protocol call never proves input works).
+            let pv = view_of(&st);
+            let max_scroll = (pv.content_h - pv.view_h).max(0);
+            let target = match v.get("y").and_then(|n| n.as_i64()) {
+                Some(y) => y as i32,
+                None => st.scroll + v.get("delta").and_then(|n| n.as_i64()).unwrap_or(0) as i32,
+            };
+            st.scroll = target.clamp(0, max_scroll);
+            st.panel_dirty = true;
+            out["scroll"] = serde_json::json!(st.scroll);
+            out["scroll_max"] = serde_json::json!(max_scroll);
+            out["content_h"] = serde_json::json!(pv.content_h);
+            out["view_h"] = serde_json::json!(pv.view_h);
+            logline!(
+                "INFO",
+                "panel_scroll y={} max={max_scroll} content={} view={}",
+                st.scroll,
+                pv.content_h,
+                pv.view_h
+            );
+        }
+        "hits" => {
+            // Diagnostics for the panel: the live widget boxes, in design px.
+            //
+            // Exists because "click the third row" is not a test: a harness can read
+            // the real rects from here, click the real pixel, and compare state. It
+            // also lets a test prove the scroll rule — a hit above the viewport is
+            // still listed (it is still painted), but a click there must do nothing.
+            let pv = view_of(&st);
+            let hits = panel_layout(&pv);
+            let list: Vec<serde_json::Value> = hits
+                .iter()
+                .map(|h| {
+                    serde_json::json!({
+                        "id": h.id,
+                        "kind": format!("{:?}", h.kind),
+                        "x": h.r.left,
+                        "y": h.r.top,
+                        "w": (h.r.right - h.r.left).max(0),
+                        "h": (h.r.bottom - h.r.top).max(0),
+                        "text": h.text,
+                        "active": h.active,
+                    })
+                })
+                .collect();
+            out["hits"] = serde_json::json!(list);
+            out["scroll"] = serde_json::json!(st.scroll);
+            out["content_h"] = serde_json::json!(pv.content_h);
+            out["view_h"] = serde_json::json!(pv.view_h);
+            out["header_bottom"] = serde_json::json!(widget::HEADER_BOTTOM);
+        }
+        "panel_identity" => {
+            st.self_name = v.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            sync_selected(&mut st);
+            st.panel_dirty = true;
+            logline!("INFO", "this panel belongs to cursor {:?}", st.self_name);
+        }
+        "panel_roster" => {
+            // The host's view of every cursor: names for the arrows, and each one's
+            // look so the mouse section can show the selected cursor's real values.
+            let mut roster: Vec<RosterEntry> = Vec::new();
+            if let Some(list) = v.get("cursors").and_then(|c| c.as_array()) {
+                for c in list.iter().take(8) {
+                    let name = c.get("name").and_then(|x| x.as_str()).unwrap_or("");
+                    if name.is_empty() {
+                        continue;
+                    }
+                    roster.push(RosterEntry {
+                        name: name.to_string(),
+                        display: c
+                            .get("display")
+                            .and_then(|x| x.as_str())
+                            .filter(|d| !d.is_empty())
+                            .unwrap_or(name)
+                            .to_string(),
+                        settings: widget::CursorSettings {
+                            theme: c
+                                .get("theme")
+                                .and_then(|x| x.as_str())
+                                .unwrap_or("whale")
+                                .to_string(),
+                            label: c.get("label").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                            accent: c
+                                .get("color")
+                                .and_then(|x| x.as_str())
+                                .and_then(parse_hex)
+                                .unwrap_or(0x4FC3F7),
+                            opacity: c.get("opacity").and_then(|x| x.as_f64()).unwrap_or(1.0),
+                            scale: c.get("scale").and_then(|x| x.as_f64()).unwrap_or(1.0),
+                            badge: c.get("badge").and_then(|x| x.as_bool()).unwrap_or(true),
+                        },
+                    });
+                }
+            }
+            if let Some(name) = v.get("self").and_then(|x| x.as_str()) {
+                st.self_name = name.to_string();
+            }
+            st.sel_index = v.get("selected").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+            st.roster = roster;
+            sync_selected(&mut st);
+            st.panel_dirty = true;
+            st.want_panel_resize = true;
+            logline!(
+                "INFO",
+                "panel roster: {} cursors selected={} self={:?} names={:?}",
+                st.roster.len(),
+                st.sel_index,
+                st.self_name,
+                st.roster.iter().map(|r| r.display.clone()).collect::<Vec<String>>()
+            );
+        }
+        "panel_theme" => {
+            // The host can drive the menu's own look (a theme switch from a tool).
+            if let Some(accent) = v.get("accent").and_then(|x| x.as_str()).and_then(parse_hex) {
+                st.panel_accent = accent & 0xFFFFFF;
+            }
+            if let Some(z) = v.get("zoom").and_then(|x| x.as_f64()) {
+                st.panel_zoom = z.clamp(0.6, 2.0);
+                st.want_panel_resize = true;
+            }
+            st.panel_dirty = true;
         }
         "opacity" => {
             if let Some(x) = v.get("value").and_then(|n| n.as_f64()) {
@@ -4147,6 +4848,25 @@ fn handle_line(line: &str) {
     out["panel_hwnd"] = serde_json::json!(format!("0x{:X}", st.panel_hwnd));
     out["panel"] = serde_json::json!(st.panel_shown);
     out["panel_expanded"] = serde_json::json!(st.panel_full);
+    {
+        // The panel reports its own viewport: a test can then prove "the content is
+        // reachable by scrolling" from numbers instead of guessing from pixels.
+        let pv = view_of(&*st);
+        out["panel_scroll"] = serde_json::json!(st.scroll);
+        out["panel_content_h"] = serde_json::json!(pv.content_h);
+        out["panel_view_h"] = serde_json::json!(pv.view_h);
+    }
+    // The redesign's state, reported so a test can assert it instead of peeking at
+    // pixels: menu accent/zoom (panel chrome) vs the cursor's own colour/size.
+    out["panel_accent"] = serde_json::json!(hex(st.panel_accent));
+    out["panel_zoom"] = serde_json::json!(st.panel_zoom);
+    out["menu_themes"] = serde_json::json!(
+        st.menu_themes.iter().map(|t| t.name.clone()).collect::<Vec<String>>()
+    );
+    out["mouse_presets"] = serde_json::json!(st.mouse_presets.clone());
+    out["sel_name"] = serde_json::json!(st.sel_name);
+    out["sel_index"] = serde_json::json!(st.sel_index);
+    out["sel_total"] = serde_json::json!(st.sel_total);
     out["layer"] = serde_json::json!(st.layer_mode);
     out["layer_hwnd"] = serde_json::json!(format!("0x{:X}", st.layer_hwnd));
     out["layer_title"] = serde_json::json!(st.layer_title);
@@ -4311,10 +5031,11 @@ fn main() {
             RegisterClassExW(&wc);
         }
 
-        let sw = GetSystemMetrics(SYSTEM_METRICS_INDEX(SM_CXSCREEN.0));
-        let sh = GetSystemMetrics(SYSTEM_METRICS_INDEX(SM_CYSCREEN.0));
-        let px = sw - PW - 24;
-        let py = (sh - PH) / 2;
+        // Park the panel inside the work area: SM_CYSCREEN includes the taskbar,
+        // and a panel that starts under it can never be clicked back.
+        let (wx, wy, ww, wh) = work_area();
+        let px = wx + ww - PW - 24;
+        let py = wy + ((wh - PH) / 2).max(8);
 
         let hwnd = make_overlay();
         let panel = make_panel(px, py);
@@ -4472,15 +5193,25 @@ fn main() {
             // The panel grows and shrinks with its sections, so the requested
             // height is recomputed from the live expansion state.
             {
-                let want_h = {
+                // The viewport is derived from the content and the WORK area, and the
+                // scroll offset is clamped to what that viewport can actually show, so
+                // collapsing a section cannot leave the panel scrolled past its end.
+                let (want_h, content_h) = {
                     let s = st.lock().unwrap();
                     if s.panel_full {
-                        panel_height(&view_of(&s))
+                        let v = view_of(&s);
+                        (panel_view_h(&v), panel_content_h(&v))
                     } else {
-                        CHIP_H
+                        (CHIP_H, CHIP_H)
                     }
                 };
                 let mut s = st.lock().unwrap();
+                let max_scroll = (content_h - want_h).max(0);
+                let sc = s.scroll.clamp(0, max_scroll);
+                if sc != s.scroll {
+                    s.scroll = sc;
+                    s.panel_dirty = true;
+                }
                 if s.panel_px_h != want_h {
                     s.panel_px_h = want_h;
                     s.want_panel_resize = true;
@@ -4796,16 +5527,16 @@ fn main() {
                 let h = if p_full { p_h } else { CHIP_H };
                 logline!("TRACE", "resize w={w} h={h} zoom={z:.3} p_h={p_h}");
                 // Opening a section grows the panel downward; keep it on screen by
-                // sliding it up rather than letting it run off the bottom edge.
-                let screen_h = GetSystemMetrics(SYSTEM_METRICS_INDEX(SM_CYSCREEN.0));
-                if p_pos.1 + h > screen_h - 8 {
-                    let moved = rect_y_clamp(p_pos.1, h, screen_h);
+                // sliding it up rather than letting it run off the bottom edge. The
+                // work area is used (not SM_CYSCREEN) so the taskbar is off limits.
+                let (wx, wy, ww, wh) = work_area();
+                if p_pos.1 + h > wy + wh - 8 || p_pos.1 < wy + 8 {
+                    let moved = rect_y_clamp_in(p_pos.1, h, wy, wh);
                     let mut s = st.lock().unwrap();
                     s.panel_pos.1 = moved;
                 }
-                let screen_w = GetSystemMetrics(SYSTEM_METRICS_INDEX(SM_CXSCREEN.0));
-                if p_pos.0 + w > screen_w - 8 || p_pos.0 < 8 {
-                    let moved = rect_x_clamp(p_pos.0, w, screen_w);
+                if p_pos.0 + w > wx + ww - 8 || p_pos.0 < wx + 8 {
+                    let moved = rect_x_clamp_in(p_pos.0, w, wx, ww);
                     let mut s = st.lock().unwrap();
                     s.panel_pos.0 = moved;
                 }
@@ -4987,6 +5718,17 @@ fn main() {
                         s.drawn_pos = pos;
                         s.panel_dirty = true;
                     }
+                }
+            }
+
+            // The panel's lists live in host-written files (menu themes, mouse
+            // presets). Re-read them at a low rate so a save lands on screen without
+            // polling the disk every frame.
+            {
+                let mut s = st.lock().unwrap();
+                if s.panel_shown && now.duration_since(s.lists_tick) >= Duration::from_millis(1500) {
+                    s.lists_tick = now;
+                    refresh_panel_lists(&mut s);
                 }
             }
 

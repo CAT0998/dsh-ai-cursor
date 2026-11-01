@@ -42,6 +42,14 @@ import {
 } from './presets'
 import { dirname } from 'node:path'
 import { readFile, writeFile, rm } from 'node:fs/promises'
+import {
+  cursorDisplayName,
+  cursorPatchCommands,
+  handlePanelCommand,
+  loadCursorPresets,
+  resolveTarget,
+} from './panelstate'
+import type { CursorPreset, RosterEntry } from './panelstate'
 import { berthsFrom, describeBerths, readBerths, readSelection, selectedNames, writeBerths } from './dock'
 export type { InterceptMode } from './intercept'
 export type { OverlayStatus } from './overlay'
@@ -101,28 +109,62 @@ export function apply(ctx: Context, config: ConfigShape): void {
   const dockCommandFile = () =>
     `${(config.assetDir || '').replace(/[\/]+$/, '')}/dock-command.json`
 
+  /** Where the panel asks for things outside its own process. */
+  const panelMailboxFile = (): string => `${dirname(overlay.executable)}/logs/dock-command.json`
+  /** Wall clock of this host start: a mailbox command older than this is a leftover. */
+  const bootMs = Date.now()
+  let lastMailboxEpoch = 0
   /**
-   * 消费面板写下的命令。
+   * Is a panel on screen?
    *
-   * 面板是独立进程，不能直接调用插件，所以它把意图写进 dock-command.json；
-   * 宿主在每次 ai_mouse_dock 时读一次并处理，处理完删掉，避免重复执行。
+   * The mailbox timer runs only while it is: with no panel nothing can write the
+   * mailbox, so waking up every 250ms forever would be pure noise. Every status
+   * reply carries `panel`, so this stays honest without polling.
    */
-  const consumeDockCommands = async (): Promise<string | null> => {
-    const stateDir = `${dirname(overlay.executable)}/logs`
-    const cmdFile = `${stateDir}/dock-command.json`
-    let cmd: { action?: string; index?: number } = {}
+  let panelOpen = config.panel !== false
+
+  const menuThemesFile = () =>
+    `${(config.assetDir || '').replace(/[\/]+$/, '')}/menu-themes.json`
+  const cursorPresetsFile = () =>
+    `${(config.assetDir || '').replace(/[\/]+$/, '')}/cursor-presets.json`
+
+  /** What the menu preset store currently looks like, for the roster push. */
+  const readCursorPresetList = async (): Promise<CursorPreset[]> =>
+    config.assetDir ? loadCursorPresets(cursorPresetsFile()) : []
+
+  /**
+   * 消费面板写下的命令（信箱的唯一消费者）。
+   *
+   * 面板是独立进程：它写不了素材目录，也控制不了别的光标进程，所以它只能把意图写进
+   * `<exeDir>/logs/dock-command.json`（带 `epoch`）。这个函数是唯一的消费者：
+   * 模块级定时器在面板打开时调它，`ai_mouse_dock` 也调一次，这样停靠站的点击即使没有
+   * 面板也不会丢。返回一句人能读的结果。
+   */
+  const drainMailbox = async (): Promise<string | null> => {
+    const cmdFile = panelMailboxFile()
+    let cmd: Record<string, unknown> = {}
     try {
-      const raw = await readFile(cmdFile, 'utf8')
-      cmd = JSON.parse(raw) as { action?: string; index?: number }
+      cmd = JSON.parse(await readFile(cmdFile, 'utf8')) as Record<string, unknown>
     } catch {
       return null
     }
-    if (cmd.action === 'preset_save' || cmd.action === 'preset_delete') {
+    const action = String(cmd.action ?? '')
+    const epoch = Number(cmd.epoch ?? 0)
+    // 必须比本次宿主启动新，也要比上一条处理过的新：否则上一次运行留下的
+    // 「保存/删除」会在每次启动时被重放（LESSONS 11）。
+    if (!Number.isFinite(epoch) || epoch <= Math.max(bootMs, lastMailboxEpoch)) return null
+    lastMailboxEpoch = epoch
+    /** 处理完就删掉，避免同一意图被执行两次。 */
+    const consume = async (): Promise<void> => {
       await rm(cmdFile, { force: true })
-      const wanted = String((cmd as { name?: string }).name ?? '').trim()
+    }
+
+    if (action === 'preset_save' || action === 'preset_delete') {
+      await consume()
+      const wanted = String(cmd.name ?? '').trim()
       const file = presetsFile()
       const list = await loadPresets(file)
-      if (cmd.action === 'preset_delete') {
+      if (action === 'preset_delete') {
         if (!wanted) return '没有选中要删除的预设'
         const next = removePreset(list, wanted)
         if (next.length === list.length) return `没有名为 ${wanted} 的预设`
@@ -143,22 +185,125 @@ export function apply(ctx: Context, config: ConfigShape): void {
       await savePresets(file, upsertPreset(list, preset))
       return `已保存预设 ${name}`
     }
-    if (cmd.action !== 'toggle_column') return null
-    const idx = Number(cmd.index ?? -1)
-    await rm(cmdFile, { force: true })
-    if (!Number.isInteger(idx) || idx < 0) return '命令缺少有效的栏位下标'
-    // 该栏已打开 → 关闭它：把它从停靠站的选择里去掉
-    const selFile = `${stateDir}/dock-selection.json`
-    try {
-      const raw = await readFile(selFile, 'utf8')
-      const sel = JSON.parse(raw) as { selected?: unknown[] }
-      const kept = (sel.selected ?? []).map(Number).filter((x) => x !== idx)
-      await writeFile(selFile, JSON.stringify({ selected: kept.map(String) }), 'utf8')
-      return `已关闭第 ${idx + 1} 栏`
-    } catch {
-      return `第 ${idx + 1} 栏没有可关闭的状态`
+
+    if (action === 'toggle_column') {
+      await consume()
+      const idx = Number(cmd.index ?? -1)
+      if (!Number.isInteger(idx) || idx < 0) return '命令缺少有效的栏位下标'
+      // 该栏已打开 → 关闭它：把它从停靠站的选择里去掉
+      const selFile = `${dirname(overlay.executable)}/logs/dock-selection.json`
+      try {
+        const raw = await readFile(selFile, 'utf8')
+        const sel = JSON.parse(raw) as { selected?: unknown[] }
+        const kept = (sel.selected ?? []).map(Number).filter((x) => x !== idx)
+        await writeFile(selFile, JSON.stringify({ selected: kept.map(String) }), 'utf8')
+        return `已关闭第 ${idx + 1} 栏`
+      } catch {
+        return `第 ${idx + 1} 栏没有可关闭的状态`
+      }
     }
+
+    // ------------------------------------------------------------ 菜单主题 ---
+    // 菜单主题 / 鼠标预设的落盘逻辑放在 `panelstate.ts`，这里只做三件事：
+    // 把宿主能力注入进去、把返回的协议命令发给光标、删掉已被消费的信箱。
+    if (action === 'select_cursor') {
+      await consume()
+      const idx = Number(cmd.index ?? -1)
+      if (!Number.isInteger(idx) || idx < 0) return '命令缺少有效的光标下标'
+      selectedCursor = Math.min(idx, cursors.size - 1)
+      await persistSelection()
+      await pushRoster()
+      const name = [...cursors.keys()][selectedCursor] ?? ''
+      return `已选中光标「${name}」(${selectedCursor + 1}/${cursors.size})`
+    }
+    if (action === 'cursor_patch') {
+      await consume()
+      const names = [...cursors.keys()]
+      const target = resolveTarget(cmd.target, names, names[selectedCursor] ?? names[0] ?? '', selectedCursor)
+      if (!target) return '找不到要修改的光标'
+      const patch = (cmd.patch ?? {}) as Record<string, unknown>
+      const commands = cursorPatchCommands(patch)
+      if (commands.length === 0) return '这条修改没有可应用的内容'
+      const prev = active
+      try {
+        active = cursors.get(target) ?? overlay
+        for (const [command, payload] of commands) await send(command, payload)
+      } catch (error) {
+        return `修改光标「${target}」失败：${error instanceof Error ? error.message : String(error)}`
+      } finally {
+        active = prev
+      }
+      await pushRoster()
+      return `已修改光标「${target}」`
+    }
+    // Mouse presets belong to ONE cursor, and the panel names it: "self" cannot be
+    // resolved here, because the host does not know which cursor's panel wrote the
+    // command. So the target is switched in for the duration of the call.
+    if (action === 'cursor_preset_save' || action === 'cursor_preset_apply') {
+      await consume()
+      const names = [...cursors.keys()]
+      const target = resolveTarget(
+        cmd.target,
+        names,
+        names[selectedCursor] ?? names[0] ?? '',
+        selectedCursor,
+      )
+      if (!target) return '找不到要保存/应用的光标'
+      const prev = active
+      let result: Awaited<ReturnType<typeof handlePanelCommand>> = null
+      try {
+        active = cursors.get(target) ?? overlay
+        result = await handlePanelCommand(action, cmd, {
+          assetDir: (config.assetDir || '').replace(/[\/]+$/, ''),
+          menuThemesFile: menuThemesFile(),
+          cursorPresetsFile: cursorPresetsFile(),
+          status: async () => (await send('status')) as unknown as Record<string, unknown>,
+        })
+        for (const [command, payload] of result?.commands ?? []) await send(command, payload)
+      } catch (error) {
+        return `光标「${target}」的预设操作失败：${error instanceof Error ? error.message : String(error)}`
+      } finally {
+        active = prev
+      }
+      // the saved look is now what the cursor really has: republish the names
+      await pushRoster().catch(() => undefined)
+      return result?.message ?? null
+    }
+
+    const handled = await handlePanelCommand(action, cmd, {
+      assetDir: (config.assetDir || '').replace(/[\/]+$/, ''),
+      menuThemesFile: menuThemesFile(),
+      cursorPresetsFile: cursorPresetsFile(),
+      status: async () => (await send('status')) as unknown as Record<string, unknown>,
+    })
+    if (handled) {
+      await consume()
+      for (const [command, payload] of handled.commands ?? []) await send(command, payload)
+      return handled.message
+    }
+
+    // `rest` / `shutdown` / `stop_all` are broadcast to every cursor process by the
+    // panel its own way; the host must not eat them, so an unknown action leaves the
+    // file alone.
+    return null
   }
+
+  // Every panel intent above has to land without a tool call: a human clicking
+  // 「保存主题」 expects the file to appear. The timer only runs while a panel is
+  // open, and `ctx.effect` tears it down when the plugin unloads.
+  let draining = false
+  ctx.effect(() => {
+    const timer = setInterval(() => {
+      if (!panelOpen || draining) return
+      draining = true
+      void drainMailbox()
+        .catch(() => undefined)
+        .finally(() => {
+          draining = false
+        })
+    }, 250)
+    return () => clearInterval(timer)
+  })
 
   const presetsFile = () =>
     `${(config.assetDir || '').replace(/[\/]+$/, '')}/presets.json`
@@ -194,6 +339,87 @@ export function apply(ctx: Context, config: ConfigShape): void {
     }
   }
   let active: Overlay = overlay
+
+  // ------------------------------------------------------- panel selection ---
+  /**
+   * Which cursor the panel's ‹ › arrows point at.
+   *
+   * It is a host-side notion: the panel only ever writes "select index N" into the
+   * mailbox, because the other cursors are separate processes. Persisted next to the
+   * executable so the choice survives a restart.
+   */
+  let selectedCursor = 0
+  const selectionFile = (): string => `${dirname(overlay.executable)}/logs/cursor-ui.json`
+
+  const persistSelection = async (): Promise<void> => {
+    try {
+      await writeFile(selectionFile(), JSON.stringify({ selected: selectedCursor }), 'utf8')
+    } catch {
+      /* a selection that cannot be stored must never break the tools */
+    }
+  }
+
+  void (async () => {
+    try {
+      const parsed = JSON.parse(await readFile(selectionFile(), 'utf8')) as { selected?: unknown }
+      const n = Number(parsed.selected)
+      if (Number.isInteger(n) && n >= 0) selectedCursor = n
+    } catch {
+      /* first run: the default cursor is selected */
+    }
+  })()
+
+  /**
+   * Publish the roster to every panel.
+   *
+   * Every panel is its own process, so each one gets the same list plus its own
+   * `self`: that is what lets it tell "edit me" from "forward this to another
+   * cursor". The names are the requirement's rule — a saved preset name, else 默认 /
+   * 自定义N — and each entry carries its live look so the mouse section can show the
+   * selected cursor instead of its own.
+   */
+  const pushRoster = async (): Promise<void> => {
+    const names = [...cursors.keys()]
+    if (names.length === 0) return
+    selectedCursor = Math.min(Math.max(selectedCursor, 0), names.length - 1)
+    const entries: RosterEntry[] = []
+    for (const [index, name] of names.entries()) {
+      const ov = cursors.get(name)
+      let st: Record<string, unknown> = {}
+      if (ov) {
+        const prev = active
+        try {
+          active = ov
+          st = (await send('status')) as unknown as Record<string, unknown>
+        } catch {
+          st = {}
+        } finally {
+          active = prev
+        }
+      }
+      entries.push({
+        name,
+        display: cursorDisplayName(index, meta.get(name)?.preset),
+        theme: String(st.theme ?? 'whale'),
+        label: String(st.label ?? ''),
+        color: String(st.color ?? '#4FC3F7'),
+        opacity: Number(st.opacity ?? 1),
+        scale: Number(st.scale ?? 1),
+        badge: st.badge !== false,
+      })
+    }
+    for (const [name, ov] of cursors) {
+      const prev = active
+      try {
+        active = ov
+        await send('panel_roster', { self: name, selected: selectedCursor, cursors: entries })
+      } catch {
+        /* that cursor's panel may not be up yet */
+      } finally {
+        active = prev
+      }
+    }
+  }
   ctx.effect(() => () => {
     for (const c of cursors.values()) c.dispose()
   })
@@ -218,6 +444,9 @@ export function apply(ctx: Context, config: ConfigShape): void {
     if (typeof reply.permission === 'number') {
       state.permission = normalizeLevel(reply.permission, 3)
     }
+    // Keep the mailbox timer honest: it only runs while a panel is on screen, and
+    // every reply says whether one is.
+    if (typeof reply.panel === 'boolean') panelOpen = reply.panel
     return reply
   }
 
@@ -308,6 +537,9 @@ export function apply(ctx: Context, config: ConfigShape): void {
     await send('panel_expanded', { expanded: config.panelExpanded })
     await send('panel', { visible: config.panel })
     await send('permission', { level: config.permission })
+    // The panel's ‹ › arrows need every cursor's name: publish the roster once the
+    // process is configured. Fire-and-forget so a probe never delays a tool call.
+    void pushRoster().catch(() => undefined)
   }
 
   ctx.tools.register(
@@ -464,6 +696,8 @@ export function apply(ctx: Context, config: ConfigShape): void {
         await prime()
         if (args.expanded !== undefined) await send('panel_expanded', { expanded: args.expanded })
         if (args.visible !== undefined) await send('panel', { visible: args.visible })
+        // the panel opens with the selector already filled in
+        if (args.visible !== false) await pushRoster().catch(() => undefined)
         return describeStatus(await send('status'))
       },
     }),
@@ -758,7 +992,8 @@ export function apply(ctx: Context, config: ConfigShape): void {
       output: TEXT_OUTPUT,
       async execute(args: { visible?: boolean }) {
         if (args.visible === undefined) {
-          const handled = await consumeDockCommands()
+          const handled = await drainMailbox()
+          await pushRoster().catch(() => undefined)
           const dir = (config.assetDir || '').replace(/[\/]+$/, '')
           // 命令已经执行过了，别因为停靠站没开就把结果吞掉
           if (!overlay.dockRunning) return `${handled ? `${handled}。` : ''}停靠站：关`
@@ -860,6 +1095,7 @@ export function apply(ctx: Context, config: ConfigShape): void {
           if (!target) return `没有名为「${name}」的光标。现有：${[...cursors.keys()].join(', ')}`
           active = target
           await prime()
+          await pushRoster().catch(() => undefined)
           return describeStatus(await send('status'))
         }
 
@@ -874,7 +1110,9 @@ export function apply(ctx: Context, config: ConfigShape): void {
             await prime()
           }
           meta.delete(name)
+          if (selectedCursor >= cursors.size) selectedCursor = Math.max(0, cursors.size - 1)
           void refreshDock()
+          await pushRoster().catch(() => undefined)
           return `已关闭光标「${name}」。`
         }
 
@@ -903,6 +1141,7 @@ export function apply(ctx: Context, config: ConfigShape): void {
             }
           }
           void refreshDock()
+          await pushRoster().catch(() => undefined)
           return `已创建光标「${name}」${applied}。${describeStatus(await send('status'))}`
         }
         return `未知 action：${action}（可用 create / use / list / kill）`

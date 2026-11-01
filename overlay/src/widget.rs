@@ -7,6 +7,10 @@
 
 use windows::Win32::Foundation::RECT;
 
+/// The header strip (title + collapse/close + drag zone) is never scrolled: it is
+/// the fixed chrome above the scrollable content. Everything else lives below it.
+pub const HEADER_BOTTOM: i32 = 41;
+
 /// Reserved surface: `Wheel` and the fields below are consumed by the modules
 /// that are still being filled in, so they are deliberately not wired yet.
 #[allow(dead_code)]
@@ -69,6 +73,36 @@ impl Hit {
     }
 }
 
+/// One AI cursor's editable look, as the panel shows it.
+///
+/// This is the shape of a *mouse preset* too: what the ‹ › selector displays and
+/// what a named save stores. When the selected cursor is another process the panel
+/// keeps this as a mirror and forwards the edit; when it is this process the same
+/// struct is written straight into `St`.
+#[derive(Clone, Default)]
+pub struct CursorSettings {
+    pub theme: String,
+    pub label: String,
+    pub accent: u32,
+    pub opacity: f64,
+    pub scale: f64,
+    pub badge: bool,
+}
+
+impl CursorSettings {
+    /// The look a fresh cursor starts with; `Default` alone would be opacity 0.
+    pub fn initial() -> CursorSettings {
+        CursorSettings {
+            theme: "whale".to_string(),
+            label: "AI 鼠标".to_string(),
+            accent: 0x4FC3F7,
+            opacity: 1.0,
+            scale: 1.0,
+            badge: true,
+        }
+    }
+}
+
 /// Everything a section may read. Kept as a plain copy so layout stays a pure
 /// function of state — the same input always produces the same widgets.
 #[allow(dead_code)]
@@ -117,6 +151,33 @@ pub struct PanelView {
     pub map_opacity: f64,
     pub map_visible: bool,
     pub map_window: bool,
+    /// Scroll offset in design px. The sections are laid out from `48 - scroll`,
+    /// so one offset moves the paint AND every hit box together.
+    pub scroll: i32,
+    /// Design height the whole section stack needs (may exceed `view_h`).
+    pub content_h: i32,
+    /// Design height of the visible viewport: the content capped by the monitor's
+    /// work area, so the last section can never hide under the taskbar again.
+    pub view_h: i32,
+    /// The PANEL's own accent. Menu themes drive this one only; the cursor keeps
+    /// using `accent`. Two colours is what makes "菜单主题" and "AI 鼠标设置" truly
+    /// separate rather than one control doing both.
+    pub panel_accent: u32,
+    /// Menu theme preset names (read-only, from `menu-themes.json`).
+    pub menu_themes: Vec<String>,
+    /// Which menu theme is highlighted in the list.
+    pub menu_theme_sel: usize,
+    /// Mouse preset names (read-only, from `cursor-presets.json`).
+    pub mouse_presets: Vec<String>,
+    /// Which mouse preset is highlighted in the list.
+    pub mouse_preset_sel: usize,
+    /// The cursor the ‹ › arrows currently select, and how many exist.
+    pub sel_name: String,
+    pub sel_index: usize,
+    pub sel_total: usize,
+    /// The selected cursor's editable look: the mouse section reads THIS, not the
+    /// local `St`, because the selected cursor may be a different process.
+    pub sel_settings: CursorSettings,
 }
 
 #[allow(dead_code)]
@@ -163,6 +224,9 @@ pub const SWATCHES: [u32; 8] = [
     0x4FC3F7, 0x7C5CFF, 0xFF6B8B, 0x34D399, 0xF5A524, 0xE2E8F0, 0xFF4D4F, 0x22D3EE,
 ];
 pub const SWATCH_IDS: [&str; 8] = ["sw0", "sw1", "sw2", "sw3", "sw4", "sw5", "sw6", "sw7"];
+/// The same palette for the menu bar's OWN accent. Separate ids because these two
+/// choose different things: `sw*` = the cursor colour, `mt*` = the panel colour.
+pub const MT_SWATCH_IDS: [&str; 8] = ["mt0", "mt1", "mt2", "mt3", "mt4", "mt5", "mt6", "mt7"];
 
 pub fn hex(rgb: u32) -> String {
     format!("#{:06X}", rgb & 0xFFFFFF)

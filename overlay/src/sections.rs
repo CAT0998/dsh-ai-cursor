@@ -11,8 +11,8 @@
 
 use crate::rect;
 use crate::widget::{
-    channels_of, hex, CustomRowView, Hit, Kind, PanelView, SlotView, CUSTOM_IDS, SWATCH_IDS,
-    SWATCHES,
+    channels_of, hex, CustomRowView, Hit, Kind, PanelView, SlotView, CUSTOM_IDS, MT_SWATCH_IDS,
+    SWATCH_IDS, SWATCHES,
 };
 
 pub const PAD: i32 = 14;
@@ -30,6 +30,11 @@ pub struct SecDef {
 
 /// The panel's sections, in display order. Adding a module here is the whole
 /// registration step; `docs/MODULES.md` documents the contract.
+///
+/// Structure rule (2026-11-01 redesign, see `docs/PANEL-REDESIGN.md`): the panel is
+/// split into **菜单主题** (the menu bar's own chrome: accent + zoom) and
+/// **AI 鼠标设置** (one cursor's look). The two never share a control, so choosing a
+/// menu theme can no longer repaint the cursor and vice versa.
 pub const SECTIONS: &[SecDef] = &[
     SecDef {
         key: "actions",
@@ -39,25 +44,25 @@ pub const SECTIONS: &[SecDef] = &[
         render: body_actions,
     },
     SecDef {
-        key: "appearance",
-        header: "sec_appearance",
-        title: "外观",
-        default_collapsed: false,
-        render: body_appearance,
-    },
-    SecDef {
-        key: "style",
-        header: "sec_style",
-        title: "造型",
+        key: "menu_theme",
+        header: "sec_menu_theme",
+        title: "菜单主题",
         default_collapsed: true,
-        render: body_style,
+        render: body_menu_theme,
     },
     SecDef {
-        key: "colors",
-        header: "sec_colors",
-        title: "颜色",
+        key: "mouse",
+        header: "sec_mouse",
+        title: "AI 鼠标设置",
         default_collapsed: false,
-        render: body_colors,
+        render: body_mouse,
+    },
+    SecDef {
+        key: "mouse_presets",
+        header: "sec_mouse_presets",
+        title: "鼠标预设",
+        default_collapsed: true,
+        render: body_mouse_presets,
     },
     SecDef {
         key: "artwork",
@@ -73,13 +78,6 @@ pub const SECTIONS: &[SecDef] = &[
         title: "小地图",
         default_collapsed: true,
         render: body_minimap,
-    },
-    SecDef {
-        key: "presets",
-        header: "sec_presets",
-        title: "预设",
-        default_collapsed: true,
-        render: body_presets,
     },
     SecDef {
         key: "permission",
@@ -355,32 +353,118 @@ fn body_actions(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
     y + l.sc(122)
 }
 
-fn body_appearance(v: &PanelView, x: i32, y: i32, out: &mut Vec<Hit>) -> i32 {
-    out.push(Hit::new(rect(x, y, content_right(), y + 18), Kind::Label, "l_badge").text("AI 提示"));
+/// 菜单主题：**只**描述菜单栏自己长什么样。
+///
+/// 硬判据：这个分区里没有任何一个控件会改变 AI 光标的像素。它写 `panel_accent`
+/// 与 `panel_zoom`，与光标用的 `accent` / `scale` 是两套值、两套存储。
+fn body_menu_theme(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
+    // 面板强调色（只影响菜单栏的按钮/滑杆/滚动条）
+    for (i, (id, rgb)) in MT_SWATCH_IDS.iter().zip(SWATCHES.iter()).enumerate() {
+        let bx = x + i as i32 * 36;
+        out.push(
+            Hit::new(rect(bx, y, bx + 26, y + 26), Kind::Swatch, id)
+                .text(hex(*rgb))
+                .active(v.panel_accent & 0xFFFFFF == *rgb)
+                .hover(hov(v, id)),
+        );
+    }
     out.push(
-        Hit::new(rect(x + 116, y - 3, x + 166, y + 23), Kind::Button, "badge_on")
-            .text("开")
-            .active(v.badge)
-            .hover(hov(v, "badge_on")),
+        Hit::new(rect(x + 268, y + 4, content_right(), y + 22), Kind::LabelRight, "l_mt_hex")
+            .text(hex(v.panel_accent)),
+    );
+    y += 32;
+
+    // 菜单缩放：和右下角「大小」把手是同一个值
+    out.push(Hit::new(rect(x, y + 4, x + 56, y + 20), Kind::Label, "l_mt_zoom").text("菜单缩放"));
+    out.push(
+        Hit::new(rect(x + 62, y + 2, x + 330, y + 20), Kind::Slider, "panel_zoom")
+            .data((((v.zoom - 0.6) / 1.4) * 1000.0).clamp(0.0, 1000.0) as i32)
+            .hover(hov(v, "panel_zoom")),
     );
     out.push(
-        Hit::new(rect(x + 174, y - 3, x + 224, y + 23), Kind::Button, "badge_off")
-            .text("关")
-            .active(!v.badge)
-            .hover(hov(v, "badge_off")),
+        Hit::new(rect(x + 336, y + 4, content_right(), y + 20), Kind::LabelRight, "l_mt_zoom_v")
+            .text(format!("{:.0}%", v.zoom * 100.0)),
+    );
+    y += 30;
+
+    // 主题预设列表（menu-themes.json，宿主写、面板只读）
+    let current = v
+        .menu_themes
+        .get(v.menu_theme_sel)
+        .cloned()
+        .unwrap_or_else(|| "未保存".to_string());
+    out.push(
+        Hit::new(rect(x, y, content_right(), y + 18), Kind::Label, "l_mt_cur")
+            .text(format!("主题预设 {} 个 · 当前：{}", v.menu_themes.len(), current)),
+    );
+    y += 22;
+    for (i, name) in v.menu_themes.iter().enumerate().take(6) {
+        let id = format!("mt_apply_{i}");
+        out.push(
+            Hit::new(rect(x, y, content_right(), y + 22), Kind::Button, Box::leak(id.into_boxed_str()))
+                .text(name.clone())
+                .active(v.menu_theme_sel == i)
+                .hover(hov(v, "mt_apply")),
+        );
+        y += 26;
+    }
+    out.push(
+        Hit::new(rect(x, y + 2, x + 110, y + 26), Kind::Button, "mt_save")
+            .text("保存主题")
+            .hover(hov(v, "mt_save")),
     );
     out.push(
-        Hit::new(rect(x + 240, y, content_right(), y + 18), Kind::LabelRight, "l_opacity")
-            .text(format!("透明度 {}%", (v.opacity * 100.0).round() as i32)),
+        Hit::new(rect(x + 118, y + 2, x + 228, y + 26), Kind::Button, "mt_delete")
+            .text("删除所选")
+            .hover(hov(v, "mt_delete")),
     );
     out.push(
-        Hit::new(rect(x, y + 28, content_right(), y + 46), Kind::Slider, "opacity")
-            .data(((v.opacity - 0.15) / 0.85 * 1000.0).clamp(0.0, 1000.0) as i32),
+        Hit::new(rect(x + 236, y + 2, x + 340, y + 26), Kind::Button, "mt_reset")
+            .text("恢复默认")
+            .hover(hov(v, "mt_reset")),
     );
-    y + 50
+    out.push(
+        Hit::new(rect(x, y + 32, content_right(), y + 50), Kind::Label, "l_mt_hint")
+            .text("存 menu-themes.json（宿主写）；相同的主题只留一份"),
+    );
+    y + 56
 }
 
-fn body_style(v: &PanelView, x: i32, y: i32, out: &mut Vec<Hit>) -> i32 {
+/// 「AI 鼠标设置」：编辑**选中的那一只**光标。
+///
+/// 第一节是选鼠标的 ‹ 预设名 ›：名字是这只光标当前套用的鼠标预设名，没有名字时
+/// 第一只是「默认」，其余依次「自定义1」「自定义2」…（见 `docs/PANEL-REDESIGN.md`）。
+///
+/// 控件 id 与重构前完全一致（badge_on / opacity / scale / theme_* / sw* / ch_* / wheel），
+/// 这样已有的自测、点击脚本和用户的肌肉记忆都还有效。
+fn body_mouse(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
+    // ---- 选中哪只鼠标 -------------------------------------------------------
+    out.push(
+        Hit::new(rect(x, y, x + 34, y + 26), Kind::Button, "mouse_prev")
+            .text("\u{2039}")
+            .hover(hov(v, "mouse_prev")),
+    );
+    out.push(
+        Hit::new(rect(x + 40, y, x + 300, y + 26), Kind::Label, "mouse_sel")
+            .text(format!(
+                "{}（{}/{}）",
+                v.sel_name,
+                v.sel_index + 1,
+                v.sel_total.max(1)
+            )),
+    );
+    out.push(
+        Hit::new(rect(x + 306, y, x + 340, y + 26), Kind::Button, "mouse_next")
+            .text("\u{203A}")
+            .hover(hov(v, "mouse_next")),
+    );
+    out.push(
+        Hit::new(rect(x + 348, y + 4, content_right(), y + 22), Kind::LabelRight, "l_mouse_swap")
+            .text(if v.sel_total > 1 { "左右切换" } else { "只有这一只" }),
+    );
+    y += 32;
+
+    // ---- 造型 + 大小 --------------------------------------------------------
     let themes: [(&'static str, &str, &str); 3] =
         [("theme_whale", "鲸鱼", "whale"), ("theme_dot", "圆点", "dot"), ("theme_arrow", "箭头", "arrow")];
     for (i, (id, text, key)) in themes.iter().enumerate() {
@@ -388,41 +472,39 @@ fn body_style(v: &PanelView, x: i32, y: i32, out: &mut Vec<Hit>) -> i32 {
         out.push(
             Hit::new(rect(bx, y, bx + 66, y + 26), Kind::Button, id)
                 .text(*text)
-                .active(v.theme == *key)
+                .active(v.sel_settings.theme == *key)
                 .hover(hov(v, id)),
         );
     }
     out.push(
         Hit::new(rect(x + 226, y, content_right(), y + 18), Kind::LabelRight, "l_scale")
-            .text(format!("大小 {}%", (v.scale * 100.0).round() as i32)),
+            .text(format!("大小 {}%", (v.sel_settings.scale * 100.0).round() as i32)),
     );
     out.push(
         Hit::new(rect(x, y + 28, content_right(), y + 46), Kind::Slider, "scale")
-            .data(((v.scale - 0.6) / 1.4 * 1000.0).clamp(0.0, 1000.0) as i32),
+            .data(((v.sel_settings.scale - 0.6) / 1.4 * 1000.0).clamp(0.0, 1000.0) as i32)
+            .hover(hov(v, "scale")),
     );
-    y + 50
-}
+    y += 52;
 
-fn body_colors(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
-    // presets
+    // ---- 颜色 --------------------------------------------------------------
     for (i, (id, rgb)) in SWATCH_IDS.iter().zip(SWATCHES.iter()).enumerate() {
         let bx = x + i as i32 * 36;
         out.push(
             Hit::new(rect(bx, y, bx + 26, y + 26), Kind::Swatch, id)
                 .text(hex(*rgb))
-                .active(v.accent & 0xFFFFFF == *rgb)
+                .active(v.sel_settings.accent & 0xFFFFFF == *rgb)
                 .hover(hov(v, id)),
         );
     }
     out.push(
         Hit::new(rect(x + 268, y + 4, content_right(), y + 22), Kind::LabelRight, "l_hex")
-            .text(hex(v.accent)),
+            .text(hex(v.sel_settings.accent)),
     );
     y += 30;
 
-    // 256-level RGB channels (P2)
     let labels = ["R", "G", "B"];
-    let channels = channels_of(v.accent);
+    let channels = channels_of(v.sel_settings.accent);
     for (i, label) in labels.iter().enumerate() {
         let id: &'static str = match i {
             0 => "ch_r",
@@ -437,7 +519,6 @@ fn body_colors(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
         out.push(
             Hit::new(rect(x + 24, y + 2, x + 300, y + 20), Kind::Channel, id)
                 .text(format!("{:3}", channels[i]))
-                .active(false)
                 .hover(hov(v, id))
                 .data(i as i32),
         );
@@ -449,15 +530,14 @@ fn body_colors(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
         y += 22;
     }
 
-    // colour wheel: hue ring + HSV square, drawn from a cached surface
+    // 色环：色相环 + 内部明度/饱和方块
     let d = crate::wheel::D;
     out.push(
-        Hit::new(rect(x, y + 6, x + d, y + 6 + d), Kind::Wheel, "wheel")
-            .hover(hov(v, "wheel")),
+        Hit::new(rect(x, y + 6, x + d, y + 6 + d), Kind::Wheel, "wheel").hover(hov(v, "wheel")),
     );
     out.push(
         Hit::new(rect(x + d + 10, y + 12, content_right(), y + 30), Kind::LabelRight, "l_wheel_hex")
-            .text(hex(v.accent)),
+            .text(hex(v.sel_settings.accent)),
     );
     out.push(
         Hit::new(rect(x + d + 10, y + 36, content_right(), y + 54), Kind::Label, "l_wheel_hint")
@@ -467,7 +547,85 @@ fn body_colors(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
         Hit::new(rect(x + d + 10, y + 54, content_right(), y + 72), Kind::Label, "l_wheel_hint2")
             .text("内块选明度/饱和"),
     );
-    y + 6 + d + 8
+    y += 6 + d + 8;
+
+    // ---- 透明度 + AI 提示 ---------------------------------------------------
+    out.push(
+        Hit::new(rect(x, y + 4, x + 56, y + 20), Kind::Label, "l_opacity")
+            .text(format!("透明度 {}%", (v.sel_settings.opacity * 100.0).round() as i32)),
+    );
+    out.push(
+        Hit::new(rect(x + 62, y + 2, x + 330, y + 20), Kind::Slider, "opacity")
+            .data(((v.sel_settings.opacity - 0.15) / 0.85 * 1000.0).clamp(0.0, 1000.0) as i32)
+            .hover(hov(v, "opacity")),
+    );
+    out.push(
+        Hit::new(rect(x + 336, y + 4, content_right(), y + 20), Kind::LabelRight, "l_opacity_v")
+            .text(format!("{:.0}%", v.sel_settings.opacity * 100.0)),
+    );
+    y += 30;
+    out.push(Hit::new(rect(x, y + 4, x + 60, y + 20), Kind::Label, "l_badge").text("AI 提示"));
+    out.push(
+        Hit::new(rect(x + 62, y - 1, x + 112, y + 25), Kind::Button, "badge_on")
+            .text("开")
+            .active(v.sel_settings.badge)
+            .hover(hov(v, "badge_on")),
+    );
+    out.push(
+        Hit::new(rect(x + 120, y - 1, x + 170, y + 25), Kind::Button, "badge_off")
+            .text("关")
+            .active(!v.sel_settings.badge)
+            .hover(hov(v, "badge_off")),
+    );
+    out.push(
+        Hit::new(rect(x + 182, y + 4, content_right(), y + 22), Kind::Label, "l_badge_hint")
+            .text("按钮下方显示的文字"),
+    );
+    y + 32
+}
+
+/// 「鼠标预设」：命名保存/应用/删除**选中那只鼠标**的设置。
+///
+/// 只保留这一个预设分区（旧的 `presets` 分区已移除）：旧文件 `presets.json` 的格式与
+/// 工具（`ai_mouse_preset`）继续可用，但面板上不再出现第二个「预设」区块。
+fn body_mouse_presets(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
+    if v.mouse_presets.is_empty() {
+        out.push(
+            Hit::new(rect(x, y, content_right(), y + 18), Kind::Label, "l_no_mouse_presets")
+                .text("还没有鼠标预设：点下面「保存当前」把选中的鼠标存下来"),
+        );
+        y += 22;
+    }
+    for (i, name) in v.mouse_presets.iter().enumerate().take(6) {
+        let id = format!("mp_apply_{i}");
+        out.push(
+            Hit::new(rect(x, y, content_right(), y + 22), Kind::Button, Box::leak(id.into_boxed_str()))
+                .text(name.clone())
+                .active(v.mouse_preset_sel == i)
+                .hover(hov(v, "mp_apply")),
+        );
+        y += 26;
+    }
+    out.push(
+        Hit::new(rect(x, y + 2, x + 110, y + 26), Kind::Button, "mp_save")
+            .text("保存当前")
+            .hover(hov(v, "mp_save")),
+    );
+    out.push(
+        Hit::new(rect(x + 118, y + 2, x + 228, y + 26), Kind::Button, "mp_delete")
+            .text("删除所选")
+            .hover(hov(v, "mp_delete")),
+    );
+    out.push(
+        Hit::new(rect(x + 236, y + 2, x + 336, y + 26), Kind::Button, "mp_export")
+            .text("导出")
+            .hover(hov(v, "mp_export")),
+    );
+    out.push(
+        Hit::new(rect(x, y + 32, content_right(), y + 50), Kind::Label, "l_mp_hint")
+            .text("存 cursor-presets.json；相同设置只留一份"),
+    );
+    y + 56
 }
 
 const PREVIEW_IDS: [&'static str; 3] = ["prev0", "prev1", "prev2"];
@@ -525,6 +683,14 @@ fn source_short(slot: &SlotView) -> String {
 }
 
 fn body_artwork(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
+    // Say it in the UI, not only in the docs: the artwork slots belong to THIS
+    // process. The ‹ › selector above switches which mouse is being configured, and
+    // the picture editors deliberately do not follow it (see PANEL-REDESIGN §7).
+    out.push(
+        Hit::new(rect(x, y, content_right(), y + 16), Kind::Label, "l_art_scope")
+            .text("仅本面板这只光标：图案不随上面选择的鼠标切换"),
+    );
+    y += 20;
     let rows: [(&'static str, &'static str); 3] =
         [("art_prev0", "art_next0"), ("art_prev1", "art_next1"), ("art_prev2", "art_next2")];
     for (i, (prev, next)) in rows.iter().enumerate() {
@@ -627,52 +793,6 @@ fn body_minimap(v: &PanelView, x: i32, y: i32, out: &mut Vec<Hit>) -> i32 {
             .text("独立进程 · 可拖动缩放最小化"),
     );
     y + 34
-}
-
-fn body_presets(v: &PanelView, x: i32, y: i32, out: &mut Vec<Hit>) -> i32 {
-    let mut y = y;
-    if v.presets.is_empty() {
-        out.push(
-            Hit::new(rect(x, y, content_right(), y + 18), Kind::Label, "l_no_presets")
-                .text("还没有预设：在插件里 ai_mouse_preset save 一个"),
-        );
-        return y + 24;
-    }
-    for (i, name) in v.presets.iter().enumerate().take(8) {
-        let active = v.preset_sel == i;
-        let row = rect(x, y, content_right(), y + 22);
-        // 索引编进 id：on_toggle 只有 (St, &str)，拿不到 Hit 的 data
-        let id = format!("preset_apply_{i}");
-        out.push(
-            Hit::new(row, Kind::Button, Box::leak(id.into_boxed_str()))
-                .text(name.clone())
-                .active(active)
-                .hover(hov(v, "preset_apply")),
-        );
-        y += 26;
-    }
-    out.push(
-        Hit::new(rect(x, y + 2, x + 110, y + 26), Kind::Button, "preset_export")
-            .text("导出预设")
-            .hover(hov(v, "preset_export")),
-    );
-    // 保存/删除需要写素材目录，浮层写不了，所以把意图写给宿主执行
-    out.push(
-        Hit::new(rect(x + 118, y + 2, x + 228, y + 26), Kind::Button, "preset_save")
-            .text("保存当前")
-            .hover(hov(v, "preset_save")),
-    );
-    out.push(
-        Hit::new(rect(x + 236, y + 2, x + 346, y + 26), Kind::Button, "preset_delete")
-            .text("删除所选")
-            .hover(hov(v, "preset_delete")),
-    );
-    // 提示放到按钮下面一行：原来它从 x+118 开始，正好压在「保存当前」上面
-    out.push(
-        Hit::new(rect(x, y + 32, content_right(), y + 50), Kind::Label, "l_preset_hint")
-            .text("导出到 logs/；保存与删除由宿主写回 presets.json"),
-    );
-    y + 56
 }
 
 fn body_permission(v: &PanelView, x: i32, y: i32, out: &mut Vec<Hit>) -> i32 {

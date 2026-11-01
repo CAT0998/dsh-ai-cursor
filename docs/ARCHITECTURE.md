@@ -134,3 +134,90 @@ widget.rs  ←── sections.rs ←── main.rs(draw_panel)
 | DSH 侧边栏 | **不在本仓库**：用 DSH 的 Web 侧边栏（浏览器虚拟界面）实现，读 `berths.json` / `presets.json` 渲染 HTML | 新工程 |
 | 线程/渲染优化 | `main()` 主循环：把 `sprite.rs` 解码移出、静图不重绘 | 1 处为主 |
 | 停靠站圆角黑边 | `Canvas::compose` 与 `present` 的尺寸对照（打印 canvas w/h vs compose w/h） | 1 处 |
+
+---
+
+## 七、面板结构性重构（2026-11-01）后的结构
+
+设计见 [PANEL-REDESIGN.md](PANEL-REDESIGN.md)。**这一节是现在改面板前的必读**，
+它替换了旧版「外观/造型/颜色/预设」四节混在一起的布局。
+
+### 7.1 分区（`SECTIONS` 顺序 = 显示顺序）
+
+| 顺序 | key | 标题 | 归属 | 只改什么 |
+|---|---|---|---|---|
+| 1 | `actions` | 操作 | 全局 | 显示/隐藏/停止/启用、拖拽、停靠站、小地图、停止全部、退出 |
+| 2 | `menu_theme` | **菜单主题** | 菜单 | `panel_accent` + `panel_zoom` + 菜单主题预设（`menu-themes.json`） |
+| 3 | `mouse` | **AI 鼠标设置** | 光标 | 选中光标（roster）、造型、颜色、大小、透明度、徽标 |
+| 4 | `mouse_presets` | **鼠标预设** | 光标 | `cursor-presets.json`：保存/应用/删除/导出 |
+| 5 | `artwork` | 图案 | **本面板光标** | 三个槽位与参数（不随选择切换，UI 里有明示） |
+| 6 | `minimap` | 小地图 | 全局 | 小地图窗口开关 |
+| 7 | `permission` | 权限等级 | 全局 | 停止/只读/操作/管理员 |
+| 8 | `custom` | 自定义模块（空位） | 全局 | `custom-section.json` |
+
+**硬判据**：`menu_theme` 里没有任何控件会改变光标像素；`mouse` 里没有任何控件会改变
+面板像素。两套颜色值是分开的（`panel_accent` vs `accent`），两套存储文件也是分开的。
+
+旧的 `presets` 分区已从面板移除（**只保留一个预设区块**），`presets.json` 的格式与
+`ai_mouse_preset` 工具完全不变，仍可用。
+
+### 7.2 数据流（面板 → 宿主 → 目标光标）
+
+```
+面板点 ‹ › / 改颜色 / 存主题
+   │ 能本地做的直接做（选中光标 == 本进程）
+   │ 否则写 <exeDir>/logs/dock-command.json（带 epoch）
+   ▼
+宿主 drainMailbox()    ← 面板打开时 250ms 定时器 + ai_mouse_dock 各排空一次
+   ├─ select_cursor  -> 写 logs/cursor-ui.json，再给所有面板推 panel_roster
+   ├─ cursor_patch   -> 翻译成 theme/color/opacity/scale/badge 发给目标光标进程
+   ├─ menu_theme_*   -> 写 <assetDir>/menu-themes.json（去重）
+   └─ cursor_preset_*-> 写字 <assetDir>/cursor-presets.json（去重）/ 应用
+   ▼
+panel_roster { self, selected, cursors:[{name,display,theme,color,…}] }
+   → 面板据此显示名字（默认 / 自定义N / 已保存预设名）和被选中光标的值
+```
+
+**为什么必须绕**：别的光标是独立进程（内存不共享），面板写不了 assetDir，子进程
+stdin 的写端只有宿主持有。见 LESSONS 11 / 3d。
+
+### 7.3 新增协议命令（`handle_line` 里按语义区插入）
+
+| 命令 | 方向 | 作用 |
+|---|---|---|
+| `panel_roster` | 宿主→面板 | 全部光标的名字 + 每只的实时外观；`self` 是本面板所属光标 |
+| `panel_identity` | 宿主→面板 | 只报本面板属于哪只（等价于只推 self） |
+| `panel_theme` | 宿主→面板 | 直接设菜单强调色/缩放 |
+| `panel_scroll` | 任意→面板 | 设绝对 `y` 或相对 `delta` 滚动（自动化用） |
+| `hits` | 任意→面板 | **诊断**：返回当前所有控件框（id/kind/x/y/w/h/text），点击脚本靠它定位 |
+
+### 7.4 存储一览
+
+| 数据 | 文件 | 谁能写 |
+|---|---|---|
+| 菜单主题预设 | `<assetDir>/menu-themes.json` | 宿主 |
+| 鼠标预设 | `<assetDir>/cursor-presets.json` | 宿主 |
+| 旧预设（兼容） | `<assetDir>/presets.json` | 宿主 |
+| 面板意图信箱 | `<exeDir>/logs/dock-command.json` | 浮层可写 |
+| 选中的光标 | `<exeDir>/logs/cursor-ui.json` | 宿主 |
+| 面板列表缓存 | 内存（每 1.5s 重读上面两个 json） | 浮层 |
+
+### 7.5 滚动（视口模型）
+
+- `PH_MAX` 只是画布分配上限；**窗口高度 = 视口高度** = `min(内容高, 工作区高-16)`，
+  工作区用 `GetMonitorInfoW` 的 `rcWork`（排除任务栏）——这就是 1080p「预设点不到」的修复。
+- `sections::build(v, 48 - v.scroll, …)`：绘制与命中框一起平移，**没有第二套坐标**。
+- 内容区用 `IntersectClipRect` 裁剪到 `[HEADER_BOTTOM, view_h]`；画完 `SelectClipRgn` 恢复。
+- `pick()` 带视口守卫：表头以上的点只能命中表头自己的控件，滚出去的控件**彻底不响应**。
+- 滚轮：`panel_proc` 的 `WM_MOUSEWHEEL`，先打原始 `wParam` 再换算（一格 60px）。
+
+### 7.6 想加东西时的新插入点
+
+| 想加的东西 | 插入点 |
+|---|---|
+| 新的面板分区 | `sections.rs` 的 `SECTIONS`（按显示顺序）+ 一个 `body_xxx` |
+| 新的面板控件 | `widget.rs` 的 `Kind` + `sections.rs` 生成 `Hit` + `main.rs` 的 `draw_panel` match |
+| 新的"面板要宿主做事"的动作 | 1) `sections.rs` 出按钮 2) `on_toggle` 里 `write_mailbox({action,…})` 3) 宿主 `drainMailbox` 加一个分支 4) `panelstate.ts` 的纯函数 + 单测 |
+| 新的按光标保存的数据 | 归到 `cursor-presets.json`（`panelstate.ts` 的 `cursorPresetKey` 决定去重） |
+| 新的菜单自身外观 | `St.panel_*` 字段 + `menu-themes.json`，**不要**复用 `st.accent` |
+
