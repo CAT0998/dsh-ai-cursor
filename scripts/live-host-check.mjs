@@ -173,6 +173,19 @@ try {
         lastRoster.includes('"默认"') &&
         lastRoster.includes('"自定义1"'),
         lastRoster.trim())
+  // ---- 预设必须存到"被指定的那只"，不是 active 那只 ----
+  await sendMailbox({ action: 'cursor_patch', target: 'agent-b', patch: { color: '#00AAFF' } })
+  await sleep(600)
+  await rm(join(assets, 'cursor-presets.json'), { force: true })
+  await sendMailbox({ action: 'cursor_preset_save', target: 'agent-b', index: 1 })
+  await sleep(700)
+  const perCursor = (await exists(join(assets, 'cursor-presets.json')))
+    ? await readJson(join(assets, 'cursor-presets.json'))
+    : []
+  check('E15 预设按 target 存的是 agent-b 的样子（#00AAFF）',
+        perCursor.length === 1 && perCursor[0]?.color === '#00AAFF',
+        JSON.stringify(perCursor[0] && { name: perCursor[0].name, color: perCursor[0].color }))
+
   await call('ai_mouse_cursor', { action: 'use', name: 'default' }).catch(() => '')
   void created
 } catch (error) {

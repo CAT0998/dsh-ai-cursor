@@ -469,3 +469,46 @@ poll drag  -> (820,520)           ← 轮询路径每帧把它覆盖回按下位
 - 光标位置：**(1000,660)** ✅ 跟到位
 - permission：**管理员(3)** ✅ 没有降级
 - note：「用户把 AI 光标放到了 (1000, 660)，AI 控制已恢复。」
+
+
+---
+
+## P11 面板结构性重构：菜单主题 / 鼠标设置 / 滚动（2026-11-01 完成）
+
+设计文档：[PANEL-REDESIGN.md](PANEL-REDESIGN.md)；结构说明：[ARCHITECTURE.md](ARCHITECTURE.md) 第七节；
+新踩的坑：[LESSONS.md](LESSONS.md) 第 12 条。
+
+**需求（用户原话 8 条）→ 落点**
+
+| 需求 | 落点 |
+|---|---|
+| 菜单主题与 AI 鼠标设置分开 | 两个分区 + 两套颜色值（`panel_accent` vs `accent`），互不修改对方像素 |
+| 能选中每一只鼠标 | `panel_roster` 里带 `self`，面板据此区分"编辑我"与"转发别人" |
+| 每只鼠标可命名保存；保留原预设 | `cursor-presets.json`；旧 `presets.json` 与 `ai_mouse_preset` 不动 |
+| 鼠标设置与主题设置分开保存 | `cursor-presets.json` / `menu-themes.json` 两个文件 |
+| 左右箭头切换选中的鼠标 | `mouse_prev` / `mouse_next` 写 `select_cursor` |
+| 箭头旁显示预设名：默认 / 自定义N | `cursorDisplayName(index, presetName)`（宿主算，面板显示） |
+| 相同预设不重复保存 | `cursorPresetKey` 规范化键 + `upsertCursorPreset`；单测 17 个用例 |
+| 菜单栏加滚轮 | 视口裁剪 + `WM_MOUSEWHEEL`（一格 60px）+ 右缘滚动条 |
+
+**顺带修掉的老缺陷**：1080p 下「预设」落在任务栏下面点不到。根因是面板高度按
+`SM_CYSCREEN`（含任务栏）算；现在视口 = `min(内容高, rcWork 高 - 16)`，超出的部分
+用滚轮到达，`pick()` 还会让"滚出视口/被表头盖住"的控件彻底不响应。
+
+**行为变化（有意为之）**
+- 面板只保留一个预设区块（`鼠标预设`）；旧 `presets.json` 不再在面板里列出，但文件格式与
+  `ai_mouse_preset` 工具完全不变。
+- 图案分区只编辑本面板那只光标，UI 顶部已写明。
+- "选中鼠标"是面板的编辑对象，不改变 `ai_mouse_*` 工具默认作用的光标（那仍是 `use`）。
+
+**验证**
+- `selftest-overlay.py` 35/35；`live-panel-check.py` 36/36（真滚轮/真点击注入）；
+  `live-host-check.mjs` 15/15（假 Cordis 上下文装载构建后的插件，真进程 + 真信箱 + 真文件）；
+  `tsc --noEmit` 干净；`vitest` 65/65。
+- 截图：`artifacts/panel-selected-2.png`（`‹ 自定义1（2/2）›`，箭头造型 / 120% / #FF0044 / 80%）、
+  `artifacts/panel-presets-open.png`、`artifacts/panel-scrolltop.png`、`artifacts/panel-scrollmax.png`。
+
+**遗留**
+1. 宿主半边要重启 DSH 才会真正加载（profile 是 `link:` 到本仓库，`lib/` 已重建）。
+2. 菜单主题只含 accent + zoom；视口高度取主屏工作区。
+3. `scripts/__pycache__/` 需要 `git rm --cached` + `.gitignore`。

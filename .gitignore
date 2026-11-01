@@ -19,3 +19,8 @@ verify-*.png
 ai-mouse-*.png
 bin/logs/
 logs/
+
+# python bytecode from the verification scripts
+scripts/__pycache__/
+__pycache__/
+*.pyc
