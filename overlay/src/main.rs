@@ -2642,12 +2642,14 @@ unsafe fn make_window(class: PCWSTR, title: PCWSTR, ex: u32, w: i32, h: i32) -> 
         None,
     )
     .expect("CreateWindowExW");
-    let insert = if DOCK_MODE.load(std::sync::atomic::Ordering::Relaxed)
-        && !DOCK_TOPMOST.load(std::sync::atomic::Ordering::Relaxed)
-    {
-        windows::Win32::UI::WindowsAndMessaging::HWND_TOP
-    } else {
+    // Let the caller decide, through its ex style. SetWindowPos with HWND_TOPMOST
+    // adds WS_EX_TOPMOST itself, so forcing it here made every window topmost no
+    // matter what the caller asked for - which is how the menu ended up floating
+    // above everything even after its own flag was removed.
+    let insert = if ex & WS_EX_TOPMOST.0 != 0 {
         HWND_TOPMOST
+    } else {
+        windows::Win32::UI::WindowsAndMessaging::HWND_TOP
     };
     let _ = SetWindowPos(hwnd, insert, 0, 0, w, h, SET_WINDOW_POS_FLAGS(0));
     hwnd
@@ -2697,21 +2699,33 @@ unsafe fn make_panel(x: i32, y: i32) -> HWND {
     let hwnd = make_window(
         w!("AiMousePanel"),
         w!("AI Mouse Panel"),
-        WS_EX_LAYERED.0
-            | WS_EX_TOOLWINDOW.0
-            | WS_EX_NOACTIVATE.0
-            | WS_EX_TOPMOST.0,
+        // NOT topmost on purpose: the menu is a normal window that other windows may
+        // cover. It still never takes focus (NOACTIVATE), which is the property that
+        // mattered - floating above everything was just a side effect of that, and an
+        // unwelcome one.
+        WS_EX_LAYERED.0 | WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0,
         PW,
         PH,
     );
+    // HWND_TOP plus an explicit NOTOPMOST: a window that stays topmost ignores the
+    // rest of the z-order, and re-created panels must not come back on top.
     let _ = SetWindowPos(
         hwnd,
-        HWND_TOPMOST,
+        HWND_NOTOPMOST,
         x,
         y,
         PW,
         PH,
         SWP_NOACTIVATE | SWP_NOZORDER,
+    );
+    let _ = SetWindowPos(
+        hwnd,
+        windows::Win32::UI::WindowsAndMessaging::HWND_TOP,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
     );
     let _ = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
     hwnd
