@@ -93,6 +93,10 @@ git 历史里 `05efa16` 就以 "installs, but never fires" 记过同一件事，
 排除了一个常见原因：消息泵用的是 `PeekMessage(hwnd=null, 0, 0, PM_REMOVE)`，
 这是能收到钩子回调的正确写法，所以不是过滤问题。真实原因仍未定位。
 
+第二次尝试：把 `hMod` 从 exe 模块句柄改成 `NULL`（按文档，回调在自己进程时应传 NULL）。
+结果**仍然 0 次回调**（`hook_error=0`、handle 有效、点 3 次 `hook_events` 仍为 0）。
+所以不是 hMod 的问题。两次尝试都失败，按规矩停止猜测。
+
 **结论：不要基于全局低级钩子做功能。**
 需要"AI 窗口只能被 AI 操作"时，改用 `EnableWindow(hwnd, FALSE)` + `PostMessage`
 （窗口收不到任何真实输入，但程序化投递仍可达），系统原生、不用钩子。
@@ -266,6 +270,14 @@ alpha=0 的像素点在它上面等于点桌面。所以圆角外侧的四角**�
 宿主每 250ms 排空一次 `dock-command.json`，脚本点完 0.4s 再读信箱经常读空。
 判据改成"信箱里还有 **或** 面板日志里新增了这条意图"，两者任一成立即可；
 点完立刻重读太脆，靠日志尾部才是稳的。
+
+#### 14e 两个 agent 同时跑浮层脚本会互相踩
+同一台机器上并发跑两套验收时实测到 `OSError: [Errno 22]`（往已退出的子进程 stdin 写）：
+`bin/logs/` 的日志与信箱、`AiMouseOverlay/Panel` 窗口类、屏幕坐标都是**全机共享**的，
+任何一方 `taskkill /IM ai-mouse-overlay.exe` 都会把对方的子进程一起杀掉。
+规矩：① 并发前互相打个招呼，或者各自 `cp bin/ai-mouse-overlay.exe <临时目录>/` 用不同 exe
+（日志目录跟着 exe 走，正好隔离）；② 脚本里只 `kill` 自己 `subprocess` 拿到的句柄，
+不要按镜像名杀；③ 遇到一次莫名其妙的失败，先单独重跑再查代码（LESSONS §2 的同一类错误）。
 
 ---
 

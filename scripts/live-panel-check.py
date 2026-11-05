@@ -570,7 +570,7 @@ def main() -> int:
         ink(im452, (374, 2, 442, 38), 150),
     )
     check("H3 标题「AI 鼠标」真的画出来了", title_ink > 150, f"ink={title_ink}")
-    check("H3b 署名「该程序由你和我友情提供」真的画出来了", sign_ink > 300, f"ink={sign_ink}")
+    check("H3b 署名「该程序由 DeepSeek 与 CAT0998 友情提供」真的画出来了", sign_ink > 300, f"ink={sign_ink}")
     check("H3c 最小化 + ✕ 真的画出来了", btn_ink > 25, f"ink={btn_ink}")
     # the header row used to be painted inside the scroll clip, i.e. invisible
     check("H3d 标题栏不是空的（整条横带都有墨）",
@@ -632,8 +632,10 @@ def main() -> int:
           and hits_now["opacity"]["h"] == 18,
           f"sec={sec_now['h']} btn={hits_now['show']['h']} slider={hits_now['opacity']['h']}")
     # A wider window must not scale the content: the title is pixel-identical.
-    check("H6d 字体大小不变（标题像素与 452 宽时逐点一致）",
-          crop(im452, (14, 4, 232, 38)) == crop(im700, (14, 4, 232, 38)),
+    # 只裁「AI 鼠标」这几个字。原来裁到 x=232，把右对齐的署名也框进去了——
+    # 署名是右对齐的，宽度变了它就会移动，那是流体布局的正常行为，不是缩放。
+    check("H6d 字体大小不变（「AI 鼠标」像素与 452 宽时逐点一致）",
+          crop(im452, (14, 4, 110, 38)) == crop(im700, (14, 4, 110, 38)),
           "title crop identical")
 
     # ---- 真鼠标拖右下角：宽高一起变（需求 3）----

@@ -1619,7 +1619,7 @@ fn panel_layout(v: &PanelView) -> Vec<Hit> {
     // 署名：标题栏右侧、✕ 左边，小号灰字（Label 的 12px 字体 + muted 色）
     o.push(
         Hit::new(rect(pad, 12, right - 70, 30), Kind::LabelRight, "sign")
-            .text("该程序由你和我友情提供"),
+            .text("该程序由 DeepSeek 与 CAT0998 友情提供"),
     );
     o.push(Hit::new(rect(pad, 40, right, 41), Kind::Sep, "sep1"));
 
