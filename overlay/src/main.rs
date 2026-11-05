@@ -195,6 +195,12 @@ unsafe extern "system" fn tray_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
 /// hand the window to the DWM's non-client painting (no transparency, black corners).
 /// The strip is drawn as an opaque 1px stroke plus this many px of grab room inside it.
 const RESIZE_EDGE: i32 = 6;
+/// How far the pointer may travel while pressing the collapsed chip before the press
+/// becomes a DRAG instead of a click. Below it, the release still means "expand".
+const CHIP_DRAG_PX: i32 = 4;
+/// Snap distance for the collapsed chip: release within this many px of a work-area
+/// edge (or corner) and it parks flush against it.
+const CHIP_SNAP_PX: i32 = 16;
 /// Smallest window the panel may be dragged down to: below this the header (title,
 /// minimise, close, signature) no longer fits and nothing would be reachable.
 const PANEL_MIN_W: i32 = 300;
@@ -1258,6 +1264,23 @@ enum ScrollBar {
     Horizontal,
 }
 
+/// A press on the collapsed chip (the "≡ AI 鼠标" strip).
+///
+/// The chip has to answer two questions with one button: a CLICK expands it, a DRAG
+/// moves it. So the press is only recorded here; it becomes a drag once the pointer
+/// travels `CHIP_DRAG_PX`, and only a release that never became a drag is a click.
+/// Expanding on the press (the old behaviour) would make dragging impossible.
+#[derive(Clone, Copy)]
+struct ChipPress {
+    /// Where the pointer was when the button went down (screen px).
+    start: (i32, i32),
+    /// Offset from the window origin to that point, so the chip follows the pointer
+    /// without jumping when the drag starts.
+    grab: (i32, i32),
+    /// Set once the pointer travelled past `CHIP_DRAG_PX`.
+    dragging: bool,
+}
+
 #[derive(Clone)]
 struct St {
     // --- cursor window ---
@@ -1319,6 +1342,8 @@ struct St {
     /// A scrollbar thumb being dragged: which bar, and where inside the thumb the
     /// press landed (so the thumb stays under the pointer instead of jumping).
     scroll_drag: Option<(ScrollBar, i32)>,
+    /// A press on the collapsed chip, until it is either a click or a drag.
+    chip_press: Option<ChipPress>,
 
     // --- permission ---
     permission: u8,
@@ -1494,6 +1519,7 @@ impl St {
             drag_wheel: false,
             resize: None,
             scroll_drag: None,
+            chip_press: None,
             permission: 3,
             prev_permission: 3,
             slots: [Slot::new(SLOT_CURSOR), Slot::new(SLOT_HINT), Slot::new(SLOT_ORNAMENT)],
@@ -3927,6 +3953,79 @@ unsafe fn set_resize_cursor(edge: u32) {
     }
 }
 
+/// Snap the collapsed chip to the work-area edges and corners.
+///
+/// Only the CHIP snaps (the expanded menu keeps its free position — the user asked for
+/// snapping on the strip), only on RELEASE, and only when an edge is within
+/// `CHIP_SNAP_PX`. The two axes are decided independently, which is what makes all four
+/// corners work without a corner table: snapping both axes of a release in a corner
+/// lands exactly in that corner.
+///
+/// The result is the ideal flush position; `panel_geom` still clamps the window into the
+/// work area with its 8 px safety margin, so the window parks 8 px in from the edge —
+/// close enough to read as "snapped", far enough that it can never be lost off-screen.
+fn snap_chip_pos(pos: (i32, i32), w: i32, h: i32, work: (i32, i32, i32, i32)) -> (i32, i32) {
+    let (wx, wy, ww, wh) = work;
+    let near = |v: i32, target: i32| (v - target).abs() <= CHIP_SNAP_PX;
+    let mut x = pos.0;
+    let mut y = pos.1;
+    if near(x, wx) {
+        x = wx;
+    } else if near(x + w, wx + ww) {
+        x = wx + ww - w;
+    }
+    if near(y, wy) {
+        y = wy;
+    } else if near(y + h, wy + wh) {
+        y = wy + wh - h;
+    }
+    (x, y)
+}
+
+/// Where the panel parks when it OPENS: the collapsed chip in the bottom-right corner
+/// of the work area (user decision 2026-11-05). The chip is what opens, so the corner
+/// is computed for the chip; expanding it later re-clamps the big window into the same
+/// work area.
+fn default_panel_pos() -> (i32, i32) {
+    let (wx, wy, ww, wh) = work_area();
+    (wx + ww - CHIP_W - 8, wy + wh - CHIP_H - 8)
+}
+
+/// Where the window position is recorded for a future "remember my spot" mode.
+///
+/// `<exeDir>/logs/` is the only place an overlay process may write (LESSONS §3d).
+fn panel_window_path() -> Option<std::path::PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("logs").join("panel-window.json")))
+}
+
+/// Record the panel's rect + collapsed state.
+///
+/// Nothing READS this yet on purpose: today every open starts bottom-right and
+/// collapsed (what the user asked for). The file exists so "remember the last
+/// position" becomes a one-line change later — see docs/TASKS.md T10.
+fn write_panel_window_file(st: &St) {
+    let Some(path) = panel_window_path() else { return };
+    let (w, h) = if st.panel_full { (st.panel_w, st.panel_px_h) } else { (CHIP_W, CHIP_H) };
+    let body = serde_json::json!({
+        "x": st.panel_pos.0,
+        "y": st.panel_pos.1,
+        "w": w,
+        "h": h,
+        "collapsed": !st.panel_full,
+        "updated_ms": now_ms(),
+    })
+    .to_string();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    match std::fs::write(&path, body) {
+        Ok(_) => logline!("INFO", "panel-window recorded -> {}", path.display()),
+        Err(e) => logline!("ERROR", "panel-window write {}: {e}", path.display()),
+    }
+}
+
 /// The rectangle a scrollbar is GRABBED in.
 ///
 /// The painted bar is `BAR_THICK` px wide, which is a fine look and a terrible target.
@@ -4134,6 +4233,25 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                 }
                 return LRESULT(0);
             }
+            if let Some(mut cp) = st.chip_press {
+                // A press on the chip only becomes a drag after it travels far enough:
+                // a release before that is still a click (expand).
+                let mut p = POINT::default();
+                let _ = GetCursorPos(&mut p);
+                let (dx, dy) = (p.x - cp.start.0, p.y - cp.start.1);
+                if !cp.dragging && dx * dx + dy * dy >= CHIP_DRAG_PX * CHIP_DRAG_PX {
+                    cp.dragging = true;
+                    logline!("INFO", "chip drag start at ({},{})", p.x, p.y);
+                }
+                if cp.dragging {
+                    st.panel_pos = (p.x - cp.grab.0, p.y - cp.grab.1);
+                    // Reuse the ordinary move path: position only, the size is unchanged.
+                    st.want_panel_move = true;
+                    st.panel_dirty = true;
+                }
+                st.chip_press = Some(cp);
+                return LRESULT(0);
+            }
             if let Some(d) = st.resize {
                 let mut p = POINT::default();
                 let _ = GetCursorPos(&mut p);
@@ -4317,7 +4435,21 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                         st.panel_dirty = true;
                         handled = true;
                     }
-                    Kind::Button | Kind::Swatch | Kind::Chip | Kind::Section => {
+                    Kind::Chip => {
+                        // One button, two meanings: remember where it went down and let
+                        // the move handler decide click vs drag. Expanding here (the old
+                        // behaviour) is exactly why the chip could never be dragged.
+                        let mut p = POINT::default();
+                        let _ = GetCursorPos(&mut p);
+                        st.chip_press = Some(ChipPress {
+                            start: (p.x, p.y),
+                            grab: (p.x - st.panel_pos.0, p.y - st.panel_pos.1),
+                            dragging: false,
+                        });
+                        st.hover.clear();
+                        handled = true;
+                    }
+                    Kind::Button | Kind::Swatch | Kind::Section => {
                         let id = h.id;
                         drop(st);
                         {
@@ -4337,8 +4469,39 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
         }
         WM_LBUTTONUP => {
             let s = state();
+            let mut expand_chip = false;
             {
                 let mut st = s.lock().unwrap();
+                if let Some(cp) = st.chip_press.take() {
+                    if cp.dragging {
+                        // Settle: snap to the nearest work-area edge / corner, then clamp
+                        // exactly like the automatic layout does, so what is written to
+                        // panel-window.json is the position the window really has.
+                        let (wx, wy, ww, wh) = work_area();
+                        let freed = st.panel_pos;
+                        let ideal = snap_chip_pos(freed, CHIP_W, CHIP_H, (wx, wy, ww, wh));
+                        let x = rect_x_clamp_in(ideal.0, CHIP_W, wx, ww);
+                        let y = rect_y_clamp_in(ideal.1, CHIP_H, wy, wh);
+                        st.panel_pos = (x, y);
+                        st.want_panel_resize = true;
+                        st.panel_dirty = true;
+                        logline!(
+                            "INFO",
+                            "chip dropped freed=({},{}) snapped=({},{}) work=({},{},{},{})",
+                            freed.0,
+                            freed.1,
+                            x,
+                            y,
+                            wx,
+                            wy,
+                            ww,
+                            wh
+                        );
+                        write_panel_window_file(&*st);
+                    } else {
+                        expand_chip = true;
+                    }
+                }
                 st.drag_slider = None;
                 st.drag_panel = None;
                 st.drag_wheel = false;
@@ -4351,6 +4514,11 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                 st.panel_dirty = true;
             }
             let _ = ReleaseCapture();
+            if expand_chip {
+                // A click that never moved: the chip's original meaning.
+                let mut st = s.lock().unwrap();
+                on_toggle(&mut st, "expand");
+            }
             return LRESULT(0);
         }
         _ => {}
@@ -4749,9 +4917,26 @@ fn handle_line(line: &str) {
             // `--no-panel` processes have no window to show; saying otherwise would
             // make the host believe a second panel exists.
             let on = v.get("visible").and_then(|b| b.as_bool()).unwrap_or(true) && has_panel();
+            // OPENING (hidden -> shown) always starts the same way, by user decision:
+            // the collapsed chip parked in the bottom-right corner of the work area.
+            // The host sends `panel_expanded` before `panel` in its prime burst, so this
+            // reset intentionally wins; a later explicit `panel_expanded` still expands.
+            let reopening = on && !st.panel_shown;
             st.panel_shown = on;
             if on {
                 st.want_panel_show = true;
+                if reopening {
+                    st.panel_full = false;
+                    st.panel_pos = default_panel_pos();
+                    st.want_panel_resize = true;
+                    logline!(
+                        "INFO",
+                        "panel opened collapsed at bottom-right ({},{})",
+                        st.panel_pos.0,
+                        st.panel_pos.1
+                    );
+                    write_panel_window_file(&*st);
+                }
             } else {
                 st.want_panel_hide = true;
             }
@@ -5692,12 +5877,26 @@ fn main() {
         let (wx, wy, ww, wh) = work_area();
         let px = wx + ww - PW - 24;
         let py = wy + ((wh - PH) / 2).max(8);
+        // `--panel` (dev / screenshots) opens exactly like a real open does: collapsed,
+        // in the bottom-right corner. Anything else would make the flag lie about
+        // what the user actually sees.
+        let dev_open = has_panel() && INIT_PANEL.load(std::sync::atomic::Ordering::Relaxed);
 
         let hwnd = make_overlay();
         // A cursor that is not the panel owner does not create the window at all: a
         // hidden panel would still be a second `AiMousePanel` on the desktop.
         let panel = if has_panel() { make_panel(px, py) } else { null_hwnd() };
-        if has_panel() && INIT_PANEL.load(std::sync::atomic::Ordering::Relaxed) {
+        if dev_open {
+            let (dx, dy) = default_panel_pos();
+            let _ = SetWindowPos(
+                panel,
+                HWND_TOPMOST,
+                dx,
+                dy,
+                CHIP_W,
+                CHIP_H,
+                SWP_NOACTIVATE | SWP_NOZORDER,
+            );
             let _ = ShowWindow(panel, SW_SHOWNOACTIVATE);
         }
         let grab = make_grab();
@@ -5706,7 +5905,13 @@ fn main() {
             s.hwnd = hwnd.0 as isize;
             s.panel_hwnd = panel.0 as isize;
             s.grab_hwnd = grab.0 as isize;
-            s.panel_pos = (px, py);
+            if dev_open {
+                s.panel_full = false;
+                s.panel_px_h = CHIP_H;
+                s.panel_pos = default_panel_pos();
+            } else {
+                s.panel_pos = (px, py);
+            }
         }
 
         if TRAY_MODE.load(std::sync::atomic::Ordering::Relaxed) {
