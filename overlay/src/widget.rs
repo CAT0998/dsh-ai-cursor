@@ -141,6 +141,14 @@ pub struct PanelView {    pub full: bool,
     pub panel_h: i32,
     /// Width of the content viewport: `min(panel_w, PW)`.
     pub view_w: i32,
+    /// Width the CONTENT is laid out at: `max(PW, panel_w)`.
+    ///
+    /// This is the number the sections lay out against — the window width, floored at
+    /// the design width. It is what makes the layout fluid: a wider window means a
+    /// wider content column (rows re-flow), **not** a bigger one (nothing is scaled).
+    pub content_w: i32,
+    /// Scroll bars: chrome, and the geometry a drag is measured against.
+    pub bars: ScrollBars,
     /// Horizontal scroll offset in design px, 0..=(PW - view_w).
     pub hscroll: i32,
     /// Selected cursors, one column header each.
@@ -197,6 +205,26 @@ impl PanelView {
     pub fn max_hscroll(&self) -> i32 {
         (crate::PW - self.view_w.max(0)).max(0)
     }
+
+    /// Deepest vertical scroll offset: how much content is below the viewport.
+    pub fn vmax(&self) -> i32 {
+        (self.content_h - self.view_h).max(0)
+    }
+}
+
+/// The panel's two scroll bars, in panel pixels.
+///
+/// They are chrome, but they are **draggable**: the same rectangles are painted, hit
+/// tested and used for the drag maths, so the thumb can never be somewhere the click
+/// does not expect. `None` means "this bar does not exist" (nothing to scroll).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ScrollBars {
+    /// Vertical bar: hugs the WINDOW's right edge, not the 452 design width.
+    pub v_track: Option<RECT>,
+    pub v_thumb: Option<RECT>,
+    /// Horizontal bar: only exists when the window is narrower than the content.
+    pub h_track: Option<RECT>,
+    pub h_thumb: Option<RECT>,
 }
 
 #[allow(dead_code)]

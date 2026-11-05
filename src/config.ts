@@ -35,6 +35,11 @@ export interface Config {
   scale: number
   /** Show the "AI 鼠标" badge under the cursor. */
   badge: boolean
+  /**
+   * Performance mode: draw nothing at all unless `ai_mouse_render_once` asks for a
+   * frame. The cursor then only exists for the moment before a screenshot.
+   */
+  performanceMode: boolean
   /** Starting permission ceiling for the agent (0 stopped … 3 admin). */
   permission: 0 | 1 | 2 | 3
   /**
@@ -84,6 +89,13 @@ export const Config: Schema<Config> = Schema.object({
   badge: Schema.boolean()
     .default(true)
     .description('Show the "AI 鼠标" badge under the cursor.'),
+  performanceMode: Schema.boolean()
+    .default(false)
+    .description(
+      'Performance mode: the overlay draws nothing at all (no cursor, no animation frames) '
+        + 'unless ai_mouse_render_once asks for one showing. Use it when the cursor must only '
+        + 'appear in screenshots; every render-once call re-shows and re-times it.',
+    ),
   intercept: Schema.union(INTERCEPT_MODES)
     .default('off')
     .description(

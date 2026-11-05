@@ -13,6 +13,7 @@ import {
   cursorDisplayName,
   cursorPatchCommands,
   cursorPresetKey,
+  renameCursorPreset,
   handlePanelCommand,
   loadCursorPresets,
   loadMenuThemes,
@@ -242,5 +243,32 @@ describe('选中鼠标的路由（面板 -> 宿主 -> 目标光标）', () => {
     expect(resolveTarget(1, names, 'agent-b', 2)).toBe('agent-b')
     expect(resolveTarget(undefined, names, 'default', 2)).toBe('agent-c')
     expect(resolveTarget('nobody', names, 'default', 0)).toBeUndefined()
+  })
+})
+
+describe('鼠标预设重命名（T7）', () => {
+  const one: CursorPreset = { name: '默认', theme: 'whale', color: '#4FC3F7', opacity: 1 }
+  const two: CursorPreset = { name: '红色', theme: 'dot', color: '#FF0044', opacity: 1 }
+
+  it('改名字，别的字段与去重键都不变', () => {
+    const r = renameCursorPreset([one, two], '默认', '我的鲸鱼')
+    expect(r.error).toBeUndefined()
+    expect([...r.list.map((p) => p.name)].sort()).toEqual(['我的鲸鱼', '红色'].sort())
+    const moved = r.list.find((p) => p.name === '我的鲸鱼')!
+    expect(moved.theme).toBe('whale')
+    // the key is built from the look, not the name: a rename cannot change it
+    expect(cursorPresetKey(moved)).toBe(cursorPresetKey(one))
+  })
+
+  it('重名冲突报错，不覆盖', () => {
+    const r = renameCursorPreset([one, two], '默认', '红色')
+    expect(r.renamed).toBeUndefined()
+    expect(r.error).toContain('已经有名为「红色」')
+    expect(r.list).toHaveLength(2)
+  })
+
+  it('找不到原名时报错', () => {
+    const r = renameCursorPreset([one], '不存在', 'x')
+    expect(r.error).toContain('没有名为')
   })
 })

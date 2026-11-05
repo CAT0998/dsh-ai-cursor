@@ -202,6 +202,31 @@ try {
         secondCursorArgs.includes('--no-panel'),
         secondCursorArgs.trim().slice(0, 120))
 
+  // ---- T7：预设重命名（宿主侧工具） ----
+  const renamed = await call('ai_mouse_preset', { action: 'rename', from: '自定义1', to: '蓝色小鼠' })
+  const afterRename = (await exists(join(assets, 'cursor-presets.json')))
+    ? await readJson(join(assets, 'cursor-presets.json'))
+    : []
+  check(
+    'E17 预设重命名：改名字、保留设置',
+    /改名为/.test(renamed) &&
+      afterRename.some((p2) => p2.name === '蓝色小鼠' && p2.color === '#00AAFF') &&
+      !afterRename.some((p2) => p2.name === '自定义1'),
+    `${renamed.slice(0, 40)} / ${JSON.stringify(afterRename.map((p2) => p2.name))}`,
+  )
+  // make sure a second preset exists, otherwise "rename to 默认" is a legal rename and
+  // there is nothing to clash with
+  await sendMailbox({ action: 'cursor_preset_save', target: 'default', index: 0 })
+  await sleep(800)
+  const two = await readJson(join(assets, 'cursor-presets.json'))
+  const clash = await call('ai_mouse_preset', { action: 'rename', from: '蓝色小鼠', to: '默认' })
+  const afterClash = await readJson(join(assets, 'cursor-presets.json'))
+  check(
+    'E18 重名冲突不覆盖（报错并保持两条）',
+    two.length === 2 && /已经有名为/.test(clash) && afterClash.length === 2,
+    `${JSON.stringify(two.map((p2) => p2.name))} / ${clash.slice(0, 40)} / ${JSON.stringify(afterClash.map((p2) => p2.name))}`,
+  )
+
   await call('ai_mouse_cursor', { action: 'use', name: 'default' }).catch(() => '')
   void created
 } catch (error) {

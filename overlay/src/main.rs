@@ -1251,6 +1251,13 @@ struct ResizeDrag {
     rect: (i32, i32, i32, i32),
 }
 
+/// Which scroll bar a drag is on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ScrollBar {
+    Vertical,
+    Horizontal,
+}
+
 #[derive(Clone)]
 struct St {
     // --- cursor window ---
@@ -1279,6 +1286,14 @@ struct St {
     want_hide: bool,
     capture_visible: bool,
     want_affinity: Option<bool>,
+    /// Performance mode (`performance {on:true}`): nothing is drawn at all unless a
+    /// `render_once` window is open. See `render_allowed`.
+    perf_mode: bool,
+    /// Deadline of the current one-shot render window (`render_once`); `None` = closed.
+    render_until: Option<Instant>,
+    /// Set by the window thread once a `render_once` request has actually painted,
+    /// so the reply can promise "it is on screen now" before a screenshot is taken.
+    render_ack: bool,
 
     // --- panel window ---
     panel_hwnd: isize,
@@ -1301,6 +1316,9 @@ struct St {
     drag_wheel: bool,
     /// An edge drag in progress (resize). See `ResizeDrag`.
     resize: Option<ResizeDrag>,
+    /// A scrollbar thumb being dragged: which bar, and where inside the thumb the
+    /// press landed (so the thumb stays under the pointer instead of jumping).
+    scroll_drag: Option<(ScrollBar, i32)>,
 
     // --- permission ---
     permission: u8,
@@ -1413,6 +1431,19 @@ struct St {
     dump_error: Option<String>,
 }
 
+/// Is the cursor allowed to be on screen right now?
+///
+/// Performance mode draws **nothing** — not a frame, not an animation tick — except
+/// inside a `render_once` window: the agent asks for exactly the moment it is about
+/// to take a screenshot, and everything else must cost nothing. Outside the mode
+/// this is always true, so every existing caller behaves as before.
+fn render_allowed(st: &St, now: Instant) -> bool {
+    if !st.perf_mode {
+        return true;
+    }
+    matches!(st.render_until, Some(t) if now < t)
+}
+
 impl St {
     fn new() -> Self {
         let now = Instant::now();
@@ -1442,6 +1473,9 @@ impl St {
             want_hide: false,
             capture_visible: false,
             want_affinity: None,
+            perf_mode: false,
+            render_until: None,
+            render_ack: false,
             panel_hwnd: 0,
             panel_shown: INIT_PANEL.load(std::sync::atomic::Ordering::Relaxed),
             panel_full: true,
@@ -1459,6 +1493,7 @@ impl St {
             drag_panel: None,
             drag_wheel: false,
             resize: None,
+            scroll_drag: None,
             permission: 3,
             prev_permission: 3,
             slots: [Slot::new(SLOT_CURSOR), Slot::new(SLOT_HINT), Slot::new(SLOT_ORNAMENT)],
@@ -1588,14 +1623,16 @@ fn panel_layout(v: &PanelView) -> Vec<Hit> {
     );
     o.push(Hit::new(rect(pad, 40, right, 41), Kind::Sep, "sep1"));
 
-    // ---- content (fixed design width, both scroll offsets) ----
+    // ---- content (fluid: laid out at the CONTENT width, both scroll offsets) ----
     // The section stack is laid out from an offset y: scrolling is therefore a
     // single number that moves the paint AND every hit box together, which is why
-    // no second coordinate space is needed anywhere.
+    // no second coordinate space is needed anywhere. The width comes from
+    // `v.content_w` (the window width, floored at the design width), never from a
+    // constant, so every row and every separator re-flows with the window.
     let content = o.len();
     let bottom = sections::build(v, 48 - v.scroll, &mut o);
 
-    let cr = PW - pad;
+    let cr = v.content_w - pad;
     o.push(Hit::new(rect(pad, bottom, cr, bottom + 1), Kind::Sep, "sep5"));
     let perm_name = match v.permission {
         0 => "停止",
@@ -2296,51 +2333,34 @@ impl Canvas {
 
 // -------------------------------------------------------------- panel paint ---
 
-/// The two scroll bars: chrome, never clickable.
+/// The two scroll bars: chrome, and draggable.
 ///
 /// They are the visible proof that the panel scrolls — without them a user cannot
-/// tell whether the menu simply ends or there is more beyond the edge.
+/// tell whether the menu simply ends or there is more beyond the edge — and the thumb
+/// is the handle: `panel_proc` turns a press on it into a scroll offset.
 ///
-/// The VERTICAL bar hugs the right edge of the content viewport (that is what it
-/// scrolls, and it stays beside the 452-wide column when the window is wider). The
-/// HORIZONTAL bar only exists when the window is narrower than the design width: the
-/// content column is fixed, so "window too narrow" is the only sideways case there is.
+/// The rectangles are **not** recomputed here: they come from `PanelGeom` (via
+/// `v.bars`), which is also what the hit test and the drag maths use. A bar that is
+/// painted somewhere else than it is grabbed is impossible by construction.
+///
+/// The VERTICAL bar hugs the WINDOW's right edge (it used to sit out at the 452 design
+/// width, which is exactly the defect the user reported after widening the window).
+/// The HORIZONTAL bar only exists when the window is narrower than the content floor.
 unsafe fn draw_scroll_bars(cv: &Canvas, v: &PanelView) {
     if !v.full {
         return;
     }
-    let h = v.panel_h;
-    let hbar = v.max_hscroll() > 0;
-    let top = widget::HEADER_BOTTOM + 4;
-    let vmax = (v.content_h - v.view_h).max(0);
-    if vmax > 0 {
-        let bottom = h - 6 - if hbar { 8 } else { 0 };
-        let track_h = bottom - top;
-        if track_h >= 12 && v.view_w > 16 {
-            let x1 = v.view_w - 4;
-            let x0 = v.view_w - 7;
-            cv.fill_round(rect(x0, top, x1, bottom), 1, C_TRACK);
-            let ratio = (v.view_h as f64 / v.content_h.max(1) as f64).clamp(0.05, 1.0);
-            let thumb_h = ((track_h as f64 * ratio).round() as i32).clamp(24, track_h);
-            let frac = (v.scroll as f64 / vmax as f64).clamp(0.0, 1.0);
-            let ty = top + ((track_h - thumb_h) as f64 * frac).round() as i32;
-            cv.fill_round(rect(x0, ty, x1, ty + thumb_h), 1, C_MUTED);
-        }
+    if let Some(t) = v.bars.v_track {
+        cv.fill_round(t, 1, C_TRACK);
     }
-    let hmax = v.max_hscroll();
-    if hmax > 0 {
-        let y0 = h - 7;
-        let y1 = h - 4;
-        let right = v.view_w - 4;
-        let track_w = right - 4;
-        if track_w >= 24 {
-            cv.fill_round(rect(4, y0, right, y1), 1, C_TRACK);
-            let ratio = (v.view_w as f64 / PW as f64).clamp(0.05, 1.0);
-            let thumb_w = ((track_w as f64 * ratio).round() as i32).clamp(24, track_w);
-            let frac = (v.hscroll as f64 / hmax as f64).clamp(0.0, 1.0);
-            let tx = 4 + ((track_w - thumb_w) as f64 * frac).round() as i32;
-            cv.fill_round(rect(tx, y0, tx + thumb_w, y1), 1, C_MUTED);
-        }
+    if let Some(t) = v.bars.v_thumb {
+        cv.fill_round(t, 1, C_MUTED);
+    }
+    if let Some(t) = v.bars.h_track {
+        cv.fill_round(t, 1, C_TRACK);
+    }
+    if let Some(t) = v.bars.h_thumb {
+        cv.fill_round(t, 1, C_MUTED);
     }
 }
 
@@ -2414,7 +2434,6 @@ unsafe fn draw_panel(cv: &Canvas, v: &PanelView, hits: &[Hit], h: i32) {
 
     // ---- 5. present: canvas and window are the same size, so compose cannot scale
     // (it samples by index with a stride fixed to the canvas width — LESSONS §4) ----
-    logline!("TRACE", "draw_panel {}x{} content_h={} view_w={} hscroll={}", v.panel_w, h, v.content_h, v.view_w, v.hscroll);
     cv.compose(v.panel_w, h, 0.98);
     draw_previews(cv, v, hits);
     cv.blit(state().lock().unwrap().panel_hwnd, v.panel_w, h, None);
@@ -2738,6 +2757,8 @@ fn view_of(st: &St) -> PanelView {
         panel_w: st.panel_w,
         panel_h: 0,
         view_w: 0,
+        content_w: content_width(st.panel_w),
+        bars: widget::ScrollBars::default(),
         hscroll: st.hscroll,
         columns: st.columns.clone(),
         columns_collapsed: st.columns_collapsed,
@@ -2768,8 +2789,17 @@ fn view_of(st: &St) -> PanelView {
     v.panel_w = g.w;
     v.panel_h = if v.full { g.h } else { CHIP_H };
     v.view_w = g.view_w;
+    v.content_w = g.content_w;
+    // A collapsed panel has no scroll viewport at all: exposing bar rects there would
+    // make a click on the chip land on an invisible scrollbar.
+    v.bars = if v.full { g.bars } else { widget::ScrollBars::default() };
     v.view_h = g.h;
     v.hscroll = g.hscroll;
+    // The width feeds back into the layout (fluid rows), so if clamping the window
+    // changed it, the height has to be measured again on the final column.
+    if content_width(g.w) != content_width(st.panel_w) {
+        v.content_h = panel_content_h(&v);
+    }
     // The layout runs on the CLAMPED offsets, so an out-of-range scroll can never
     // paint/hit-test a widget that should be out of reach.
     v.scroll = g.vscroll;
@@ -2834,14 +2864,83 @@ pub struct PanelGeom {
     pub y: i32,
     pub w: i32,
     pub h: i32,
-    /// Content viewport width: `min(w, PW)`. The content itself never widens.
+    /// Content viewport width: `min(w, content_w)`. Only smaller than the window when
+    /// the window is below the design floor, i.e. when there is something to scroll.
     pub view_w: i32,
+    /// Width the sections lay themselves out at (`max(PW, w)`): the fluid column.
+    pub content_w: i32,
     pub content_h: i32,
     /// Horizontal / vertical scroll offsets (already clamped) and their maxima.
     pub hscroll: i32,
     pub hmax: i32,
     pub vscroll: i32,
     pub vmax: i32,
+    /// The two scroll bars, including their thumbs (see `widget::ScrollBars`).
+    pub bars: widget::ScrollBars,
+}
+
+/// **Content floor.** The sections lay out at the window width, but never below this:
+/// squeezing the buttons and sliders under 452 px would break them, so a narrower
+/// window scrolls sideways instead.
+fn content_width(panel_w: i32) -> i32 {
+    panel_w.max(PW)
+}
+
+/// Scroll-bar metrics, in panel px.
+///
+/// The bars sit INSIDE the opaque resize frame, 3 px wide with a 1 px breathing gap, so
+/// they are visibly attached to the window edge and never inside a resize hot zone.
+const BAR_THICK: i32 = 3;
+/// Distance from the window edge to the bar's outer edge.
+const BAR_INSET: i32 = 7;
+
+/// Rect of the vertical bar's track, and of its thumb.
+///
+/// The x is derived from the WINDOW width (`w`), not from the design width: that is
+/// the defect the user hit — after widening the window the bar stayed out at 452.
+fn vbar_rects(w: i32, h: i32, scroll: i32, vmax: i32, hbar: bool) -> (Option<RECT>, Option<RECT>) {
+    if vmax <= 0 {
+        return (None, None);
+    }
+    let x1 = w - BAR_INSET;
+    let x0 = x1 - BAR_THICK;
+    let y0 = widget::HEADER_BOTTOM + 4;
+    let y1 = h - BAR_INSET - if hbar { BAR_THICK + 4 } else { 0 };
+    let track_h = y1 - y0;
+    if x0 < 1 || track_h < 12 {
+        return (None, None);
+    }
+    let track = rect(x0, y0, x1, y1);
+    // The thumb is proportional to how much of the content is visible. Its height
+    // never scales with the window, only with the content/view ratio (that is rolling,
+    // not zooming).
+    let ratio = (h as f64 / (h + vmax) as f64).clamp(0.06, 1.0);
+    let thumb_h = ((track_h as f64 * ratio).round() as i32).clamp(24, track_h);
+    let frac = (scroll as f64 / vmax as f64).clamp(0.0, 1.0);
+    let ty = y0 + ((track_h - thumb_h) as f64 * frac).round() as i32;
+    (Some(track), Some(rect(x0, ty, x1, ty + thumb_h)))
+}
+
+/// Rect of the horizontal bar's track, and of its thumb. Only when hmax > 0.
+fn hbar_rects(w: i32, h: i32, view_w: i32, content_w: i32, hscroll: i32, hmax: i32) -> (Option<RECT>, Option<RECT>) {
+    if hmax <= 0 {
+        return (None, None);
+    }
+    let y1 = h - BAR_INSET;
+    let y0 = y1 - BAR_THICK;
+    let x0 = 4;
+    // leave the vertical bar's column free so the two never overlap
+    let x1 = w - BAR_INSET - BAR_THICK - 4;
+    let track_w = x1 - x0;
+    if y0 < 1 || track_w < 16 {
+        return (None, None);
+    }
+    let track = rect(x0, y0, x1, y1);
+    let ratio = (view_w as f64 / content_w.max(1) as f64).clamp(0.06, 1.0);
+    let thumb_w = ((track_w as f64 * ratio).round() as i32).clamp(24, track_w);
+    let frac = (hscroll as f64 / hmax as f64).clamp(0.0, 1.0);
+    let tx = x0 + ((track_w - thumb_w) as f64 * frac).round() as i32;
+    (Some(track), Some(rect(tx, y0, tx + thumb_w, y1)))
 }
 
 /// Automatic window height: the content, capped by the monitor's WORK area (taskbar
@@ -2862,12 +2961,29 @@ fn panel_geom(st: &St, content_h: i32) -> PanelGeom {
     };
     let x = rect_x_clamp_in(st.panel_pos.0, w, wx, ww);
     let y = rect_y_clamp_in(st.panel_pos.1, h, wy, wh);
-    let view_w = w.min(PW);
-    let hmax = (PW - view_w).max(0);
+    // Fluid: the content column follows the window; the design width is only the floor.
+    let content_w = content_width(w);
+    let view_w = w.min(content_w);
+    let hmax = (content_w - view_w).max(0);
     let hscroll = st.hscroll.clamp(0, hmax);
     let vmax = (content_h - h).max(0);
     let vscroll = st.scroll.clamp(0, vmax);
-    PanelGeom { x, y, w, h, view_w, content_h, hscroll, hmax, vscroll, vmax }
+    let (v_track, v_thumb) = vbar_rects(w, h, vscroll, vmax, hmax > 0);
+    let (h_track, h_thumb) = hbar_rects(w, h, view_w, content_w, hscroll, hmax);
+    PanelGeom {
+        x,
+        y,
+        w,
+        h,
+        view_w,
+        content_w,
+        content_h,
+        hscroll,
+        hmax,
+        vscroll,
+        vmax,
+        bars: widget::ScrollBars { v_track, v_thumb, h_track, h_thumb },
+    }
 }
 
 /// Design height the whole section stack needs, unscrolled.
@@ -3811,6 +3927,33 @@ unsafe fn set_resize_cursor(edge: u32) {
     }
 }
 
+/// The rectangle a scrollbar is GRABBED in.
+///
+/// The painted bar is `BAR_THICK` px wide, which is a fine look and a terrible target.
+/// The grab area is therefore padded on the content side only — padding towards the
+/// window edge would steal from the resize frame band, and then dragging the border
+/// would sometimes scroll instead of resizing.
+fn bar_grab_rect(r: RECT, vertical: bool) -> RECT {
+    const GRAB_PAD: i32 = 4;
+    if vertical {
+        rect(r.left - GRAB_PAD, r.top, r.right, r.bottom)
+    } else {
+        rect(r.left, r.top - GRAB_PAD, r.right, r.bottom)
+    }
+}
+
+/// Map a pointer position on a scrollbar to a scroll offset.
+///
+/// `grab` is where inside the thumb the press landed: keeping that point under the
+/// pointer is what makes a thumb feel *grabbed* rather than teleported. The result is
+/// clamped by the caller against the bar's max.
+fn bar_scroll_from(pointer: i32, track: (i32, i32), thumb_len: i32, max: i32, grab: i32) -> i32 {
+    let (a, b) = track;
+    let span = (b - a - thumb_len).max(1);
+    let frac = ((pointer - grab - a) as f64 / span as f64).clamp(0.0, 1.0);
+    (frac * max as f64).round() as i32
+}
+
 /// One resize step: the new window rect for a pointer at (cx, cy).
 ///
 /// Deltas are measured against the rect captured when the drag STARTED, never against
@@ -3935,6 +4078,62 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
             let (x, y) = client_xy(lparam);
             let s = state();
             let mut st = s.lock().unwrap();
+            if let Some((which, grab)) = st.scroll_drag {
+                let pv = view_of(&st);
+                let mut p = POINT::default();
+                let _ = GetCursorPos(&mut p);
+                // The pointer has to be expressed INSIDE the window; take the window
+                // rect from the OS so a drag that started before a resize cannot be
+                // measured against a stale origin.
+                let (wx, wy, _, _) = window_rect_of(hwnd);
+                let (cx, cy) = (p.x - wx, p.y - wy);
+                let mut changed = false;
+                match which {
+                    ScrollBar::Vertical => {
+                        if let (Some(track), Some(thumb)) = (pv.bars.v_track, pv.bars.v_thumb) {
+                            let want = bar_scroll_from(
+                                cy,
+                                (track.top, track.bottom),
+                                thumb.bottom - thumb.top,
+                                pv.vmax(),
+                                grab,
+                            );
+                            let want = want.clamp(0, pv.vmax());
+                            if want != st.scroll {
+                                st.scroll = want;
+                                changed = true;
+                            }
+                        }
+                    }
+                    ScrollBar::Horizontal => {
+                        if let (Some(track), Some(thumb)) = (pv.bars.h_track, pv.bars.h_thumb) {
+                            let want = bar_scroll_from(
+                                cx,
+                                (track.left, track.right),
+                                thumb.right - thumb.left,
+                                pv.max_hscroll(),
+                                grab,
+                            );
+                            let want = want.clamp(0, pv.max_hscroll());
+                            if want != st.hscroll {
+                                st.hscroll = want;
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+                if changed {
+                    st.panel_dirty = true;
+                    logline!(
+                        "INFO",
+                        "panel bar drag {:?} -> scroll={} hscroll={}",
+                        which,
+                        st.scroll,
+                        st.hscroll
+                    );
+                }
+                return LRESULT(0);
+            }
             if let Some(d) = st.resize {
                 let mut p = POINT::default();
                 let _ = GetCursorPos(&mut p);
@@ -4004,10 +4203,68 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
             let (x, y) = client_xy(lparam);
             let s = state();
             let mut st = s.lock().unwrap();
-            // The frame wins over the widgets: a click on the border resizes, exactly
+            let pv = view_of(&st);
+            // 1) Scroll bars first: they are chrome sitting inside the frame band, and a
+            // press must scroll rather than start a resize or hit a widget behind them.
+            {
+                let mut started: Option<(ScrollBar, i32)> = None;
+                if let (Some(track), Some(thumb)) = (pv.bars.v_track, pv.bars.v_thumb) {
+                    let grab = bar_grab_rect(track, true);
+                    if x >= grab.left && x < grab.right && y >= grab.top && y < grab.bottom {
+                        let grab = if y >= thumb.top && y < thumb.bottom {
+                            y - thumb.top
+                        } else {
+                            // pressed the track: centre the thumb on the pointer
+                            let half = (thumb.bottom - thumb.top) / 2;
+                            let want = bar_scroll_from(
+                                y,
+                                (track.top, track.bottom),
+                                thumb.bottom - thumb.top,
+                                pv.vmax(),
+                                half,
+                            );
+                            st.scroll = want.clamp(0, pv.vmax());
+                            st.panel_dirty = true;
+                            half
+                        };
+                        started = Some((ScrollBar::Vertical, grab));
+                    }
+                }
+                if started.is_none() {
+                    if let (Some(track), Some(thumb)) = (pv.bars.h_track, pv.bars.h_thumb) {
+                        let grab = bar_grab_rect(track, false);
+                        if x >= grab.left && x < grab.right && y >= grab.top && y < grab.bottom {
+                            let grab = if x >= thumb.left && x < thumb.right {
+                                x - thumb.left
+                            } else {
+                                let half = (thumb.right - thumb.left) / 2;
+                                let want = bar_scroll_from(
+                                    x,
+                                    (track.left, track.right),
+                                    thumb.right - thumb.left,
+                                    pv.max_hscroll(),
+                                    half,
+                                );
+                                st.hscroll = want.clamp(0, pv.max_hscroll());
+                                st.panel_dirty = true;
+                                half
+                            };
+                            started = Some((ScrollBar::Horizontal, grab));
+                        }
+                    }
+                }
+                if let Some(d) = started {
+                    st.scroll_drag = Some(d);
+                    st.hover.clear();
+                    drop(st);
+                    let _ = SetCapture(hwnd);
+                    logline!("INFO", "panel bar drag start {:?} at ({x},{y})", d);
+                    return LRESULT(0);
+                }
+            }
+            // 2) The frame wins over the widgets: a click on the border resizes, exactly
             // like a normal window, and never lands on a control that happens to sit
             // under the border strip.
-            let pv = view_of(&st);
             let edge = if pv.full { resize_edge_at(x, y, pv.panel_w, pv.panel_h) } else { 0 };
             if edge != 0 {
                 let mut p = POINT::default();
@@ -4086,6 +4343,9 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                 st.drag_panel = None;
                 st.drag_wheel = false;
                 if st.resize.take().is_some() {
+                    st.panel_dirty = true;
+                }
+                if st.scroll_drag.take().is_some() {
                     st.panel_dirty = true;
                 }
                 st.panel_dirty = true;
@@ -5065,6 +5325,44 @@ fn handle_line(line: &str) {
                 st.idle_ms = ms;
             }
         }
+        "performance" => {
+            // 性能模式：默认什么都不画，只有 render_once 那一小段时间才出现。
+            // Turning it on also takes the cursor off screen immediately: the point of
+            // the mode is that an idle overlay paints nothing at all.
+            let on = v.get("on").and_then(|b| b.as_bool()).unwrap_or(true);
+            st.perf_mode = on;
+            st.render_until = None;
+            if on {
+                st.visible = false;
+                st.want_show = false;
+                st.want_hide = true;
+                st.dirty = false;
+            } else {
+                st.dirty = true;
+            }
+            st.panel_dirty = true;
+            out["performance"] = serde_json::json!(on);
+        }
+        "render_once" => {
+            // One frame on screen for `ms`: shows the cursor AND draws it, so a
+            // screenshot taken right after this call actually contains it.
+            // Repeatable: every call re-shows and re-times the window.
+            let ms = v
+                .get("ms")
+                .and_then(|m| m.as_u64())
+                .unwrap_or(800)
+                .clamp(120, 30_000);
+            let now = Instant::now();
+            st.render_until = Some(now + Duration::from_millis(ms));
+            st.visible = true;
+            st.want_show = true;
+            st.want_hide = false;
+            st.dirty = true;
+            st.last_activity = now;
+            st.render_ack = false;
+            st.panel_dirty = true;
+            out["ms"] = serde_json::json!(ms);
+        }
         "theme" => {
             if let Some(t) = v.get("theme").and_then(|t| t.as_str()) {
                 if matches!(t, "whale" | "dot" | "arrow") {
@@ -5142,6 +5440,21 @@ fn handle_line(line: &str) {
         st = state().lock().unwrap();
     }
 
+    if cmd == "render_once" {
+        // `ok` has to mean "it is on screen now": the caller takes its screenshot as
+        // soon as this returns, so replying from the reader thread before the window
+        // thread has painted would hand back a picture without the cursor.
+        drop(st);
+        for _ in 0..200 {
+            if state().lock().unwrap().render_ack {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        st = state().lock().unwrap();
+        out["rendered"] = serde_json::json!(st.render_ack);
+    }
+
     out["visible"] = serde_json::json!(st.visible);
     if cmd == "dump" {
         out["dump_error"] = serde_json::json!(st.dump_error);
@@ -5174,12 +5487,26 @@ fn handle_line(line: &str) {
         out["panel_content_h"] = serde_json::json!(pv.content_h);
         out["panel_view_h"] = serde_json::json!(pv.view_h);
         // The window itself, and the sideways scroll that only exists when it is
-        // narrower than the 452-wide content column.
+        // narrower than the content floor.
         out["panel_w"] = serde_json::json!(pv.panel_w);
         out["panel_h"] = serde_json::json!(pv.panel_h);
         out["panel_view_w"] = serde_json::json!(pv.view_w);
+        // The column the sections are laid out at: equal to the window width unless
+        // the window is below the design floor (then it stays 452 and scrolls).
+        out["panel_content_w"] = serde_json::json!(pv.content_w);
         out["panel_hscroll"] = serde_json::json!(st.hscroll);
         out["panel_hscroll_max"] = serde_json::json!(pv.max_hscroll());
+        // The scroll bars' own rects, so a test can grab the thumb by geometry
+        // instead of guessing pixels — and so "the bar follows the window edge" is an
+        // assertion, not an eyeball.
+        let r4 = |r: Option<RECT>| {
+            r.map(|r| serde_json::json!([r.left, r.top, r.right - r.left, r.bottom - r.top]))
+                .unwrap_or(serde_json::Value::Null)
+        };
+        out["panel_vbar"] = r4(pv.bars.v_track);
+        out["panel_vthumb"] = r4(pv.bars.v_thumb);
+        out["panel_hbar"] = r4(pv.bars.h_track);
+        out["panel_hthumb"] = r4(pv.bars.h_thumb);
     }
     // The redesign's state, reported so a test can assert it instead of peeking at
     // pixels: menu accent (panel chrome) vs the cursor's own colour/size.
@@ -5192,6 +5519,13 @@ fn handle_line(line: &str) {
     out["sel_index"] = serde_json::json!(st.sel_index);
     out["sel_total"] = serde_json::json!(st.sel_total);
     out["layer"] = serde_json::json!(st.layer_mode);
+    // Performance mode: whether it is on, and how much of the current one-shot render
+    // window is left (0 = nothing is being drawn).
+    out["performance"] = serde_json::json!(st.perf_mode);
+    out["render_left_ms"] = serde_json::json!(st
+        .render_until
+        .map(|t| t.saturating_duration_since(Instant::now()).as_millis() as u64)
+        .unwrap_or(0));
     out["layer_hwnd"] = serde_json::json!(format!("0x{:X}", st.layer_hwnd));
     out["layer_title"] = serde_json::json!(st.layer_title);
     out["map_zoom"] = serde_json::json!(st.map_zoom);
@@ -5739,10 +6073,33 @@ fn main() {
                 (s.hwnd, s.panel_hwnd)
             };
 
+            // --- performance mode: what is allowed on screen right now ------------
+            // With `performance` on, the cursor exists only inside a `render_once`
+            // window. When the window closes it is hidden again, so nothing is left
+            // behind and nothing keeps painting; a plain `show` cannot bring it back
+            // while the mode is on — that is the whole point of the mode.
+            let allow = {
+                let mut s = st.lock().unwrap();
+                if s.perf_mode && matches!(s.render_until, Some(t) if now >= t) {
+                    s.render_until = None;
+                    s.visible = false;
+                    s.want_hide = true;
+                    logline!("INFO", "render_once window closed -> hidden again");
+                }
+                let allow = render_allowed(&s, now);
+                if !allow {
+                    // Nothing may be painted: drop any pending frame instead of
+                    // re-trying it every iteration (that would keep the loop awake).
+                    s.dirty = false;
+                }
+                allow
+            };
             if do_hide {
                 let _ = ShowWindow(hwnd_of(ohwnd), SW_HIDE);
             }
-            if do_show {
+            if do_show && allow {
+                // SW_SHOWNOACTIVATE + WS_EX_NOACTIVATE: showing the cursor must never
+                // take the focus from whatever the human or the agent is doing.
                 let _ = ShowWindow(hwnd_of(ohwnd), SW_SHOWNOACTIVATE);
             }
 
@@ -5802,7 +6159,9 @@ fn main() {
             {
                 let (gh, show, x, y) = {
                     let s = st.lock().unwrap();
-                    let show = s.drag_enabled && s.visible && !s.want_hide_grab;
+                    // In performance mode there is no cursor to grab while nothing is
+                    // drawn, so the click-catcher hotspot stays away too.
+                    let show = s.drag_enabled && s.visible && !s.want_hide_grab && !s.perf_mode;
                     (s.grab_hwnd, show, s.cur.0 as i32, s.cur.1 as i32)
                 };
                 if gh != 0 {
@@ -6071,7 +6430,7 @@ fn main() {
             }
             let (draw_cursor_now, cvv) = {
                 let mut s = st.lock().unwrap();
-                if s.visible && s.dirty {
+                if s.visible && s.dirty && render_allowed(&s, now) {
                     s.dirty = false;
                     s.frames += 1;
                     (true, cursor_view(&s))
@@ -6081,6 +6440,8 @@ fn main() {
             };
             if draw_cursor_now {
                 draw_cursor(&cursor_cv, &cvv);
+                // The promise `render_once` makes: this frame has been painted.
+                st.lock().unwrap().render_ack = true;
             }
 
             let (draw_panel_now, pv) = {
@@ -6118,7 +6479,15 @@ fn main() {
                 }
             }
 
-            std::thread::sleep(Duration::from_millis(8));
+            // Performance mode with nothing on screen: sleep instead of running the
+            // animation loop. 50 ms is the worst case the next `render_once` / `show`
+            // waits to appear, and it removes ~6/7 of the idle wake-ups; the frame
+            // rate is untouched whenever there is something to paint.
+            let idle = {
+                let s = st.lock().unwrap();
+                s.perf_mode && s.render_until.is_none() && !s.panel_shown && !s.dirty
+            };
+            std::thread::sleep(Duration::from_millis(if idle { 50 } else { 8 }));
         }
 
         let (ohwnd, phwnd) = {

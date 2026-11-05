@@ -9,6 +9,7 @@ import {
   loadPresets,
   presetCommands,
   removePreset,
+  renamePreset,
   savePresets,
   upsertPreset,
   type Preset,
@@ -126,5 +127,43 @@ describe('describePreset', () => {
   it('lists the set fields and marks an empty preset', () => {
     expect(describePreset({ name: 'e' })).toContain('空')
     expect(describePreset({ name: 'n', theme: 'dot', opacity: 0.5 })).toMatch(/theme=dot/)
+  })
+})
+
+describe('renamePreset（T7：预设重命名）', () => {
+  const a: Preset = { name: '默认', theme: 'whale', color: '#4FC3F7' }
+  const b: Preset = { name: '红色', theme: 'dot', color: '#FF0044' }
+
+  it('renames in place and keeps every other field', () => {
+    const r = renamePreset([a, b], '默认', '蓝色')
+    expect(r.error).toBeUndefined()
+    expect(r.renamed?.name).toBe('蓝色')
+    expect(r.list.map((p) => p.name).sort()).toEqual(['红色', '蓝色'].sort())
+    const moved = r.list.find((p) => p.name === '蓝色')
+    expect(moved?.theme).toBe('whale')
+    expect(moved?.color).toBe('#4FC3F7')
+  })
+
+  it('never overwrites an existing name — that would silently destroy a look', () => {
+    const r = renamePreset([a, b], '默认', '红色')
+    expect(r.renamed).toBeUndefined()
+    expect(r.error).toContain('已经有名为「红色」')
+    expect(r.list).toHaveLength(2)
+  })
+
+  it('is case-insensitive on both sides, and a same-name rename is a no-op', () => {
+    const r = renamePreset([a], ' 默认 ', '默认')
+    expect(r.error).toBeUndefined()
+    expect(r.list).toHaveLength(1)
+    const upper = renamePreset([{ ...a, name: 'Default' }], 'default', 'DEFAULT')
+    expect(upper.renamed?.name).toBe('DEFAULT')
+    expect(upper.list).toHaveLength(1)
+  })
+
+  it('reports a missing source instead of inventing one', () => {
+    const r = renamePreset([a], '没有这个', '新名字')
+    expect(r.renamed).toBeUndefined()
+    expect(r.error).toContain('没有名为')
+    expect(r.list).toHaveLength(1)
   })
 })

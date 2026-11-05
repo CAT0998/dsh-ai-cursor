@@ -99,23 +99,26 @@ pub fn is_collapsed(v: &PanelView, key: &str) -> bool {
     v.collapsed.iter().any(|k| k == key)
 }
 
-/// Everything the layout needs: design units only.
+/// Everything the layout needs: the content width plus the fixed design metrics.
 ///
 /// Rectangles must never be written as bare constants again: they come from here,
 /// so a widget's padding, row height and right edge have exactly one definition and
 /// the hit test (which consumes the same rects) always matches what is drawn.
 ///
-/// There is deliberately **no scale factor**: the panel content is authored at its
-/// design width (`crate::PW` = 452) and stays there. Resizing the window changes how
-/// much of it is visible (and how much empty margin sits on the right), never its
-/// size — that is the difference between "window zoom" and "menu zoom", and the
-/// latter was removed on purpose (docs/TASKS.md, decision table).
+/// **Fluid, not scaled** (2026-11-05, the user overturned "fixed 452 + right margin"):
+/// the content column is as wide as the window, so `content_right(v)` moves with it and
+/// every row re-flows. Nothing here multiplies a font size, a row height or a control
+/// height — that "zoom everything" implementation is exactly what the user rejected,
+/// and `PW` is now only the **floor**: a window narrower than it scrolls sideways
+/// instead of squeezing the controls below their design size.
 #[derive(Clone, Copy, Debug)]
-pub struct Layout;
+pub struct Layout {
+    pub content_w: i32,
+}
 
 impl Layout {
-    pub fn new() -> Layout {
-        Layout
+    pub fn new(content_w: i32) -> Layout {
+        Layout { content_w }
     }
     pub fn pad(&self) -> i32 {
         PAD
@@ -130,7 +133,7 @@ impl Layout {
         34
     }
     pub fn content_right(&self) -> i32 {
-        content_right()
+        self.content_w - PAD
     }
     pub fn button_row(&self, y: i32, n: i32) -> (i32, i32) {
         let total = self.content_right() - self.pad();
@@ -143,12 +146,30 @@ fn hov(v: &PanelView, id: &str) -> bool {
     v.hover == id
 }
 
-fn content_right() -> i32 {
-    crate::PW - PAD
+/// Right edge of the content column **for this window**: the whole point of the fluid
+/// layout. `PW` is only the minimum the content is ever laid out at.
+fn content_right(v: &PanelView) -> i32 {
+    v.content_w - PAD
 }
 
-fn col_w() -> i32 {
-    (content_right() - PAD - 3 * 8) / 4
+fn col_w(v: &PanelView) -> i32 {
+    (content_right(v) - PAD - 3 * 8) / 4
+}
+
+/// Left edge of the i-th item of a row distributed evenly over `[PAD, right)`.
+///
+/// `right` is passed in rather than always being `content_right()` because a row
+/// often ends with a right-aligned value label (the colour hex) that the items must
+/// not run into: reserving the tail is what keeps the grid tidy at every width.
+fn slot_x_to(i: i32, n: i32, right: i32) -> i32 {
+    let avail = (right - PAD).max(0);
+    PAD + (avail as f64 * i as f64 / n.max(1) as f64).round() as i32
+}
+
+/// Width of one item of an evenly distributed row, minus `gap` between items.
+fn slot_w(v: &PanelView, n: i32, gap: i32) -> i32 {
+    let avail = content_right(v) - PAD;
+    ((avail - gap * (n - 1)) / n.max(1)).max(1)
 }
 
 /// Build the whole section stack starting at `y`. Returns the bottom y.
@@ -171,7 +192,7 @@ fn build_design(v: &PanelView, mut y: i32, out: &mut Vec<Hit>) -> i32 {
         let gap = 6;
         // the fold chip takes a slot at the right end of the strip
         let fold_w = 26;
-        let w = (content_right() - PAD - gap * (n - 1) - fold_w - gap) / n.max(1);
+        let w = (content_right(v) - PAD - gap * (n - 1) - fold_w - gap) / n.max(1);
         for (i, (name, color)) in v.columns.iter().enumerate() {
             let x = PAD + i as i32 * (w + gap);
             out.push(
@@ -211,7 +232,7 @@ fn build_design(v: &PanelView, mut y: i32, out: &mut Vec<Hit>) -> i32 {
         };
         out.push(
             Hit::new(
-                rect(PAD, y, content_right(), y + SECTION_TITLE_H),
+                rect(PAD, y, content_right(v), y + SECTION_TITLE_H),
                 Kind::Section,
                 sec.header,
             )
@@ -223,7 +244,7 @@ fn build_design(v: &PanelView, mut y: i32, out: &mut Vec<Hit>) -> i32 {
             y = (sec.render)(v, PAD, y, out);
             y += 4;
         }
-        out.push(Hit::new(rect(PAD, y, content_right(), y + 1), Kind::Sep, "sec_sep"));
+        out.push(Hit::new(rect(PAD, y, content_right(v), y + 1), Kind::Sep, "sec_sep"));
         y += 7;
     }
     y
@@ -232,7 +253,7 @@ fn build_design(v: &PanelView, mut y: i32, out: &mut Vec<Hit>) -> i32 {
 // ------------------------------------------------------------------ bodies ---
 
 fn body_actions(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
-    let l = Layout::new();
+    let l = Layout::new(v.content_w);
     let acts: [(&'static str, &str, bool); 4] = [
         ("show", "显示", v.visible),
         ("hide", "隐藏", !v.visible),
@@ -323,8 +344,10 @@ fn body_actions(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
 /// `PanelGeom` 里只有一份。
 fn body_menu_theme(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
     // 面板强调色（只影响菜单栏的按钮/滑杆/滚动条）
+    // The eight swatches form an evenly distributed grid (fluid); the circles keep
+    // their design diameter - nothing is scaled.
     for (i, (id, rgb)) in MT_SWATCH_IDS.iter().zip(SWATCHES.iter()).enumerate() {
-        let bx = x + i as i32 * 36;
+        let bx = slot_x_to(i as i32, 8, content_right(v) - 150);
         out.push(
             Hit::new(rect(bx, y, bx + 26, y + 26), Kind::Swatch, id)
                 .text(hex(*rgb))
@@ -333,7 +356,7 @@ fn body_menu_theme(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32
         );
     }
     out.push(
-        Hit::new(rect(x + 268, y + 4, content_right(), y + 22), Kind::LabelRight, "l_mt_hex")
+        Hit::new(rect(content_right(v) - 144, y + 4, content_right(v), y + 22), Kind::LabelRight, "l_mt_hex")
             .text(hex(v.panel_accent)),
     );
     y += 32;
@@ -345,37 +368,36 @@ fn body_menu_theme(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32
         .cloned()
         .unwrap_or_else(|| "未保存".to_string());
     out.push(
-        Hit::new(rect(x, y, content_right(), y + 18), Kind::Label, "l_mt_cur")
+        Hit::new(rect(x, y, content_right(v), y + 18), Kind::Label, "l_mt_cur")
             .text(format!("主题预设 {} 个 · 当前：{}", v.menu_themes.len(), current)),
     );
     y += 22;
     for (i, name) in v.menu_themes.iter().enumerate().take(6) {
         let id = format!("mt_apply_{i}");
         out.push(
-            Hit::new(rect(x, y, content_right(), y + 22), Kind::Button, Box::leak(id.into_boxed_str()))
+            Hit::new(rect(x, y, content_right(v), y + 22), Kind::Button, Box::leak(id.into_boxed_str()))
                 .text(name.clone())
                 .active(v.menu_theme_sel == i)
                 .hover(hov(v, "mt_apply")),
         );
         y += 26;
     }
+    // The three actions share the row evenly, so they widen with the window (fluid),
+    // and their HEIGHT stays 24 px - a control never scales.
+    let w3 = slot_w(v, 3, 8);
+    for (i, (id, text)) in [("mt_save", "保存主题"), ("mt_delete", "删除所选"), ("mt_reset", "恢复默认")]
+        .iter()
+        .enumerate()
+    {
+        let bx = x + i as i32 * (w3 + 8);
+        out.push(
+            Hit::new(rect(bx, y + 2, bx + w3, y + 26), Kind::Button, id)
+                .text(*text)
+                .hover(hov(v, id)),
+        );
+    }
     out.push(
-        Hit::new(rect(x, y + 2, x + 110, y + 26), Kind::Button, "mt_save")
-            .text("保存主题")
-            .hover(hov(v, "mt_save")),
-    );
-    out.push(
-        Hit::new(rect(x + 118, y + 2, x + 228, y + 26), Kind::Button, "mt_delete")
-            .text("删除所选")
-            .hover(hov(v, "mt_delete")),
-    );
-    out.push(
-        Hit::new(rect(x + 236, y + 2, x + 340, y + 26), Kind::Button, "mt_reset")
-            .text("恢复默认")
-            .hover(hov(v, "mt_reset")),
-    );
-    out.push(
-        Hit::new(rect(x, y + 32, content_right(), y + 50), Kind::Label, "l_mt_hint")
+        Hit::new(rect(x, y + 32, content_right(v), y + 50), Kind::Label, "l_mt_hint")
             .text("存 menu-themes.json（宿主写）；相同的主题只留一份"),
     );
     y + 56
@@ -395,8 +417,11 @@ fn body_mouse(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
             .text("\u{2039}")
             .hover(hov(v, "mouse_prev")),
     );
+    // The hint and the arrows are anchored to the RIGHT edge of the content, so the
+    // row stays balanced at any width (ids and heights unchanged).
+    let cr = content_right(v);
     out.push(
-        Hit::new(rect(x + 40, y, x + 300, y + 26), Kind::Label, "mouse_sel")
+        Hit::new(rect(x + 40, y, cr - 140, y + 26), Kind::Label, "mouse_sel")
             .text(format!(
                 "{}（{}/{}）",
                 v.sel_name,
@@ -405,12 +430,12 @@ fn body_mouse(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
             )),
     );
     out.push(
-        Hit::new(rect(x + 306, y, x + 340, y + 26), Kind::Button, "mouse_next")
+        Hit::new(rect(cr - 134, y, cr - 100, y + 26), Kind::Button, "mouse_next")
             .text("\u{203A}")
             .hover(hov(v, "mouse_next")),
     );
     out.push(
-        Hit::new(rect(x + 348, y + 4, content_right(), y + 22), Kind::LabelRight, "l_mouse_swap")
+        Hit::new(rect(cr - 94, y + 4, cr, y + 22), Kind::LabelRight, "l_mouse_swap")
             .text(if v.sel_total > 1 { "左右切换" } else { "只有这一只" }),
     );
     y += 32;
@@ -418,21 +443,24 @@ fn body_mouse(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
     // ---- 造型 + 大小 --------------------------------------------------------
     let themes: [(&'static str, &str, &str); 3] =
         [("theme_whale", "鲸鱼", "whale"), ("theme_dot", "圆点", "dot"), ("theme_arrow", "箭头", "arrow")];
+    // Three chips share the space left of the 大小 label: they widen with the window
+    // while keeping their 26 px height (fluid width, fixed height).
+    let chip_w = (((x + 226 - x) - 2 * 8) / 3).max(40);
     for (i, (id, text, key)) in themes.iter().enumerate() {
-        let bx = x + i as i32 * 74;
+        let bx = x + i as i32 * (chip_w + 8);
         out.push(
-            Hit::new(rect(bx, y, bx + 66, y + 26), Kind::Button, id)
+            Hit::new(rect(bx, y, bx + chip_w, y + 26), Kind::Button, id)
                 .text(*text)
                 .active(v.sel_settings.theme == *key)
                 .hover(hov(v, id)),
         );
     }
     out.push(
-        Hit::new(rect(x + 226, y, content_right(), y + 18), Kind::LabelRight, "l_scale")
+        Hit::new(rect(x + 226, y, content_right(v), y + 18), Kind::LabelRight, "l_scale")
             .text(format!("大小 {}%", (v.sel_settings.scale * 100.0).round() as i32)),
     );
     out.push(
-        Hit::new(rect(x, y + 28, content_right(), y + 46), Kind::Slider, "scale")
+        Hit::new(rect(x, y + 28, content_right(v), y + 46), Kind::Slider, "scale")
             .data(((v.sel_settings.scale - 0.6) / 1.4 * 1000.0).clamp(0.0, 1000.0) as i32)
             .hover(hov(v, "scale")),
     );
@@ -440,7 +468,7 @@ fn body_mouse(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
 
     // ---- 颜色 --------------------------------------------------------------
     for (i, (id, rgb)) in SWATCH_IDS.iter().zip(SWATCHES.iter()).enumerate() {
-        let bx = x + i as i32 * 36;
+        let bx = slot_x_to(i as i32, 8, content_right(v) - 150);
         out.push(
             Hit::new(rect(bx, y, bx + 26, y + 26), Kind::Swatch, id)
                 .text(hex(*rgb))
@@ -449,7 +477,7 @@ fn body_mouse(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
         );
     }
     out.push(
-        Hit::new(rect(x + 268, y + 4, content_right(), y + 22), Kind::LabelRight, "l_hex")
+        Hit::new(rect(content_right(v) - 144, y + 4, content_right(v), y + 22), Kind::LabelRight, "l_hex")
             .text(hex(v.sel_settings.accent)),
     );
     y += 30;
@@ -468,13 +496,13 @@ fn body_mouse(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
                 .data(i as i32),
         );
         out.push(
-            Hit::new(rect(x + 24, y + 2, x + 300, y + 20), Kind::Channel, id)
+            Hit::new(rect(x + 24, y + 2, content_right(v) - 124, y + 20), Kind::Channel, id)
                 .text(format!("{:3}", channels[i]))
                 .hover(hov(v, id))
                 .data(i as i32),
         );
         out.push(
-            Hit::new(rect(x + 308, y + 4, content_right(), y + 22), Kind::LabelRight, id)
+            Hit::new(rect(content_right(v) - 118, y + 4, content_right(v), y + 22), Kind::LabelRight, id)
                 .text(format!("{:3}", channels[i]))
                 .data(i as i32),
         );
@@ -487,15 +515,15 @@ fn body_mouse(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
         Hit::new(rect(x, y + 6, x + d, y + 6 + d), Kind::Wheel, "wheel").hover(hov(v, "wheel")),
     );
     out.push(
-        Hit::new(rect(x + d + 10, y + 12, content_right(), y + 30), Kind::LabelRight, "l_wheel_hex")
+        Hit::new(rect(x + d + 10, y + 12, content_right(v), y + 30), Kind::LabelRight, "l_wheel_hex")
             .text(hex(v.sel_settings.accent)),
     );
     out.push(
-        Hit::new(rect(x + d + 10, y + 36, content_right(), y + 54), Kind::Label, "l_wheel_hint")
+        Hit::new(rect(x + d + 10, y + 36, content_right(v), y + 54), Kind::Label, "l_wheel_hint")
             .text("外环选色相"),
     );
     out.push(
-        Hit::new(rect(x + d + 10, y + 54, content_right(), y + 72), Kind::Label, "l_wheel_hint2")
+        Hit::new(rect(x + d + 10, y + 54, content_right(v), y + 72), Kind::Label, "l_wheel_hint2")
             .text("内块选明度/饱和"),
     );
     y += 6 + d + 8;
@@ -506,12 +534,12 @@ fn body_mouse(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
             .text(format!("透明度 {}%", (v.sel_settings.opacity * 100.0).round() as i32)),
     );
     out.push(
-        Hit::new(rect(x + 62, y + 2, x + 330, y + 20), Kind::Slider, "opacity")
+        Hit::new(rect(x + 62, y + 2, content_right(v) - 124, y + 20), Kind::Slider, "opacity")
             .data(((v.sel_settings.opacity - 0.15) / 0.85 * 1000.0).clamp(0.0, 1000.0) as i32)
             .hover(hov(v, "opacity")),
     );
     out.push(
-        Hit::new(rect(x + 336, y + 4, content_right(), y + 20), Kind::LabelRight, "l_opacity_v")
+        Hit::new(rect(content_right(v) - 118, y + 4, content_right(v), y + 20), Kind::LabelRight, "l_opacity_v")
             .text(format!("{:.0}%", v.sel_settings.opacity * 100.0)),
     );
     y += 30;
@@ -529,7 +557,7 @@ fn body_mouse(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
             .hover(hov(v, "badge_off")),
     );
     out.push(
-        Hit::new(rect(x + 182, y + 4, content_right(), y + 22), Kind::Label, "l_badge_hint")
+        Hit::new(rect(x + 182, y + 4, content_right(v), y + 22), Kind::Label, "l_badge_hint")
             .text("按钮下方显示的文字"),
     );
     y + 32
@@ -542,7 +570,7 @@ fn body_mouse(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
 fn body_mouse_presets(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
     if v.mouse_presets.is_empty() {
         out.push(
-            Hit::new(rect(x, y, content_right(), y + 18), Kind::Label, "l_no_mouse_presets")
+            Hit::new(rect(x, y, content_right(v), y + 18), Kind::Label, "l_no_mouse_presets")
                 .text("还没有鼠标预设：点下面「保存当前」把选中的鼠标存下来"),
         );
         y += 22;
@@ -550,30 +578,27 @@ fn body_mouse_presets(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> 
     for (i, name) in v.mouse_presets.iter().enumerate().take(6) {
         let id = format!("mp_apply_{i}");
         out.push(
-            Hit::new(rect(x, y, content_right(), y + 22), Kind::Button, Box::leak(id.into_boxed_str()))
+            Hit::new(rect(x, y, content_right(v), y + 22), Kind::Button, Box::leak(id.into_boxed_str()))
                 .text(name.clone())
                 .active(v.mouse_preset_sel == i)
                 .hover(hov(v, "mp_apply")),
         );
         y += 26;
     }
+    let w3 = slot_w(v, 3, 8);
+    for (i, (id, text)) in [("mp_save", "保存当前"), ("mp_delete", "删除所选"), ("mp_export", "导出")]
+        .iter()
+        .enumerate()
+    {
+        let bx = x + i as i32 * (w3 + 8);
+        out.push(
+            Hit::new(rect(bx, y + 2, bx + w3, y + 26), Kind::Button, id)
+                .text(*text)
+                .hover(hov(v, id)),
+        );
+    }
     out.push(
-        Hit::new(rect(x, y + 2, x + 110, y + 26), Kind::Button, "mp_save")
-            .text("保存当前")
-            .hover(hov(v, "mp_save")),
-    );
-    out.push(
-        Hit::new(rect(x + 118, y + 2, x + 228, y + 26), Kind::Button, "mp_delete")
-            .text("删除所选")
-            .hover(hov(v, "mp_delete")),
-    );
-    out.push(
-        Hit::new(rect(x + 236, y + 2, x + 336, y + 26), Kind::Button, "mp_export")
-            .text("导出")
-            .hover(hov(v, "mp_export")),
-    );
-    out.push(
-        Hit::new(rect(x, y + 32, content_right(), y + 50), Kind::Label, "l_mp_hint")
+        Hit::new(rect(x, y + 32, content_right(v), y + 50), Kind::Label, "l_mp_hint")
             .text("存 cursor-presets.json；相同设置只留一份"),
     );
     y + 56
@@ -599,22 +624,25 @@ fn slot_row(
             .active(v.art_sel == idx)
             .hover(hov(v, PREVIEW_IDS[idx])),
     );
+    // The label takes whatever is left; the two arrows and the frame count are pinned
+    // to the right edge, so a wider window stretches the label, not the controls.
+    let cr = content_right(v);
     let label = format!("{} {}", slot.name, source_short(slot));
-    out.push(Hit::new(rect(x + 54, y, x + 250, y + 20), Kind::Label, "l_slot").text(label));
+    out.push(Hit::new(rect(x + 54, y, cr - 150, y + 20), Kind::Label, "l_slot").text(label));
     out.push(
-        Hit::new(rect(x + 250, y - 2, x + 280, y + 22), Kind::Button, prev_id)
+        Hit::new(rect(cr - 146, y - 2, cr - 116, y + 22), Kind::Button, prev_id)
             .text("\u{2039}")
             .hover(hov(v, prev_id))
             .data(idx as i32),
     );
     out.push(
-        Hit::new(rect(x + 284, y - 2, x + 314, y + 22), Kind::Button, next_id)
+        Hit::new(rect(cr - 112, y - 2, cr - 82, y + 22), Kind::Button, next_id)
             .text("\u{203A}")
             .hover(hov(v, next_id))
             .data(idx as i32),
     );
     out.push(
-        Hit::new(rect(x + 324, y, content_right(), y + 18), Kind::LabelRight, "l_slotinfo")
+        Hit::new(rect(cr - 76, y, cr, y + 18), Kind::LabelRight, "l_slotinfo")
             .text(if slot.frames > 1 { format!("{}帧", slot.frames) } else { String::from("静图") }),
     );
     y + 30
@@ -638,7 +666,7 @@ fn body_artwork(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
     // process. The ‹ › selector above switches which mouse is being configured, and
     // the picture editors deliberately do not follow it (see PANEL-REDESIGN §7).
     out.push(
-        Hit::new(rect(x, y, content_right(), y + 16), Kind::Label, "l_art_scope")
+        Hit::new(rect(x, y, content_right(v), y + 16), Kind::Label, "l_art_scope")
             .text("仅本面板这只光标：图案不随上面选择的鼠标切换"),
     );
     y += 20;
@@ -653,7 +681,7 @@ fn body_artwork(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
         format!("素材目录 {} 个文件", v.assets.len())
     };
     out.push(
-        Hit::new(rect(x, y + 2, content_right(), y + 20), Kind::Label, "l_art_note")
+        Hit::new(rect(x, y + 2, content_right(v), y + 20), Kind::Label, "l_art_note")
             .text(format!("‹ › 循环切换；点缩略图选中再调参数（{}）", assets)),
     );
     y += 26;
@@ -662,7 +690,7 @@ fn body_artwork(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
     let sel = v.art_sel.min(2);
     let slot = &v.slots[sel];
     out.push(
-        Hit::new(rect(x, y, content_right(), y + 18), Kind::Label, "l_art_edit").text(format!(
+        Hit::new(rect(x, y, content_right(v), y + 18), Kind::Label, "l_art_edit").text(format!(
             "调整「{}」：{}× 偏移({:.0},{:.0}) {:.0}%",
             slot.name,
             if slot.size > 0.0 { format!("{:.0}", slot.size) } else { "原始".to_string() },
@@ -708,12 +736,12 @@ fn body_artwork(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
     for (id, label, frac, text) in rows2 {
         out.push(Hit::new(rect(x, y + 4, x + 34, y + 20), Kind::Label, "l_art_c").text(label));
         out.push(
-            Hit::new(rect(x + 38, y + 2, x + 330, y + 20), Kind::Slider, id)
+            Hit::new(rect(x + 38, y + 2, content_right(v) - 108, y + 20), Kind::Slider, id)
                 .data((frac * 1000.0) as i32)
                 .hover(hov(v, id)),
         );
         out.push(
-            Hit::new(rect(x + 336, y + 4, content_right(), y + 20), Kind::LabelRight, "l_art_v")
+            Hit::new(rect(content_right(v) - 102, y + 4, content_right(v), y + 20), Kind::LabelRight, "l_art_v")
                 .text(text),
         );
         y += 22;
@@ -740,14 +768,14 @@ fn body_minimap(v: &PanelView, x: i32, y: i32, out: &mut Vec<Hit>) -> i32 {
             .hover(hov(v, "map_window_toggle")),
     );
     out.push(
-        Hit::new(rect(x + 176, y + 6, content_right(), y + 24), Kind::Label, "l_map_hint")
+        Hit::new(rect(x + 176, y + 6, content_right(v), y + 24), Kind::Label, "l_map_hint")
             .text("独立进程 · 可拖动缩放最小化"),
     );
     y + 34
 }
 
 fn body_permission(v: &PanelView, x: i32, y: i32, out: &mut Vec<Hit>) -> i32 {
-    let w = col_w();
+    let w = col_w(v);
     let perms: [(&'static str, &str, u8); 4] = [
         ("perm_0", "停止", 0),
         ("perm_1", "只读", 1),
@@ -770,7 +798,7 @@ fn body_permission(v: &PanelView, x: i32, y: i32, out: &mut Vec<Hit>) -> i32 {
 fn body_custom(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
     if let Some(err) = &v.custom.error {
         out.push(
-            Hit::new(rect(x, y, content_right(), y + 18), Kind::Label, "l_custom")
+            Hit::new(rect(x, y, content_right(v), y + 18), Kind::Label, "l_custom")
                 .text(format!("自定义模块有误：{err}")),
         );
         return y + 22;
@@ -778,7 +806,7 @@ fn body_custom(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
     if v.custom.rows.is_empty() {
         for line in &v.custom.hint {
             out.push(
-                Hit::new(rect(x, y, content_right(), y + 16), Kind::Label, "l_custom")
+                Hit::new(rect(x, y, content_right(v), y + 16), Kind::Label, "l_custom")
                     .text(line.clone()),
             );
             y += 18;
@@ -788,7 +816,7 @@ fn body_custom(v: &PanelView, x: i32, mut y: i32, out: &mut Vec<Hit>) -> i32 {
     for (i, row) in v.custom.rows.iter().enumerate() {
         match row {
             CustomRowView::Label(text) => {
-                out.push(Hit::new(rect(x, y, content_right(), y + 18), Kind::Label, "l_custom").text(text.clone()));
+                out.push(Hit::new(rect(x, y, content_right(v), y + 18), Kind::Label, "l_custom").text(text.clone()));
                 y += 20;
             }
             CustomRowView::Button(text) => {

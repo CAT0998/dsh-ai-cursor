@@ -205,14 +205,28 @@ def log_mark(pn: Panel):
 
 
 def log_new_has(mark, needle: str) -> bool:
-    """Was `needle` appended to the log since `mark`?"""
+    """Was `needle` appended to the log since `mark`?
+
+    The log rotates at 512 KB and every running overlay writes into the same file
+    (LESSONS §3c), so it can roll over in the middle of a check: a plain seek-to-offset
+    then reads past EOF and reports "nothing was written" for a write that DID happen.
+    If the file is shorter than the mark, it has rotated — the whole new file is then
+    "since the mark". The rotated predecessor's tail is checked as well for the case
+    where the write landed just before the roll.
+    """
     path, offset = mark
     try:
         with open(path, "rb") as f:
-            f.seek(offset)
-            return needle in f.read().decode("utf-8", "replace")
+            data = f.read() if path.stat().st_size < offset else (f.seek(offset), f.read())[1]
+        if needle in data.decode("utf-8", "replace"):
+            return True
+        rotated = path.with_name("overlay.1.log")
+        if rotated.exists():
+            tail = rotated.read_bytes()[-64 * 1024:].decode("utf-8", "replace")
+            return needle in tail
     except Exception:
         return False
+    return False
 
 
 def wrote(mark, action: str, extra: str = "") -> bool:
@@ -517,6 +531,7 @@ def main() -> int:
             s2["panel_view_w"],
             s2["panel_hscroll_max"],
             s2["panel_hscroll"],
+            s2["panel_content_w"],
         )
 
     def win_size():
@@ -538,10 +553,13 @@ def main() -> int:
     time.sleep(0.5)
 
     # ---- 内容宽度固定 452 + 标题栏（需求 4 / 6） ----
-    w0, h0, vw0, hm0, _ = geom()
-    check("H1 默认窗口 452 宽、视口 452、没有横向滚动",
-          w0 == 452 and vw0 == 452 and hm0 == 0, f"{w0}x{h0} view_w={vw0} hmax={hm0}")
-    ids0 = {h["id"] for h in pn.hits()["hits"]}
+    w0, h0, vw0, hm0, _, cw0 = geom()
+    check("H1 默认窗口 452 宽、内容 452、没有横向滚动",
+          w0 == 452 and cw0 == 452 and vw0 == 452 and hm0 == 0,
+          f"{w0}x{h0} content_w={cw0} view_w={vw0} hmax={hm0}")
+    hits452 = pn.hits()["hits"]
+    ids0 = {h["id"] for h in hits452}
+    SEC_ACTIONS_W = next(h["w"] for h in hits452 if h["id"] == "sec_actions")
     check("H2 标题栏控件齐全：title / 最小化 / 关闭 / 署名",
           {"title", "collapse", "close", "sign"} <= ids0,
           sorted(i for i in ids0 if i in ("title", "collapse", "close", "sign")))
@@ -561,13 +579,13 @@ def main() -> int:
     # ---- 真鼠标拖右边缘：变窄（需求 3 / 1）----
     bw, bh = win_size()
     drag_edge(pn, "right", -72, 0)  # 452 -> 380
-    w1, h1, vw1, hm1, _ = geom()
+    w1, h1, vw1, hm1, _, cw1 = geom()
     ow1, oh1 = win_size()
     check("H4 真鼠标拖右边缘 -> 窗口变窄，OS 与进程一致",
           w1 == 380 and ow1 == 380 and h1 == oh1,
           f"process {w1}x{h1} window {ow1}x{oh1} (was {bw}x{bh})")
-    check("H4b 变窄后视口跟着变窄、出现横向滚动范围",
-          vw1 == 380 and hm1 == 72, f"view_w={vw1} hmax={hm1}")
+    check("H4b 变窄后视口跟着变窄、内容守住 452 底线、出现横向滚动范围",
+          vw1 == 380 and cw1 == 452 and hm1 == 72, f"view_w={vw1} content_w={cw1} hmax={hm1}")
 
     # ---- 窄于 452：横向滚动条 + 滚轮横滚（需求 5）----
     im380 = dump_img("win-380")
@@ -582,16 +600,37 @@ def main() -> int:
 
     # ---- 真鼠标拖左边缘：拉到 700 宽（需求 4）----
     drag_edge(pn, "left", -320, 0)  # 380 -> 700
-    w2, h2, vw2, hm2, _ = geom()
+    w2, h2, vw2, hm2, _, cw2 = geom()
     ow2, oh2 = win_size()
     check("H6 真鼠标拖左边缘 -> 拉到 700 宽", w2 == 700 and ow2 == 700,
           f"process {w2}x{h2} window {ow2}x{oh2}")
-    check("H6b 700 宽时内容视口仍是 452、横向滚动条消失",
-          vw2 == 452 and hm2 == 0, f"view_w={vw2} hmax={hm2}")
+    check("H6b 700 宽时内容列跟着变宽（流体）、横向滚动条消失",
+          cw2 == 700 and vw2 == 700 and hm2 == 0, f"content_w={cw2} view_w={vw2} hmax={hm2}")
     im700 = dump_img("win-700")
-    margin = set(im700.crop((470, 60, 690, min(700, h2 - 20))).getdata())
-    check("H6c 右侧留白：470..690 是同一块底色", len(margin) == 1,
-          f"{len(margin)} colors {list(margin)[:3]}")
+    # ---- 流体布局：同一批控件在 700 宽时确实被重新分配了横向空间 ----
+    hits_now = {h["id"]: h for h in pn.hits()["hits"]}
+    sec_now = hits_now["sec_actions"]
+    sec_452 = SEC_ACTIONS_W
+    check("F1 分区表头随窗口拉宽（不再是 452 固定宽）",
+          sec_now["w"] > sec_452 + 200,
+          f"{sec_452} -> {sec_now['w']} px")
+    # every row's right edge must land on the new content edge, not at 438
+    right_edges = sorted({h["x"] + h["w"] for h in pn.hits()["hits"] if h["id"].startswith("mp_apply_")})
+    check("F2 整行控件右缘跟着内容宽走", all(r > 600 for r in right_edges), right_edges)
+    # the separators stretch too (the user's "界格不随尺寸变化")
+    sep = [h for h in pn.hits()["hits"] if h["id"] == "sec_sep"]
+    check("F3 分隔线随内容拉伸", bool(sep) and all(h["w"] > 600 for h in sep[:3]),
+          [h["w"] for h in sep[:3]])
+    # T6 #2 at 700 px: the vertical bar must STILL hug the window edge
+    vbar700 = pn.req("status")["panel_vbar"]
+    check("S7 700 宽时纵向滚动条仍贴窗口右缘（不是停在 452 附近）",
+          vbar700 is not None and vbar700[0] == 700 - 10, f"vbar={vbar700}")
+    # controls keep their HEIGHT: a re-flow must never scale a control
+    check("F4 控件高度不变（表头 24 / 动作按钮 34 / 滑杆 18）",
+          sec_now["h"] == 24
+          and hits_now["show"]["h"] == 34
+          and hits_now["opacity"]["h"] == 18,
+          f"sec={sec_now['h']} btn={hits_now['show']['h']} slider={hits_now['opacity']['h']}")
     # A wider window must not scale the content: the title is pixel-identical.
     check("H6d 字体大小不变（标题像素与 452 宽时逐点一致）",
           crop(im452, (14, 4, 232, 38)) == crop(im700, (14, 4, 232, 38)),
@@ -600,7 +639,7 @@ def main() -> int:
     # ---- 真鼠标拖右下角：宽高一起变（需求 3）----
     b2w, b2h = win_size()
     drag_edge(pn, "corner", -120, -90)
-    w3, h3, vw3, hm3, _ = geom()
+    w3, h3, vw3, hm3, _, cw3 = geom()
     ow3, oh3 = win_size()
     check("H7 真鼠标拖右下角 -> 宽和高都变小",
           ow3 == w3 and oh3 == h3 and w3 < w2 and h3 < h2,
@@ -615,6 +654,54 @@ def main() -> int:
     check("H8 改过窗口尺寸后纵向滚轮仍可用", after_y > before_y, f"{before_y} -> {after_y}")
     pn.req("panel_scroll", y=0)
     time.sleep(0.3)
+
+    # ---- 滚动条：贴窗口右缘 + 能拖（T6 #1/#2）----
+    def bars():
+        s2 = pn.req("status")
+        return s2["panel_vbar"], s2["panel_vthumb"], s2["panel_hbar"], s2["panel_hthumb"]
+
+    vb, vt, hb, ht = bars()
+    check("S1 纵向滚动条贴窗口右缘（x = w-10，不是 452-10）",
+          vb is not None and vb[0] == 452 - 10, f"vbar={vb} (window 452)")
+
+    # drag the vertical thumb with the REAL mouse
+    r = panel_rect(pn)
+    _, left, top, w, h = r
+    before = pn.req("status")["panel_scroll"]
+    cx, cy = left + vt[0] + vt[2] // 2, top + vt[1] + vt[3] // 2
+    wheels.drag(cx, cy, cx, cy + 180)
+    time.sleep(0.4)
+    after = pn.req("status")["panel_scroll"]
+    check("S2 真鼠标拖纵向滚动条 -> 内容滚动", after > before, f"{before} -> {after}")
+
+    # still able to resize from the right border (the bar must not eat the frame)
+    w_before = win_size()[0]
+    drag_edge(pn, "right", -100, 0)
+    w_after = win_size()[0]
+    check("S3 滚动条不吃边框：拖右边缘仍能改宽", w_after == w_before - 100,
+          f"{w_before} -> {w_after}")
+    pn.req("panel_size", width=380)
+    time.sleep(0.5)
+
+    vb2, vt2, hb2, ht2 = bars()
+    check("S4 380 宽时纵向滚动条跟着贴右缘（x = w-10）",
+          vb2 is not None and vb2[0] == 380 - 10, f"vbar={vb2}")
+    check("S5 380 宽时出现横向滚动条", hb2 is not None and hb2[2] > 100, f"hbar={hb2}")
+    pn.req("panel_hscroll", x=0)
+    time.sleep(0.3)
+    r = panel_rect(pn)
+    _, left, top, w, h = r
+    before = pn.req("status")["panel_hscroll"]
+    cx, cy = left + ht2[0] + ht2[2] // 2, top + ht2[1] + ht2[3] // 2
+    wheels.drag(cx, cy, cx + min(80, ht2[2] - 10), cy)
+    time.sleep(0.4)
+    after = pn.req("status")["panel_hscroll"]
+    check("S6 真鼠标拖横向滚动条 -> 内容横向滚动（T6 #1）", after > before,
+          f"{before} -> {after} (max {pn.req('status')['panel_hscroll_max']})")
+    pn.req("panel_hscroll", x=0)
+    pn.req("panel_size", width=452)
+    time.sleep(0.5)
+    dump_panel(pn, "win-452-bars")
 
     # ---- 最小化 = 收成「≡ AI 鼠标」小条（需求 6）----
     t = hit_by_id(pn.hits()["hits"], "collapse")

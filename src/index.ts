@@ -36,6 +36,7 @@ import {
   findPreset,
   loadPresets,
   presetCommands,
+  renamePreset,
   removePreset,
   savePresets,
   upsertPreset,
@@ -47,7 +48,9 @@ import {
   cursorPatchCommands,
   handlePanelCommand,
   loadCursorPresets,
+  renameCursorPreset,
   resolveTarget,
+  saveCursorPresets,
 } from './panelstate'
 import type { CursorPreset, RosterEntry } from './panelstate'
 import { berthsFrom, describeBerths, readBerths, readSelection, selectedNames, writeBerths } from './dock'
@@ -538,7 +541,12 @@ export function apply(ctx: Context, config: ConfigShape): void {
     if (primed.get(active) === active.generation) return
     primed.set(active, active.generation)
     await send('idle', { idle_ms: config.idleMs })
-    await send('affinity', { capture_visible: config.captureVisible })
+    // Performance mode goes first: it decides whether the cursor is drawn at all, so
+    // it must be set before anything else has a chance to put pixels on screen.
+    await send('performance', { on: config.performanceMode })
+    // In performance mode the cursor exists to be photographed, so the capture
+    // exclusion must be off — otherwise the screenshot this mode is for misses it.
+    await send('affinity', { capture_visible: config.captureVisible || config.performanceMode })
     await send('label', { text: config.label })
     await send('theme', { theme: config.theme })
     await send('badge', { visible: config.badge })
@@ -589,6 +597,46 @@ export function apply(ctx: Context, config: ConfigShape): void {
         const refused = await gate(1, 'ai_mouse_hide')
         if (refused) return refused
         return describeStatus(await send('hide'))
+      },
+    }),
+  )
+
+  /**
+   * Draw the cursor for a moment, on demand.
+   *
+   * This is the only way the cursor gets on screen in performance mode, and the
+   * reply only comes back once the frame is really painted — so "call it, then
+   * screenshot" is a safe order. It is repeatable: every call re-shows the cursor
+   * and restarts the timer. Never takes focus (SW_SHOWNOACTIVATE).
+   */
+  ctx.tools.register(
+    defineTool({
+      name: 'ai_mouse_render_once',
+      description:
+        'Show the AI cursor for a moment and make sure it is really on screen before this ' +
+        'returns: call it right BEFORE taking a screenshot, so the capture includes the AI ' +
+        'cursor. With performanceMode on this is the only time the cursor is rendered at all; ' +
+        'the rest of the time the overlay paints nothing. The cursor hides itself after `ms`; ' +
+        'calling this again re-shows and re-times it. It never moves the real pointer and ' +
+        'never takes focus.',
+      parameters: {
+        ms: {
+          type: 'number',
+          description:
+            'How long the cursor stays visible, in milliseconds (default 800, clamped to 120-30000). The reply comes back as soon as the frame is painted, not after this.',
+        },
+      },
+      output: TEXT_OUTPUT,
+      async execute(args) {
+        const refused = await gate(1, 'ai_mouse_render_once')
+        if (refused) return refused
+        await prime()
+        const ms = Math.min(Math.max(Math.round(args.ms ?? 800), 120), 30000)
+        const reply = await send('render_once', { ms })
+        if (reply.rendered !== true) {
+          return `render_once 已受理，但这一帧没有真的画出来（浮层窗口线程可能没跑）。${describeStatus(reply)}`
+        }
+        return `AI 光标已绘制并显示 ${ms}ms，现在可以截图（到时自动隐藏，不抢焦点）。${describeStatus(reply)}`
       },
     }),
   )
@@ -1180,13 +1228,15 @@ export function apply(ctx: Context, config: ConfigShape): void {
       parameters: {
         action: {
           type: 'string',
-          description: 'save | load | global | list | show | delete | export | import (global applies the preset to every cursor; export/import move presets.json to and from a file)',
+          description: 'save | load | global | list | show | delete | rename | export | import (global applies the preset to every cursor; rename takes from/to; export/import move presets.json to and from a file)',
         },
         name: { type: 'string', description: 'Preset name (case-insensitive).' },
+        from: { type: 'string', description: 'rename: the current name (defaults to name).' },
+        to: { type: 'string', description: 'rename: the new name.' },
         path: { type: 'string', description: 'File path, for export / import.' },
       },
       output: TEXT_OUTPUT,
-      async execute(args: { action?: string; name?: string; path?: string }) {
+      async execute(args: { action?: string; name?: string; from?: string; to?: string; path?: string }) {
         const dir = (config.assetDir || '').replace(/[\/]+$/, '')
         if (!dir) return '素材目录未配置，无法读写预设。'
         const file = `${dir}/presets.json`
@@ -1232,7 +1282,9 @@ export function apply(ctx: Context, config: ConfigShape): void {
           const p = findPreset(list, name)
           return p ? describePreset(p) : `没有名为「${name}」的预设。`
         }
-        if (!name) return `${action} 需要 name。`
+        // `rename` names its source with from/to, so it is the one action that does
+        // not need `name`.
+        if (!name && action !== 'rename') return `${action} 需要 name。`
 
         if (action === 'save') {
           const refused = await gate(2, 'ai_mouse_preset')
@@ -1277,6 +1329,42 @@ export function apply(ctx: Context, config: ConfigShape): void {
           return `已把预设「${p.name}」应用到 ${applied} 只光标（全局）。`
         }
 
+        if (action === 'rename') {
+          // Both stores are renamed, because "the preset list" means the legacy
+          // presets.json to some callers and the panel's cursor-presets.json to the
+          // human clicking in the menu bar. A rename that only touched one of them
+          // looked like "nothing happened" in the other list.
+          const refused = await gate(2, 'ai_mouse_preset')
+          if (refused) return refused
+          const from = (args.from ?? name).trim()
+          const to = (args.to ?? '').trim()
+          if (!from || !to) return 'rename 需要 from（原名）和 to（新名）。'
+          const legacy = renamePreset(list, from, to)
+          const cursorFile = cursorPresetsFile()
+          const cursorList = await loadCursorPresets(cursorFile)
+          const panel = renameCursorPreset(cursorList, from, to)
+          if (!legacy.renamed && !panel.renamed) {
+            // A clash is the actionable answer: the store that holds the source refused
+            // because the new name is taken. Reporting the OTHER store's "not found"
+            // would send the human looking for the wrong problem.
+            const clash = [legacy.error, panel.error].find((e) => e?.includes('已经有名为'))
+            return clash ?? legacy.error ?? panel.error ?? `没有名为「${from}」的预设。`
+          }
+          const touched: string[] = []
+          if (legacy.renamed) {
+            await savePresets(file, legacy.list)
+            touched.push('presets.json')
+          }
+          if (panel.renamed) {
+            await saveCursorPresets(cursorFile, panel.list)
+            touched.push('cursor-presets.json')
+          }
+          const clash = [legacy.error, panel.error].filter((e): e is string => Boolean(e))
+          return (
+            `已把预设「${from}」改名为「${to}」（${touched.join(' + ')}）。` +
+            (clash.length > 0 ? ` 注意：${clash.join(' ')}` : '')
+          )
+        }
         if (action === 'delete') {
           const refused = await gate(2, 'ai_mouse_preset')
           if (refused) return refused

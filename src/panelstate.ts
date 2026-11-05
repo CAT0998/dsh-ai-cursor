@@ -116,6 +116,29 @@ export function removeCursorPreset(list: CursorPreset[], name: string): CursorPr
   return list.filter((p) => p.name.trim().toLowerCase() !== wanted)
 }
 
+/** Rename a cursor preset; see `presets.ts::renamePreset` for the two rules. */
+export function renameCursorPreset(
+  list: CursorPreset[],
+  from: string,
+  to: string,
+): { list: CursorPreset[]; renamed?: CursorPreset; error?: string } {
+  const wanted = from.trim()
+  const next = to.trim()
+  if (!wanted || !next) return { list, error: 'rename 需要 from（原名）和 to（新名）。' }
+  const hit = list.find((p) => p.name.trim().toLowerCase() === wanted.toLowerCase())
+  if (!hit) return { list, error: `没有名为「${wanted}」的鼠标预设。` }
+  if (hit.name === next) return { list, renamed: hit }
+  if (list.some((p) => p !== hit && p.name.trim().toLowerCase() === next.toLowerCase())) {
+    return { list, error: `已经有名为「${next}」的鼠标预设；先删掉它，或者换个名字。` }
+  }
+  // `cursorPresetKey` is built from theme/label/color/opacity/scale/badge, so a
+  // rename (name only) cannot change which presets count as the same look.
+  const renamed: CursorPreset = { ...hit, name: next }
+  const out = list.map((p) => (p.name.trim().toLowerCase() === wanted.toLowerCase() ? renamed : p))
+  out.sort((a, b) => a.name.localeCompare(b.name))
+  return { list: out, renamed }
+}
+
 export function upsertMenuTheme(list: MenuTheme[], theme: MenuTheme): UpsertResult<MenuTheme> {
   const key = menuThemeKey(theme)
   const same = list.find((p) => menuThemeKey(p) === key)

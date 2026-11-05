@@ -96,6 +96,43 @@ export function removePreset(list: Preset[], name: string): Preset[] {
   return list.filter((p) => p.name.trim().toLowerCase() !== wanted)
 }
 
+/** What a rename attempt did. `error` is a sentence for the human, not a throw. */
+export interface RenameResult<T> {
+  list: T[]
+  /** The entry under its new name, when the rename happened (or was a no-op). */
+  renamed?: T
+  error?: string
+}
+
+/**
+ * Rename a preset, case-insensitively.
+ *
+ * Two rules the caller must not have to re-implement:
+ *   - **never overwrite**: a `to` that already names another preset is an error, not a
+ *     silent merge — losing a saved look because two names collided is worse than
+ *     asking the human to pick another name;
+ *   - renaming to the same name (any casing) is a no-op that still reports success.
+ *
+ * Only `name` changes. Every other field is carried over untouched, which is what
+ * keeps `cursorPresetKey()` (the de-duplication key: theme|label|color|opacity|scale|
+ * badge) working exactly as before — a rename can never make two presets look alike.
+ */
+export function renamePreset(list: Preset[], from: string, to: string): RenameResult<Preset> {
+  const wanted = from.trim()
+  const next = to.trim()
+  if (!wanted || !next) return { list, error: 'rename 需要 from（原名）和 to（新名）。' }
+  const hit = findPreset(list, wanted)
+  if (!hit) return { list, error: `没有名为「${wanted}」的预设。` }
+  if (hit.name === next) return { list, renamed: hit }
+  // A casing-only rename is legal, so the clash check must ignore the entry being
+  // renamed — otherwise "默认 -> 默认" with different casing would be refused.
+  if (list.some((p) => p !== hit && p.name.trim().toLowerCase() === next.toLowerCase())) {
+    return { list, error: `已经有名为「${next}」的预设；先删掉它，或者换个名字。` }
+  }
+  const renamed: Preset = { ...hit, name: next }
+  return { list: upsertPreset(removePreset(list, wanted), renamed), renamed }
+}
+
 export async function loadPresets(file: string): Promise<Preset[]> {
   try {
     const raw = await readFile(file, 'utf8')

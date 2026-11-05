@@ -20,6 +20,12 @@ export interface OverlayStatus {
   capture_visible?: boolean
   /** Badge under the cursor ("AI 提示"). */
   badge?: boolean
+  /** Performance mode: nothing is drawn outside a render-once window. */
+  performance?: boolean
+  /** Milliseconds left in the current render-once window (0 = nothing is drawn). */
+  render_left_ms?: number
+  /** Set by `render_once`: the frame really was painted before the reply was sent. */
+  rendered?: boolean
   /** Cursor + badge opacity, 0.15 - 1. */
   opacity?: number
   /** Accent colour, "#RRGGBB". */
